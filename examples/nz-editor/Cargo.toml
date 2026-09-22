@@ -1,0 +1,19 @@
+[package]
+name = "nz-editor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Krzysztof Duśko"]
+repository = "https://github.com/justybase/justybase_netezza_driver_rust"
+description = "Netezza SQL editor (TUI) built on the pure-Rust netezza driver"
+
+[[bin]]
+name = "nz-editor"
+path = "src/main.rs"
+
+[dependencies]
+nz_rust = { path = "../.." }
+spreadsheet = { package = "justybase-spreadsheet", version = "0.1.0" }
+chrono = "0.4"
+crossterm = "0.28"
+ratatui = "0.29"

@@ -1,0 +1,47 @@
+# Rust / Cargo build artifacts (including nested example crates)
+target/
+**/*.rs.bk
+
+# Test, coverage, benchmark and profiling output
+/coverage/
+/llvm-cov/
+/grcov/
+/lcov.info
+/profraw/
+/flamegraph.svg
+
+# Local example and integration-test output
+/demo.txt
+/results/
+/test-results/
+/tmp/
+*.log
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Rust tooling and local caches
+.rustc_info.json
+rust-toolchain.toml.bak
+**/obj/
+benchmarks/**/bin/
+**/.fingerprint/
+.agents/
+.codex/

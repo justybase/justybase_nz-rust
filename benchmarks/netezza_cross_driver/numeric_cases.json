@@ -1,0 +1,30 @@
+[
+  {
+    "name": "low-precision",
+    "value": "123.4567",
+    "precision": 10,
+    "scale": 4,
+    "digit_count": 2
+  },
+  {
+    "name": "low-precision-trailing-zero",
+    "value": "3.1400",
+    "precision": 10,
+    "scale": 4,
+    "digit_count": 2
+  },
+  {
+    "name": "high-precision",
+    "value": "12345678901234567890.123456",
+    "precision": 30,
+    "scale": 6,
+    "digit_count": 4
+  },
+  {
+    "name": "high-precision-negative",
+    "value": "-123456789012345678.87654321",
+    "precision": 38,
+    "scale": 8,
+    "digit_count": 4
+  }
+]

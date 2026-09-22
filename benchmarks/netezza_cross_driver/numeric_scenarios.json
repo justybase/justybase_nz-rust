@@ -1,0 +1,26 @@
+[
+  {
+    "name": "binary-numeric-heavy",
+    "description": "Mixed binary NUMERIC precision profile",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1, 999999999999999999.999999::NUMERIC(30,6) AS n2, 3.1400::NUMERIC(10,4) AS n3, 42.42::NUMERIC(18,2) AS n4 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-low-precision",
+    "description": "Binary NUMERIC profile with only low-precision values",
+    "query": "SELECT 123.4567::NUMERIC(10,4) AS n1, 42.4200::NUMERIC(10,4) AS n2, -7.2500::NUMERIC(10,4) AS n3, 0.1250::NUMERIC(10,4) AS n4 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-high-precision",
+    "description": "Binary NUMERIC profile with exact high-precision values",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1, 999999999999999999.999999::NUMERIC(30,6) AS n2 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-single-high",
+    "description": "Single high-precision NUMERIC cell",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  }
+]

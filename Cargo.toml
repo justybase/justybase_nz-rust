@@ -1,0 +1,47 @@
+[package]
+name = "nz_rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+authors = ["Krzysztof Duśko"]
+repository = "https://github.com/justybase/justybase_netezza_driver_rust"
+homepage = "https://github.com/justybase/justybase_netezza_driver_rust"
+documentation = "https://docs.rs/nz_rust"
+description = "Pure Rust driver for IBM Netezza / PureData — port of JustyBase.NetezzaDriver (C#) and @justybase/netezza-driver (Node/TS)"
+readme = "README.md"
+keywords = ["netezza", "database", "sql", "driver", "tokio"]
+categories = ["database", "asynchronous"]
+exclude = [
+    "benchmarks/**",
+    "examples/nz-editor/**",
+    "AGENTS.md",
+    ".github/**",
+    ".agents/**",
+    ".codex/**",
+]
+
+[features]
+default = []
+ssl = [
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+]
+
+[dependencies]
+bytes = "1"
+futures-core = "0.3"
+md5 = "0.7"
+sha2 = "0.10"
+rust_decimal = { version = "1.39", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

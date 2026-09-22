@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stable:
+    name: Rust stable checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test -p nz_rust --all-targets --all-features --locked
+      - run: cargo clippy -p nz_rust --all-targets --all-features --locked -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Verify published package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked --list > package-files.txt
+          ! grep -E '^(benchmarks/|examples/nz-editor/|AGENTS\.md$|\.github/|\.agents/|\.codex/)' package-files.txt
+
+  msrv:
+    name: Rust MSRV 1.87
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - run: cargo check -p nz_rust --all-targets --all-features

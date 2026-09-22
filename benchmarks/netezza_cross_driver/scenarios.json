@@ -1,0 +1,44 @@
+[
+  {
+    "name": "text-typed-loose",
+    "description": "Repeated typed text-protocol scalar query without FROM",
+    "query": "SELECT true::BOOLEAN AS ok, 1234567890123456789::BIGINT AS big_id, 123.456::NUMERIC(10,3) AS amount, 3.1400::NUMERIC(10,4) AS exact_amount, '2024-12-11'::DATE AS d, '2024-12-11 14:30:00'::TIMESTAMP AS ts, '05:41:15'::TIME AS t, 'alpha'::VARCHAR(10) AS label",
+    "repetitions": 100
+  },
+  {
+    "name": "binary-fixed-width",
+    "description": "Fixed-width binary row parsing from a large fact table",
+    "query": "SELECT 1::INT AS a, 2::INT AS b, 3::INT AS c, 4::INT AS d, '2024-12-11'::DATE AS dte, '2024-12-11 14:30:00'::TIMESTAMP AS ts FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-variable-width",
+    "description": "Variable-width character decoding from a large fact table",
+    "query": "SELECT 'ALPHA'::VARCHAR(20) AS vc1, 'BETA GAMMA'::VARCHAR(20) AS vc2, 'delta'::NVARCHAR(20) AS nvc, 'epsilon'::NCHAR(10) AS nc, 'zeta'::VARCHAR(40) AS vc3 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-heavy",
+    "description": "Binary NUMERIC conversion with precision-preserving outputs",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1, 999999999999999999.999999::NUMERIC(30,6) AS n2, 3.1400::NUMERIC(10,4) AS n3, 42.42::NUMERIC(18,2) AS n4 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-low-precision",
+    "description": "Binary NUMERIC conversion where every value can use the low-precision path",
+    "query": "SELECT 123.4567::NUMERIC(10,4) AS n1, 42.4200::NUMERIC(10,4) AS n2, -7.2500::NUMERIC(10,4) AS n3, 0.1250::NUMERIC(10,4) AS n4 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-high-precision",
+    "description": "Binary NUMERIC conversion using only precision-preserving high-precision values",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1, 999999999999999999.999999::NUMERIC(30,6) AS n2 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  },
+  {
+    "name": "binary-numeric-single-high",
+    "description": "Single high-precision NUMERIC cell to expose per-cell conversion cost",
+    "query": "SELECT 12345678901234567890.123456::NUMERIC(30,6) AS n1 FROM __SOURCE_TABLE__ ORDER BY ROWID LIMIT __ROW_LIMIT__",
+    "repetitions": 1
+  }
+]
