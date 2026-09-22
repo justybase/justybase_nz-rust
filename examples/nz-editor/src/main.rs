@@ -9,7 +9,7 @@
 //!
 //! | Key | Action |
 //! |-----|--------|
-//! | `F5` / `Ctrl+Enter` | execute the buffer (non-blocking) |
+//! | `F5` / `Ctrl+Enter` / `Alt+Enter` | execute the buffer (non-blocking) |
 //! | `F8` | cancel the running query (out-of-band cancel packet) |
 //! | `F6` | save results to `--out` (`.xlsx` / `.xlsb` select Excel) |
 //! | `F4` | describe the current result set's columns |
@@ -198,12 +198,44 @@ fn main() {
     }
 
     let mut terminal = ratatui::init();
+    enable_kitty_keyboard();
+    // Make sure the Kitty flags are popped even on panic: ratatui's own hook
+    // only calls `restore()`, so chain ours on top of it.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        disable_kitty_keyboard();
+        prev_hook(info);
+    }));
     let outcome = run(&mut terminal, &mut app);
+    disable_kitty_keyboard();
     ratatui::restore();
     if let Err(e) = outcome {
         eprintln!("nz-editor: {e}");
         exit(1);
     }
+}
+
+/// Ask the terminal to disambiguate `Ctrl+Enter` from plain `Enter`.
+///
+/// Without the Kitty keyboard protocol most terminals send `\r` for both,
+/// so crossterm reports plain `Enter` and the run shortcut can never fire.
+/// `DISAMBIGUATE_ESCAPE_CODES | REPORT_ALL_KEYS_AS_ESCAPE_CODES` makes
+/// supporting terminals send `CSI 13;5u` for `Ctrl+Enter` instead.
+/// Unsupported terminals ignore the sequence; failures are ignored.
+fn enable_kitty_keyboard() {
+    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    );
+}
+
+fn disable_kitty_keyboard() {
+    use crossterm::event::PopKeyboardEnhancementFlags;
+    let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
@@ -224,6 +256,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
 
 fn handle_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     if is_run_shortcut(key.code, key.modifiers) {
         app.execute();
@@ -237,15 +270,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         if app.completion.visible {
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up if !ctrl && !alt => {
                     app.completion.move_selection(-1);
                     return;
                 }
-                KeyCode::Down => {
+                KeyCode::Down if !ctrl && !alt => {
                     app.completion.move_selection(1);
                     return;
                 }
-                KeyCode::Tab | KeyCode::Enter => {
+                KeyCode::Tab | KeyCode::Enter if !ctrl && !alt => {
                     if app.accept_completion() {
                         return;
                     }
@@ -288,7 +321,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.focus = Focus::Input,
         _ => match app.focus {
             Focus::Input => {
-                editor_key(&mut app.editor, key.code, ctrl);
+                // Swallow both Ctrl and Alt chords so e.g. Alt+letters do not
+                // end up in the SQL buffer.
+                editor_key(&mut app.editor, key.code, ctrl || alt);
                 app.refresh_completion(false);
             }
             Focus::Grid => grid_key(app, key.code),
@@ -298,7 +333,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn is_run_shortcut(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    code == KeyCode::Enter && modifiers.contains(KeyModifiers::CONTROL)
+    // `Enter+Ctrl` is the documented shortcut, but it only arrives with the
+    // Ctrl bit when the terminal speaks the Kitty keyboard protocol (enabled
+    // in `main`). `Enter+Alt` (ESC + \r) is distinguishable in legacy mode
+    // and is the fallback. Some terminals send LF (`Ctrl+J` in raw mode) for
+    // `Ctrl+Enter`, so that is accepted too.
+    match code {
+        KeyCode::Enter => {
+            modifiers.contains(KeyModifiers::CONTROL)
+                || modifiers.contains(KeyModifiers::ALT)
+        }
+        KeyCode::Char('j') | KeyCode::Char('J') => {
+            modifiers.contains(KeyModifiers::CONTROL)
+        }
+        _ => false,
+    }
 }
 
 /// Browser keys: navigation, filter typing, Enter to expand/insert.
@@ -317,8 +366,10 @@ fn browser_key(app: &mut App, code: KeyCode) {
     }
 }
 
-/// Editor keys. `ctrl` is passed in so that an unhandled `Ctrl+<letter>` is
-/// swallowed rather than typed into the buffer.
+/// Editor keys. `modified` is true when Ctrl or Alt is held, so that an
+/// unhandled `Ctrl/Alt+<key>` is swallowed rather than typed into the buffer.
+/// The run shortcuts (`Ctrl+Enter`, `Alt+Enter`, `Ctrl+J`) never reach here —
+/// `handle_key` executes them first.
 fn editor_key(editor: &mut crate::app::Editor, code: KeyCode, ctrl: bool) {
     match code {
         KeyCode::Char(c) if !ctrl => editor.insert_char(c),
@@ -427,8 +478,35 @@ mod tests {
 
     #[test]
     fn ctrl_enter_is_the_run_shortcut() {
+        // Primary: Ctrl+Enter via the Kitty protocol.
         assert!(is_run_shortcut(KeyCode::Enter, KeyModifiers::CONTROL));
+        // Fallback: Alt+Enter works in legacy mode (ESC + \r).
+        assert!(is_run_shortcut(KeyCode::Enter, KeyModifiers::ALT));
+        // Fallback: some terminals send LF for Ctrl+Enter, seen as Ctrl+J.
+        assert!(is_run_shortcut(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(is_run_shortcut(
+            KeyCode::Char('J'),
+            KeyModifiers::CONTROL
+        ));
+        // Plain Enter is a newline, not run.
         assert!(!is_run_shortcut(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!is_run_shortcut(KeyCode::Enter, KeyModifiers::SHIFT));
         assert!(!is_run_shortcut(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(!is_run_shortcut(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!is_run_shortcut(KeyCode::Char('j'), KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn run_shortcuts_never_reach_the_buffer() {
+        use crate::app::Editor;
+        let mut e = Editor::new();
+        // All run chords must be swallowed by editor_key (handle_key runs
+        // them first and returns).
+        editor_key(&mut e, KeyCode::Enter, true);
+        editor_key(&mut e, KeyCode::Char('j'), true);
+        assert_eq!(e.text(), "");
     }
 }

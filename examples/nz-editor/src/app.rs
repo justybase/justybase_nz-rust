@@ -326,7 +326,7 @@ impl App {
             set_idx: 0,
             grid: GridState::default(),
             focus: Focus::Input,
-            log: vec!["Ready — type SQL and press F5.".into()],
+            log: vec!["Ready — type SQL and press F5 (or Alt+Enter).".into()],
             log_pane: LogPane::Compact,
             last_elapsed: None,
             history: Vec::new(),

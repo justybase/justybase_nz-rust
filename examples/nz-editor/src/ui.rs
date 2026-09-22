@@ -33,7 +33,7 @@ fn log_capacity(height: u16) -> usize {
 
 /// Ghost text shown while the SQL buffer is empty.
 const EDITOR_HINT: &str =
-    "-- SELECT * FROM <table> LIMIT 100;    F5/Ctrl+Enter runs  ·  F4 describes columns";
+    "-- SELECT * FROM <table> LIMIT 100;    F5 / Ctrl+Enter / Alt+Enter runs";
 
 /// Rows available for data once the border and the two header lines are gone.
 fn grid_body_height(area: Rect) -> usize {
@@ -196,7 +196,7 @@ fn fit_text(text: &str, width: usize) -> String {
 fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let focus = if app.focus == Focus::Input { "*" } else { " " };
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "{focus} SQL  {}  [F5/Ctrl+Enter run · Tab grid · F6 save · F2 log · Ctrl+Q quit] ",
+        "{focus} SQL  {}  [F5/Ctrl+Enter/Alt+Enter run · Tab grid · F6 save · F2 log · Ctrl+Q quit] ",
         app.server
     ));
     let inner = block.inner(area);
@@ -421,7 +421,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let Some(set) = app.current_set() else {
         frame.render_widget(
-            Paragraph::new("No results yet — press F5 to execute."),
+            Paragraph::new("No results yet — press F5 or Alt+Enter to execute."),
             inner,
         );
         return;
