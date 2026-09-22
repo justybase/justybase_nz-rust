@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 nz_rust = { path = "../.." }
-spreadsheet = { package = "justybase-spreadsheet", version = "0.1.0" }
+spreadsheet = { package = "justybase-spreadsheet", version = "0.1.1" }
 chrono = "0.4"
 crossterm = "0.28"
 ratatui = "0.29"

@@ -2,6 +2,14 @@
 
 All notable changes to `nz_rust` will be documented here.
 
+## [0.1.1] - 2026-09-22
+
+### Changed
+
+- Updated the runtime, cryptography, TLS, decimal and serialization dependencies
+  to current stable releases supported by the Rust 1.87 MSRV.
+- Refreshed the separate `nz-editor` lockfile and its spreadsheet dependency.
+
 ## [Unreleased]
 
 ### Added
