@@ -186,7 +186,7 @@ fn classify_word(word: &str, followed_by_paren: bool) -> TokenKind {
     }
 }
 
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "ALL", "AND", "AS", "ASC", "BEGIN", "BY", "CASE", "COMMIT", "CREATE", "DELETE", "DISTINCT",
     "DROP", "ELSE", "END", "EXISTS", "FROM", "GROUP", "HAVING", "IN", "INSERT", "INTO", "IS",
     "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL", "ON", "OR", "ORDER", "OUTER", "RIGHT",
@@ -194,7 +194,7 @@ const KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
-const TYPES: &[&str] = &[
+pub(crate) const TYPES: &[&str] = &[
     "BIGINT",
     "BOOLEAN",
     "CHAR",

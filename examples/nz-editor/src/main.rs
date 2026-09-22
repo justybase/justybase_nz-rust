@@ -16,6 +16,8 @@
 //! | `F2` | expand/collapse the log pane |
 //! | `F9` | toggle the schema browser sidebar |
 //! | `Tab` / `Esc` | cycle focus: editor → grid → sidebar |
+//! | `Ctrl+Space` | show SQL/table/column completion |
+//! | completion: `Up` / `Down` / `Tab` / `Enter` / `Esc` | navigate or close suggestions |
 //! | `[` / `]` | previous / next result set (grid) |
 //! | arrows / `PgUp` / `PgDn` / `Home` / `End` | navigate (grid, sidebar) |
 //! | sidebar: type / `Backspace` | filter tables by name |
@@ -31,6 +33,7 @@
 
 mod app;
 mod browser;
+mod completion;
 mod export_excel;
 mod grid;
 mod syntax;
@@ -227,6 +230,35 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.focus == Focus::Input {
+        if ctrl && key.code == KeyCode::Char(' ') {
+            app.refresh_completion(true);
+            return;
+        }
+        if app.completion.visible {
+            match key.code {
+                KeyCode::Up => {
+                    app.completion.move_selection(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    app.completion.move_selection(1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if app.accept_completion() {
+                        return;
+                    }
+                }
+                KeyCode::Esc => {
+                    app.dismiss_completion();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     if ctrl {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('c') => {
@@ -255,7 +287,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab => app.toggle_focus(),
         KeyCode::Esc => app.focus = Focus::Input,
         _ => match app.focus {
-            Focus::Input => editor_key(&mut app.editor, key.code, ctrl),
+            Focus::Input => {
+                editor_key(&mut app.editor, key.code, ctrl);
+                app.refresh_completion(false);
+            }
             Focus::Grid => grid_key(app, key.code),
             Focus::Browser => browser_key(app, key.code),
         },

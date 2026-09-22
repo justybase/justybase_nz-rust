@@ -140,9 +140,11 @@ fn write_xlsx(result: &QueryResult, path: &Path) -> Result<(), String> {
 fn write_xlsb(result: &QueryResult, path: &Path) -> Result<(), String> {
     let mut writer = XlsbWriter::create(path).map_err(|e| e.to_string())?;
     if result.result_sets.is_empty() {
-        writer.add_sheet("Sheet1", false);
         writer
-            .write_sheet(vec![], Some(&[]), false)
+            .start_sheet("Sheet1", 0, Some(&[]), XlsbSheetOptions::new())
+            .map_err(|e| e.to_string())?;
+        writer
+            .end_sheet()
             .map_err(|e| e.to_string())?;
     }
     for (i, set) in result.result_sets.iter().enumerate() {
@@ -237,6 +239,31 @@ mod tests {
             assert!(reader.read().unwrap());
             assert_eq!(reader.get_value(0), CellValue::Number(7.0));
             assert!(matches!(reader.get_value(1), CellValue::DateTime(_)));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn workbook_extension_detection_is_case_insensitive() {
+        assert!(is_workbook_path("report.xlsx"));
+        assert!(is_workbook_path("REPORT.XLSX"));
+        assert!(is_workbook_path("report.xlsb"));
+        assert!(is_workbook_path("REPORT.XLSB"));
+        assert!(!is_workbook_path("report.txt"));
+    }
+
+    #[test]
+    fn empty_result_can_still_be_written_as_xlsx_and_xlsb() {
+        let result = QueryResult {
+            result_sets: Vec::new(),
+            rows_affected: 0,
+            notices: Vec::new(),
+        };
+        for ext in ["xlsx", "xlsb"] {
+            let path = unique_temp(&format!("empty.{ext}"));
+            let _ = std::fs::remove_file(&path);
+            write_query_result_to_workbook(&result, &path).unwrap();
+            assert!(path.exists(), "empty export file missing for {ext}");
             let _ = std::fs::remove_file(&path);
         }
     }

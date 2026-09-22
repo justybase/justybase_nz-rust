@@ -2,9 +2,11 @@
 //! query history and the message log.
 
 use crate::browser::{Activation, Browser};
+use crate::completion::{self, CompletionState};
 use crate::grid;
 use crate::worker::{Job, WorkerEvent};
 use nz_rust::{NzConnectionConfig, QueryResult, ResultSet};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +38,14 @@ impl Editor {
             top: 0,
             left: 0,
         }
+    }
+
+    /// Create a buffer from text for parser/editor unit tests.
+    #[cfg(test)]
+    pub fn from_text(text: &str) -> Self {
+        let mut editor = Self::new();
+        editor.set_text(text);
+        editor
     }
 
     /// The whole buffer as text.
@@ -130,6 +140,24 @@ impl Editor {
             self.lines[r].insert(c + inserted, ' ');
         }
         self.cur.1 = c + inserted;
+    }
+
+    /// Replace a range on one line and place the cursor after the inserted
+    /// text. Completion ranges are always confined to the current line.
+    pub fn replace_range(
+        &mut self,
+        start: (usize, usize),
+        end: (usize, usize),
+        text: &str,
+    ) {
+        if start.0 != end.0 || start.0 >= self.lines.len() {
+            return;
+        }
+        let line = &mut self.lines[start.0];
+        let from = start.1.min(line.len());
+        let to = end.1.min(line.len()).max(from);
+        line.splice(from..to, text.chars());
+        self.cur = (start.0, from + text.chars().count());
     }
 
     pub fn move_left(&mut self) {
@@ -266,6 +294,11 @@ pub struct App {
     pub browser_loaded: bool,
     /// Table index whose column load is in flight (for the spinner/state).
     pub loading_columns: Option<usize>,
+    /// Column loads queued by the browser or completion, deduplicated by
+    /// catalog table index.
+    pending_column_loads: HashSet<usize>,
+    /// Current editor completion popup and replacement range.
+    pub completion: CompletionState,
     /// Backend key data for the out-of-band cancel (the worker owns the
     /// connection itself).
     cancel_config: NzConnectionConfig,
@@ -308,6 +341,8 @@ impl App {
             show_browser: false,
             browser_loaded: false,
             loading_columns: None,
+            pending_column_loads: HashSet::new(),
+            completion: CompletionState::default(),
             cancel_config: config,
             cancel_pid: pid,
             cancel_key: key,
@@ -356,6 +391,7 @@ impl App {
     /// Queue the buffer for execution on the worker thread. Non-blocking:
     /// the UI keeps ticking and [`App::drain_events`] finishes the job.
     pub fn execute(&mut self) {
+        self.completion.dismiss();
         let sql = self.editor.text().trim().to_string();
         if sql.is_empty() {
             self.push_log("Nothing to execute.");
@@ -431,6 +467,7 @@ impl App {
                             .set_tables(tables.iter().map(|t| t.clone().into()).collect());
                         self.browser_loaded = true;
                         self.push_log(format!("Schema: {count} table(s)"));
+                        self.refresh_completion(false);
                     }
                     Err(e) => self.push_log(format!("Schema load failed: {e}")),
                 },
@@ -438,7 +475,8 @@ impl App {
                     table_index,
                     result,
                 } => {
-                    self.loading_columns = None;
+                    self.pending_column_loads.remove(&table_index);
+                    self.loading_columns = self.pending_column_loads.iter().next().copied();
                     match result {
                         Ok(cols) => {
                             self.browser
@@ -451,6 +489,7 @@ impl App {
                             self.browser.set_columns(table_index, Vec::new());
                         }
                     }
+                    self.refresh_completion(false);
                 }
             }
         }
@@ -484,6 +523,7 @@ impl App {
         self.history_pos = Some(pos);
         let sql = self.history[pos].clone();
         self.editor.set_text(&sql);
+        self.completion.dismiss();
         self.focus = Focus::Input;
     }
 
@@ -496,12 +536,14 @@ impl App {
         if pos + 1 >= self.history.len() {
             self.history_pos = None;
             self.editor = Editor::new();
+            self.completion.dismiss();
             self.focus = Focus::Input;
             return;
         }
         self.history_pos = Some(pos + 1);
         let sql = self.history[pos + 1].clone();
         self.editor.set_text(&sql);
+        self.completion.dismiss();
         self.focus = Focus::Input;
     }
 
@@ -634,6 +676,7 @@ impl App {
     /// Show/hide the sidebar. Showing it focuses it; hiding returns to the
     /// editor.
     pub fn toggle_browser(&mut self) {
+        self.completion.dismiss();
         self.show_browser = !self.show_browser;
         if self.show_browser {
             self.load_schema();
@@ -658,7 +701,9 @@ impl App {
         match self.browser.activate() {
             Activation::Toggle(i) => {
                 self.browser.toggle(i);
-                self.loading_columns = None;
+                if self.loading_columns == Some(i) {
+                    self.loading_columns = None;
+                }
             }
             Activation::LoadAndExpand(i) => {
                 let Some((schema, table)) = self.browser.qualified_parts(i) else {
@@ -667,18 +712,7 @@ impl App {
                 // Mark expanded immediately (empty) so a second Enter does not
                 // double-queue the load; the event fills the columns in.
                 self.browser.set_columns(i, Vec::new());
-                self.loading_columns = Some(i);
-                if self
-                    .jobs
-                    .send(Job::LoadColumns {
-                        schema,
-                        table,
-                        table_index: i,
-                    })
-                    .is_err()
-                {
-                    self.push_log("ERROR: worker is gone");
-                }
+                self.queue_columns(i, schema, table);
             }
             Activation::InsertColumn {
                 table_index: _,
@@ -686,6 +720,7 @@ impl App {
             } => {
                 self.editor.insert_word(&name);
                 self.focus = Focus::Input;
+                self.completion.dismiss();
             }
             Activation::None => {}
         }
@@ -705,6 +740,55 @@ impl App {
                 .take(current.chars().count().saturating_sub(1))
                 .collect::<String>(),
         );
+    }
+
+    /// Recompute completion candidates after an editor event and request any
+    /// referenced table columns that have not been loaded yet.
+    pub fn refresh_completion(&mut self, force: bool) {
+        let analysis = completion::analyze(&self.editor, &self.browser, force);
+        for table_index in &analysis.missing_tables {
+            let Some((schema, table)) = self.browser.qualified_parts(*table_index) else {
+                continue;
+            };
+            self.queue_columns(*table_index, schema, table);
+        }
+        self.completion.apply(analysis);
+    }
+
+    /// Accept the currently selected completion item.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(item) = self.completion.selected_item().cloned() else {
+            return false;
+        };
+        let start = self.completion.replace_start;
+        let end = self.completion.replace_end;
+        self.editor.replace_range(start, end, &item.insert_text);
+        self.completion.dismiss();
+        true
+    }
+
+    pub fn dismiss_completion(&mut self) {
+        self.completion.dismiss();
+    }
+
+    fn queue_columns(&mut self, table_index: usize, schema: String, table: String) {
+        if !self.pending_column_loads.insert(table_index) {
+            self.loading_columns = Some(table_index);
+            return;
+        }
+        self.loading_columns = Some(table_index);
+        if self
+            .jobs
+            .send(Job::LoadColumns {
+                schema,
+                table,
+                table_index,
+            })
+            .is_err()
+        {
+            self.pending_column_loads.remove(&table_index);
+            self.push_log("ERROR: worker is gone");
+        }
     }
 
     /// True while a query is in flight; the status bar shows elapsed time.

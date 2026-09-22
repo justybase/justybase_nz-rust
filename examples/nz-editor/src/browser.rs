@@ -238,6 +238,27 @@ impl Browser {
         self.tables.len()
     }
 
+    /// All tables currently known to the catalog snapshot.
+    pub fn tables(&self) -> &[TableEntry] {
+        &self.tables
+    }
+
+    /// Columns loaded for a table, or `None` while that table is still lazy.
+    pub fn columns_for(&self, table_index: usize) -> Option<&[ColumnEntry]> {
+        self.columns.get(table_index).and_then(|columns| columns.as_deref())
+    }
+
+    /// Find a catalog table by case-insensitive schema/name.
+    pub fn find_table_index(&self, schema: Option<&str>, name: &str) -> Option<usize> {
+        self.tables.iter().enumerate().find_map(|(index, table)| {
+            let same_name = table.name.eq_ignore_ascii_case(name);
+            let same_schema = schema
+                .map(|schema| table.schema.eq_ignore_ascii_case(schema))
+                .unwrap_or(true);
+            (same_name && same_schema).then_some(index)
+        })
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected
     }

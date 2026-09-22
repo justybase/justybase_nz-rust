@@ -7,7 +7,7 @@ use nz_rust::{NzValue, ResultSet};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 /// Rows spent on the two fixed status header lines (focus/connection and the
@@ -244,6 +244,77 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
+    draw_completion(frame, inner, app);
+}
+
+fn draw_completion(frame: &mut Frame, editor_area: Rect, app: &App) {
+    if app.focus != Focus::Input || !app.completion.visible || app.completion.items.is_empty() {
+        return;
+    }
+    let max_label = app
+        .completion
+        .items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let max_detail = app
+        .completion
+        .items
+        .iter()
+        .map(|item| item.detail.chars().count())
+        .max()
+        .unwrap_or(0);
+    let popup_width = (max_label + max_detail + 7).clamp(18, 54) as u16;
+    let popup_height = (app.completion.items.len() + 2) as u16;
+    let cursor_x = editor_area
+        .x
+        .saturating_add((app.editor.cur.1.saturating_sub(app.editor.left)) as u16);
+    let cursor_y = editor_area
+        .y
+        .saturating_add((app.editor.cur.0.saturating_sub(app.editor.top)) as u16);
+    let x = cursor_x
+        .min(editor_area.right().saturating_sub(popup_width))
+        .max(editor_area.x);
+    let below = cursor_y.saturating_add(1);
+    let y = if below.saturating_add(popup_height) <= editor_area.bottom() {
+        below
+    } else {
+        cursor_y.saturating_sub(popup_height).max(editor_area.y)
+    };
+    let height = popup_height.min(editor_area.bottom().saturating_sub(y));
+    let width = popup_width.min(editor_area.right().saturating_sub(x));
+    if width < 4 || height < 3 {
+        return;
+    }
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let lines = app
+        .completion
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let marker = match item.kind {
+                crate::completion::CompletionKind::Keyword => "K",
+                crate::completion::CompletionKind::Table => "T",
+                crate::completion::CompletionKind::Column => "C",
+            };
+            let detail = format!("{marker} {}", item.detail);
+            let body = format!(" {marker} {:<width$}  {}", item.label, detail, width = max_label);
+            let body = fit_text(&body, width.saturating_sub(2) as usize);
+            let style = if index == app.completion.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(body, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
 }
 
 fn clip_highlighted_line(spans: Vec<HighlightSpan>, left: usize, width: usize) -> Line<'static> {
