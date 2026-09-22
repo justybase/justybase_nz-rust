@@ -31,8 +31,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo package --locked --list > package-files.txt
-          ! grep -E '^(benchmarks/|examples/nz-editor/|AGENTS\.md$|\.github/|\.agents/|\.codex/)' package-files.txt
+          package_list="$RUNNER_TEMP/package-files.txt"
+          cargo package --locked --list > "$package_list"
+          ! grep -E '^(benchmarks/|examples/nz-editor/|AGENTS\.md$|\.github/|\.agents/|\.codex/)' "$package_list"
 
   msrv:
     name: Rust MSRV 1.87
