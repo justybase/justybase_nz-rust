@@ -523,6 +523,11 @@ pub trait QueryStreamSink {
     fn on_notice(&mut self, _message: &str) -> NzResult<()> {
         Ok(())
     }
+
+    /// Called for each server command completion in a simple-query batch.
+    fn on_command_complete(&mut self, _tag: &str, _rows_affected: i64) -> NzResult<()> {
+        Ok(())
+    }
 }
 
 /// Metadata and counters returned after a streaming execution.
@@ -1406,6 +1411,10 @@ impl NzConnection {
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
                         }
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.on_command_complete(text.trim_matches('\0').trim(), n)
+                                .map_err(stream_sink_error)?;
+                        }
                     }
                     code::READY_FOR_QUERY | code::READY_FOR_QUERY_ALT => {
                         if sink.is_some() {
@@ -1444,10 +1453,7 @@ impl NzConnection {
                     code::NOTICE_RESPONSE => {
                         let len = self.read_len("noticeResponsePayload")?;
                         let data = self.read_payload(len, "noticeResponsePayload")?;
-                        let msg = String::from_utf8_lossy(&data)
-                            .replace('\0', "")
-                            .trim()
-                            .to_string();
+                        let msg = parse_backend_error_fields(&data).message;
                         if !msg.is_empty() {
                             if let Some(sink) = sink.as_deref_mut() {
                                 sink.on_notice(&msg).map_err(stream_sink_error)?;

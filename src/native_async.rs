@@ -31,7 +31,7 @@ use bytes::{Buf, BytesMut};
 use futures_core::Stream;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
@@ -127,6 +127,7 @@ enum Request {
     Stream {
         sql: String,
         rows: mpsc::Sender<NzResult<Row>>,
+        notices: Arc<Mutex<Vec<String>>>,
     },
     Close {
         response: Response<()>,
@@ -137,6 +138,17 @@ enum Request {
 /// wire while `poll_next` applies backpressure through the bounded channel.
 pub struct RowStream {
     receiver: mpsc::Receiver<NzResult<Row>>,
+    notices: Arc<Mutex<Vec<String>>>,
+}
+
+impl RowStream {
+    /// Snapshot notices received so far while this result stream is running.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|notices| notices.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Stream for RowStream {
@@ -234,11 +246,16 @@ impl Client {
         let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
         let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
         let (sender, receiver) = mpsc::channel(32);
+        let notices = Arc::new(Mutex::new(Vec::new()));
         self.requests
-            .send(Request::Stream { sql, rows: sender })
+            .send(Request::Stream {
+                sql,
+                rows: sender,
+                notices: notices.clone(),
+            })
             .await
             .map_err(|_| NzError::Closed("connection task is closed".into()))?;
-        Ok(RowStream { receiver })
+        Ok(RowStream { receiver, notices })
     }
 
     pub async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
@@ -317,8 +334,8 @@ async fn run_connection(
                     return Ok(());
                 }
             }
-            Request::Stream { sql, rows } => {
-                if let Err(error) = session.stream_query(&sql, &rows).await {
+            Request::Stream { sql, rows, notices } => {
+                if let Err(error) = session.stream_query(&sql, &rows, &notices).await {
                     let reusable = matches!(&error, NzError::Database(_));
                     let _ = rows.send(Err(error)).await;
                     if !reusable {
@@ -601,10 +618,11 @@ impl AsyncSession {
         &mut self,
         sql: &str,
         rows: &mpsc::Sender<NzResult<Row>>,
+        notices: &Arc<Mutex<Vec<String>>>,
     ) -> NzResult<()> {
         let timeout = (self.config.command_timeout > 0)
             .then(|| Duration::from_secs(self.config.command_timeout));
-        let future = self.stream_query_inner(sql, rows);
+        let future = self.stream_query_inner(sql, rows, notices);
         if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, future)
                 .await
@@ -618,6 +636,7 @@ impl AsyncSession {
         &mut self,
         sql: &str,
         rows: &mpsc::Sender<NzResult<Row>>,
+        notices: &Arc<Mutex<Vec<String>>>,
     ) -> NzResult<()> {
         self.command_number = (self.command_number % 100_000) + 1;
         let mut packet = Vec::with_capacity(sql.len() + 6);
@@ -629,7 +648,7 @@ impl AsyncSession {
             .write_all(&packet)
             .await
             .map_err(NzError::Io)?;
-        self.drain_response_stream(rows).await
+        self.drain_response_stream(rows, notices).await
     }
 
     async fn drain_response(&mut self) -> NzResult<QueryResult> {
@@ -762,10 +781,7 @@ impl AsyncSession {
                         validate_protocol_length(self.read_i32().await?, "noticePayload", true)?
                             as usize;
                     let data = self.read_bytes(len).await?;
-                    let message = String::from_utf8_lossy(&data)
-                        .replace('\0', "")
-                        .trim()
-                        .to_owned();
+                    let message = parse_backend_error_fields(&data).message;
                     if !message.is_empty() {
                         notices.push(message);
                     }
@@ -814,7 +830,11 @@ impl AsyncSession {
         }
     }
 
-    async fn drain_response_stream(&mut self, rows: &mpsc::Sender<NzResult<Row>>) -> NzResult<()> {
+    async fn drain_response_stream(
+        &mut self,
+        rows: &mpsc::Sender<NzResult<Row>>,
+        notices: &Arc<Mutex<Vec<String>>>,
+    ) -> NzResult<()> {
         let mut cached_columns: Option<Arc<[ColumnDesc]>> = None;
         let mut descriptor: Option<Arc<DbosTupleDesc>> = None;
         let mut current_columns: Option<Arc<[ColumnDesc]>> = None;
@@ -983,7 +1003,14 @@ impl AsyncSession {
                     let len =
                         validate_protocol_length(self.read_i32().await?, "noticePayload", true)?
                             as usize;
-                    let _ = self.read_bytes(len).await?;
+                    let data = self.read_bytes(len).await?;
+                    let message = parse_backend_error_fields(&data).message;
+                    if !message.is_empty() {
+                        notices
+                            .lock()
+                            .map_err(|_| NzError::Closed("notice state unavailable".into()))?
+                            .push(message);
+                    }
                 }
                 code::ERROR_RESPONSE => {
                     let len =
