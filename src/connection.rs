@@ -49,15 +49,23 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncRead;
 
 // ---------------------------------------------------------------------------
-// Virtual import streams (external-table `l` import from memory)
+// Virtual import sources (external-table `l` import)
 // ---------------------------------------------------------------------------
 
-fn import_registry() -> &'static Mutex<HashMap<String, Vec<u8>>> {
-    static REG: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+pub(crate) enum ImportSource {
+    Bytes(Vec<u8>),
+    Reader(Box<dyn Read + Send>),
+    AsyncReader(Pin<Box<dyn AsyncRead + Send>>),
+}
+
+fn import_registry() -> &'static Mutex<HashMap<String, ImportSource>> {
+    static REG: OnceLock<Mutex<HashMap<String, ImportSource>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -68,7 +76,26 @@ fn import_registry() -> &'static Mutex<HashMap<String, Vec<u8>>> {
 /// the Rust analog of `NzConnection.registerImportStream` in the Node driver.
 pub fn register_import_data(id: &str, data: Vec<u8>) {
     if let Ok(mut reg) = import_registry().lock() {
-        reg.insert(id.to_string(), data);
+        reg.insert(id.to_string(), ImportSource::Bytes(data));
+    }
+}
+
+/// Register a one-shot synchronous reader for an external-table import.
+///
+/// The reader is consumed only when the appliance requests `id`. It is read
+/// in bounded chunks, so the entire payload need not reside in memory.
+/// Use this with [`NzConnection`]; use [`register_async_import_reader`] with
+/// the native Tokio client.
+pub fn register_import_reader(id: &str, reader: impl Read + Send + 'static) {
+    if let Ok(mut reg) = import_registry().lock() {
+        reg.insert(id.to_string(), ImportSource::Reader(Box::new(reader)));
+    }
+}
+
+/// Register a one-shot Tokio reader for an external-table import.
+pub fn register_async_import_reader(id: &str, reader: impl AsyncRead + Send + 'static) {
+    if let Ok(mut reg) = import_registry().lock() {
+        reg.insert(id.to_string(), ImportSource::AsyncReader(Box::pin(reader)));
     }
 }
 
@@ -79,7 +106,7 @@ pub fn unregister_import_data(id: &str) {
     }
 }
 
-pub(crate) fn take_import_data(id: &str) -> Option<Vec<u8>> {
+pub(crate) fn take_import_source(id: &str) -> Option<ImportSource> {
     import_registry().lock().ok()?.remove(id)
 }
 
@@ -490,9 +517,10 @@ pub struct QueryResult {
 /// Receives rows while the protocol response is being decoded.
 ///
 /// Implementations should apply backpressure when forwarding a row to a
-/// result store. Returning an error aborts the stream; the connection is then
-/// considered unsafe to reuse because the remaining backend response has not
-/// necessarily been drained.
+/// result store. Returning an error aborts delivery, sends a best-effort
+/// out-of-band cancel, and drains the backend response through ReadyForQuery
+/// before returning the sink error. The connection remains reusable when that
+/// drain succeeds.
 pub trait QueryStreamSink {
     fn on_columns(
         &mut self,
@@ -1185,7 +1213,11 @@ impl NzConnection {
         self.executing = false;
         self.command_deadline = None;
         match result {
-            Ok(mut summary) => {
+            Ok((_summary, Some(sink_error))) => {
+                self.restore_tx_on_error(sql, prev_in_tx);
+                Err(sink_error)
+            }
+            Ok((mut summary, None)) => {
                 if summary.rows_affected < 0 {
                     let row_count: u64 = summary.result_sets.iter().map(|set| set.row_count).sum();
                     if row_count > 0 {
@@ -1237,26 +1269,30 @@ impl NzConnection {
 
     /// Drain one full backend response (up to `Z` / `L`) into a [`QueryResult`].
     fn drain_response(&mut self) -> NzResult<QueryResult> {
-        let (result, _) = self.drain_response_with_sink(None)?;
+        let (result, _, sink_error) = self.drain_response_with_sink(None)?;
+        debug_assert!(sink_error.is_none());
         Ok(result)
     }
 
     fn drain_response_stream<S: QueryStreamSink>(
         &mut self,
         sink: &mut S,
-    ) -> NzResult<StreamSummary> {
-        let (result, result_sets) = self.drain_response_with_sink(Some(sink))?;
-        Ok(StreamSummary {
-            result_sets,
-            rows_affected: result.rows_affected,
-            notices: result.notices,
-        })
+    ) -> NzResult<(StreamSummary, Option<NzError>)> {
+        let (result, result_sets, sink_error) = self.drain_response_with_sink(Some(sink))?;
+        Ok((
+            StreamSummary {
+                result_sets,
+                rows_affected: result.rows_affected,
+                notices: result.notices,
+            },
+            sink_error,
+        ))
     }
 
     fn drain_response_with_sink(
         &mut self,
         mut sink: Option<&mut dyn QueryStreamSink>,
-    ) -> NzResult<(QueryResult, Vec<StreamResultSet>)> {
+    ) -> NzResult<(QueryResult, Vec<StreamResultSet>, Option<NzError>)> {
         let mut sets: Vec<ResultSet> = Vec::new();
         let mut current: Option<ResultSet> = None;
         let mut cached_columns: Option<Vec<ColumnDesc>> = None;
@@ -1275,6 +1311,18 @@ impl NzConnection {
         let mut stream_var_starts: Vec<usize> = Vec::new();
         let mut row_columns: Option<Arc<[ColumnDesc]>> = None;
         let mut error: Option<NzError> = None;
+        let mut sink_error: Option<NzError> = None;
+        let mut sink_cancel_sent = false;
+
+        macro_rules! cancel_if_sink_aborted {
+            ($new_error:expr) => {
+                if $new_error && !sink_cancel_sent {
+                    sink_cancel_sent = true;
+                    self.protocol_sync_required = true;
+                    let _ = self.cancel();
+                }
+            };
+        }
 
         let outcome: NzResult<()> = (|| {
             loop {
@@ -1327,25 +1375,29 @@ impl NzConnection {
                                     &mut next_result_set_index,
                                 )
                             };
-                            emit_stream_row(
+                            let new_sink_error = emit_stream_row(
                                 &mut sink,
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 result_set_index,
                                 &stream_values,
-                            )?;
+                                &mut sink_error,
+                            );
+                            cancel_if_sink_aborted!(new_sink_error);
                             while self.try_read_available_dbos_row(
                                 &tupdesc,
                                 has_tupdesc,
                                 &mut stream_values,
                             )? {
-                                emit_stream_row(
+                                let new_sink_error = emit_stream_row(
                                     &mut sink,
                                     &mut stream_result_sets,
                                     &mut stream_columns_sent,
                                     result_set_index,
                                     &stream_values,
-                                )?;
+                                    &mut sink_error,
+                                );
+                                cancel_if_sink_aborted!(new_sink_error);
                             }
                         } else {
                             let payload = self.read_dbos_payload(has_tupdesc)?;
@@ -1402,18 +1454,25 @@ impl NzConnection {
                             };
                         }
                         if sink.is_some() {
-                            finish_stream_result_set(
+                            let new_sink_error = finish_stream_result_set(
                                 &mut sink,
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 &mut current_result_set_index,
-                            )?;
+                                &mut sink_error,
+                            );
+                            cancel_if_sink_aborted!(new_sink_error);
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
                         }
-                        if let Some(sink) = sink.as_deref_mut() {
-                            sink.on_command_complete(text.trim_matches('\0').trim(), n)
-                                .map_err(stream_sink_error)?;
+                        if sink_error.is_none() {
+                            if let Some(sink) = sink.as_deref_mut() {
+                                let new_sink_error = record_stream_sink_result(
+                                    &mut sink_error,
+                                    sink.on_command_complete(text.trim_matches('\0').trim(), n),
+                                );
+                                cancel_if_sink_aborted!(new_sink_error);
+                            }
                         }
                     }
                     code::READY_FOR_QUERY | code::READY_FOR_QUERY_ALT => {
@@ -1423,10 +1482,12 @@ impl NzConnection {
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 &mut current_result_set_index,
-                            )?;
+                                &mut sink_error,
+                            );
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
                         }
+                        self.protocol_sync_required = false;
                         break;
                     }
                     code::CONTROL_ZERO | code::CONTROL_A => {}
@@ -1455,8 +1516,14 @@ impl NzConnection {
                         let data = self.read_payload(len, "noticeResponsePayload")?;
                         let msg = parse_backend_error_fields(&data).message;
                         if !msg.is_empty() {
-                            if let Some(sink) = sink.as_deref_mut() {
-                                sink.on_notice(&msg).map_err(stream_sink_error)?;
+                            if sink_error.is_none() {
+                                if let Some(sink) = sink.as_deref_mut() {
+                                    let new_sink_error = record_stream_sink_result(
+                                        &mut sink_error,
+                                        sink.on_notice(&msg),
+                                    );
+                                    cancel_if_sink_aborted!(new_sink_error);
+                                }
                             }
                             notices.push(msg);
                         }
@@ -1466,12 +1533,14 @@ impl NzConnection {
                         let data = self.read_payload(len, "rowDescriptionPayload")?;
                         let cols = parse_row_description(&data)?;
                         if sink.is_some() {
-                            finish_stream_result_set(
+                            let new_sink_error = finish_stream_result_set(
                                 &mut sink,
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 &mut current_result_set_index,
-                            )?;
+                                &mut sink_error,
+                            );
+                            cancel_if_sink_aborted!(new_sink_error);
                             let _ = ensure_stream_result_set(
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
@@ -1514,13 +1583,15 @@ impl NzConnection {
                                     &mut next_result_set_index,
                                 )
                             };
-                            emit_stream_row(
+                            let new_sink_error = emit_stream_row(
                                 &mut sink,
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 result_set_index,
                                 &stream_values,
-                            )?;
+                                &mut sink_error,
+                            );
+                            cancel_if_sink_aborted!(new_sink_error);
                         } else {
                             let cols = current_columns(&current, &cached_columns)?;
                             let columns = row_columns
@@ -1560,12 +1631,14 @@ impl NzConnection {
                                 &mut next_result_set_index,
                             );
                             stream_result_sets[result_set_index].nullability = nullability.clone();
-                            emit_stream_columns(
+                            let new_sink_error = emit_stream_columns(
                                 &mut sink,
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
                                 result_set_index,
-                            )?;
+                                &mut sink_error,
+                            );
+                            cancel_if_sink_aborted!(new_sink_error);
                         }
                     }
                     _ => {
@@ -1605,11 +1678,22 @@ impl NzConnection {
                         &mut stream_result_sets,
                         &mut stream_columns_sent,
                         &mut current_result_set_index,
-                    )?;
+                        &mut sink_error,
+                    );
                 } else {
                     flush_current(&mut current, &mut sets, &mut row_columns);
                 }
-                if let Some(e) = error {
+                if let Some(sink_error) = sink_error {
+                    Ok((
+                        QueryResult {
+                            result_sets: sets,
+                            rows_affected,
+                            notices,
+                        },
+                        stream_result_sets,
+                        Some(sink_error),
+                    ))
+                } else if let Some(e) = error {
                     Err(e)
                 } else {
                     Ok((
@@ -1619,6 +1703,7 @@ impl NzConnection {
                             notices,
                         },
                         stream_result_sets,
+                        None,
                     ))
                 }
             }
@@ -2172,11 +2257,20 @@ impl NzConnection {
         let buf_size = cfg?.max(1);
 
         // Virtual stream first, then the filesystem (Node parity).
-        if let Some(data) = take_import_data(&filename) {
-            return self.send_import_bytes(&data, buf_size);
+        if let Some(source) = take_import_source(&filename) {
+            return match source {
+                ImportSource::Bytes(data) => {
+                    self.send_import_reader(std::io::Cursor::new(data), buf_size)
+                }
+                ImportSource::Reader(reader) => self.send_import_reader(reader, buf_size),
+                ImportSource::AsyncReader(_) => {
+                    self.write_all_raw(&2i32.to_be_bytes())?;
+                    Ok(())
+                }
+            };
         }
-        match std::fs::read(&filename) {
-            Ok(data) => self.send_import_bytes(&data, buf_size),
+        match File::open(&filename) {
+            Ok(file) => self.send_import_reader(file, buf_size),
             Err(_) => {
                 // File missing → ERROR status (C#/Node parity).
                 self.write_all_raw(&2i32.to_be_bytes())?;
@@ -2185,18 +2279,26 @@ impl NzConnection {
         }
     }
 
-    fn send_import_bytes(&mut self, data: &[u8], buffer_size: usize) -> NzResult<()> {
+    fn send_import_reader(&mut self, mut reader: impl Read, buffer_size: usize) -> NzResult<()> {
         // DATA chunks: status(4)=1 + len(4) + bytes, then DONE status(4)=3.
-        let chunk_size = buffer_size.max(1);
-        let mut off = 0;
-        while off < data.len() {
-            let chunk = &data[off..(off + chunk_size).min(data.len())];
-            let mut header = Vec::with_capacity(8);
-            header.extend_from_slice(&1i32.to_be_bytes());
-            header.extend_from_slice(&(chunk.len() as i32).to_be_bytes());
+        let mut chunk = vec![0; buffer_size.clamp(1, 64 * 1024)];
+        loop {
+            let count = match reader.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.write_all_raw(&2i32.to_be_bytes())?;
+                    return Ok(());
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            let mut header = [0u8; 8];
+            header[..4].copy_from_slice(&1i32.to_be_bytes());
+            header[4..].copy_from_slice(&(count as i32).to_be_bytes());
             self.write_all_raw(&header)?;
-            self.write_all_raw(chunk)?;
-            off += chunk.len();
+            self.write_all_raw(&chunk[..count])?;
         }
         self.write_all_raw(&3i32.to_be_bytes())
     }
@@ -2333,21 +2435,30 @@ fn emit_stream_columns(
     result_sets: &mut [StreamResultSet],
     columns_sent: &mut [bool],
     result_set_index: usize,
-) -> NzResult<()> {
+    sink_error: &mut Option<NzError>,
+) -> bool {
+    if sink_error.is_some() {
+        columns_sent[result_set_index] = true;
+        return false;
+    }
     if columns_sent[result_set_index] {
-        return Ok(());
+        return false;
     }
     if let Some(sink) = sink.as_deref_mut() {
         let result_set = &result_sets[result_set_index];
-        sink.on_columns(
-            result_set_index,
-            &result_set.columns,
-            result_set.nullability.as_deref(),
-        )
-        .map_err(stream_sink_error)?;
+        let new_sink_error = record_stream_sink_result(
+            sink_error,
+            sink.on_columns(
+                result_set_index,
+                &result_set.columns,
+                result_set.nullability.as_deref(),
+            ),
+        );
+        columns_sent[result_set_index] = true;
+        return new_sink_error;
     }
     columns_sent[result_set_index] = true;
-    Ok(())
+    false
 }
 
 fn emit_stream_row(
@@ -2356,23 +2467,37 @@ fn emit_stream_row(
     columns_sent: &mut [bool],
     result_set_index: usize,
     values: &[NzValue],
-) -> NzResult<()> {
-    emit_stream_columns(sink, result_sets, columns_sent, result_set_index)?;
-    if let Some(sink) = sink.as_deref_mut() {
-        let columns = &result_sets[result_set_index].columns;
-        sink.on_values(result_set_index, columns, values)
-            .map_err(stream_sink_error)?;
+    sink_error: &mut Option<NzError>,
+) -> bool {
+    let mut new_sink_error = emit_stream_columns(
+        sink,
+        result_sets,
+        columns_sent,
+        result_set_index,
+        sink_error,
+    );
+    if sink_error.is_none() {
+        if let Some(sink) = sink.as_deref_mut() {
+            let columns = &result_sets[result_set_index].columns;
+            new_sink_error |= record_stream_sink_result(
+                sink_error,
+                sink.on_values(result_set_index, columns, values),
+            );
+        }
     }
     result_sets[result_set_index].row_count += 1;
-    Ok(())
+    new_sink_error
 }
 
-fn stream_sink_error(error: NzError) -> NzError {
-    match error {
-        NzError::Protocol(_) => error,
-        other => NzError::Protocol(format!(
-            "stream sink aborted before the backend response was drained: {other}; reconnect required"
-        )),
+fn record_stream_sink_result(sink_error: &mut Option<NzError>, result: NzResult<()>) -> bool {
+    if sink_error.is_some() {
+        return false;
+    }
+    if let Err(error) = result {
+        *sink_error = Some(error);
+        true
+    } else {
+        false
     }
 }
 
@@ -2381,11 +2506,12 @@ fn finish_stream_result_set(
     result_sets: &mut [StreamResultSet],
     columns_sent: &mut [bool],
     current: &mut Option<usize>,
-) -> NzResult<()> {
+    sink_error: &mut Option<NzError>,
+) -> bool {
     if let Some(index) = current.take() {
-        emit_stream_columns(sink, result_sets, columns_sent, index)?;
+        return emit_stream_columns(sink, result_sets, columns_sent, index, sink_error);
     }
-    Ok(())
+    false
 }
 
 fn current_columns(
@@ -2763,12 +2889,5 @@ mod tests {
         ] {
             assert!(validate_catalog_identifier(invalid).is_err(), "{invalid:?}");
         }
-    }
-
-    #[test]
-    fn sink_failure_is_connection_fatal() {
-        let error = stream_sink_error(NzError::Config("consumer stopped".into()));
-        assert!(error.is_protocol_fault());
-        assert!(error.to_string().contains("reconnect required"));
     }
 }

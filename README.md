@@ -278,12 +278,18 @@ println!("{} result sets", summary.result_sets.len());
 ```
 
 The sink may apply backpressure by blocking or returning an error. A sink
-error or protocol error makes the connection unsafe to reuse; reconnect before
-issuing another command. This prevents an aborted consumer from accidentally
-reading the remainder of an old response as a new query response.
+error stops row delivery, sends a best-effort cancel, and drains the backend
+response through ReadyForQuery before returning the sink error. The connection
+can be reused when that drain succeeds. A protocol framing error still makes
+the connection unsafe to reuse; reconnect before issuing another command.
 
 `StreamSummary` reports result-set metadata, row counts, affected rows and
 server notices. Multiple result sets are delivered in order.
+
+Override QueryStreamSink::on_notice to handle notices as they arrive during a
+query. The native Tokio client offers query_stream_events, whose
+QueryStreamEvent values include rows and notices in wire order; query_stream
+continues to yield rows only.
 
 ## Async and pooling APIs
 
@@ -360,6 +366,13 @@ keys, table sizes, sessions, object details and object search. Use
 `change_database` to switch catalogs without reconnecting when no transaction
 is active.
 
+Additional helpers expose current database and schema, sequences, users,
+groups, query history, detailed columns, table keys, comments and owners.
+table_ddl, view_ddl, procedure_ddl, external_table_ddl and synonym_ddl
+reconstruct SQL from catalog entries. tables_ddl, views_ddl and procedures_ddl
+return per-object results and errors for batch requests. Use an explicit
+procedure signature when a name has multiple overloads.
+
 ## External-table transfer
 
 The crate also exposes the Netezza external-table import/export framing used by
@@ -367,6 +380,12 @@ the workbench. Register import data with `register_import_data`, execute the
 corresponding external-table command, and unregister it when the transfer is
 complete. Invalid buffer sizes are reported as errors; they are not silently
 replaced with a default.
+
+Use register_import_reader for synchronous Read sources and
+register_async_import_reader for Tokio AsyncRead sources. Files and readers
+are read in bounded chunks, so large imports do not need to reside in memory.
+Typed extraction supports rust_decimal::Decimal. Enable the optional chrono
+feature for NaiveDate, NaiveTime, NaiveDateTime and NzTimeTz.
 
 ## Errors and connection lifecycle
 

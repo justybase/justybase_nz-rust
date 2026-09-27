@@ -14,6 +14,12 @@
 
 //! Netezza catalog helpers used by SQL clients and the editor.
 
+mod extended;
+pub use extended::{
+    NzDdlBatchResult, NzDetailedColumnInfo, NzGroupInfo, NzQueryHistoryInfo, NzSequenceInfo,
+    NzTableKeyInfo, NzUserInfo,
+};
+
 use crate::connection::NzConnection;
 use crate::error::{NzError, NzResult};
 use crate::params::escape_literal;

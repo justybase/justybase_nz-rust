@@ -13,7 +13,7 @@
 use futures_core::Stream;
 use nz_rust::{
     ColumnDesc, NzConnection, NzConnectionConfig, NzError, NzPool, NzPoolConfig, NzValue,
-    QueryStreamSink, Row,
+    QueryStreamEvent, QueryStreamSink, Row,
 };
 
 #[derive(Default)]
@@ -23,6 +23,7 @@ struct StreamProbe {
     cells: usize,
     column_events: Vec<(usize, usize)>,
     row_result_sets: Vec<usize>,
+    notices: Vec<String>,
 }
 
 impl QueryStreamSink for StreamProbe {
@@ -52,6 +53,44 @@ impl QueryStreamSink for StreamProbe {
         self.row_result_sets.push(result_set_index);
         Ok(())
     }
+
+    fn on_notice(&mut self, message: &str) -> Result<(), NzError> {
+        self.notices.push(message.to_owned());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct AbortAfterFirstRow {
+    rows: usize,
+}
+
+impl QueryStreamSink for AbortAfterFirstRow {
+    fn on_columns(
+        &mut self,
+        _result_set_index: usize,
+        _columns: &[ColumnDesc],
+        _nullability: Option<&[bool]>,
+    ) -> Result<(), NzError> {
+        Ok(())
+    }
+
+    fn on_row(&mut self, _result_set_index: usize, _row: Row) -> Result<(), NzError> {
+        self.rows += 1;
+        Err(NzError::Config("consumer canceled stream".into()))
+    }
+}
+
+fn unique_name(prefix: &str) -> String {
+    format!(
+        "{}_{}_{}",
+        prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    )
 }
 
 /// Returns the live config, or `None` when live tests are not opted into.
@@ -95,6 +134,15 @@ fn live_query_types_parameters_multi_result_and_transaction() {
     // Trailing zeros are preserved (Node/C# reference parity).
     assert_eq!(row.try_get::<_, String>("n").unwrap(), "3.1400");
     assert_eq!(row.try_get::<_, String>("d").unwrap(), "2024-01-02");
+    assert_eq!(
+        row.try_get::<_, nz_rust::Decimal>("n").unwrap(),
+        "3.1400".parse::<nz_rust::Decimal>().unwrap()
+    );
+    #[cfg(feature = "chrono")]
+    assert_eq!(
+        row.try_get::<_, chrono::NaiveDate>("d").unwrap(),
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()
+    );
 
     let params = vec![NzValue::Text("O'Brien".into()), NzValue::Int4(7)];
     let result = conn
@@ -149,6 +197,47 @@ fn live_streaming_sink_receives_rows_without_buffering_result_sets() {
 }
 
 #[test]
+fn live_streaming_sink_abort_cancels_and_preserves_same_session() {
+    let Some(mut config) = config() else {
+        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
+        return;
+    };
+    config.command_timeout = 0;
+    let mut conn = NzConnection::connect(&config).expect("connect/authentication");
+    let table = unique_name("CANCEL_STREAM_SESSION");
+    conn.batch_execute(&format!("CREATE TEMP TABLE {table} AS (SELECT 1 AS COL1)"))
+        .expect("create session marker");
+
+    let mut sink = AbortAfterFirstRow::default();
+    let error = conn
+        .execute_stream(
+            "SELECT 1 AS ONE FROM JUST_DATA..DIMDATE LIMIT 10000",
+            &[],
+            &mut sink,
+        )
+        .expect_err("sink abort should interrupt row delivery");
+    assert!(matches!(error, NzError::Config(message) if message == "consumer canceled stream"));
+    assert_eq!(
+        sink.rows, 1,
+        "rows should stop reaching the sink after abort"
+    );
+
+    let mut recovered = false;
+    for _ in 0..20 {
+        if let Ok(result) = conn.query(&format!("SELECT COL1 FROM {table}"), &[]) {
+            assert_eq!(result.rows()[0].try_get::<_, i32>(0).unwrap(), 1);
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        recovered,
+        "same session should be reusable after streaming sink abort"
+    );
+}
+
+#[test]
 fn live_streaming_sink_preserves_multiple_result_sets() {
     let Some(config) = config() else {
         eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
@@ -196,4 +285,184 @@ async fn live_native_client_query_and_bounded_stream() {
     assert_eq!(rows, 10);
     client.close().await.expect("native close");
     assert!(driver.await.unwrap().is_ok());
+}
+
+#[test]
+fn live_notices_arrive_during_streaming_query() {
+    let Some(config) = config() else { return };
+    let mut conn = NzConnection::connect(&config).unwrap();
+    let procedure = unique_name("RUST_NOTICE");
+    let sql = format!(
+        "CREATE OR REPLACE PROCEDURE {procedure}() RETURNS INTEGER EXECUTE AS OWNER LANGUAGE NZPLSQL AS BEGIN_PROC BEGIN RAISE NOTICE 'rust notice first'; RAISE NOTICE 'rust notice second'; END; END_PROC;"
+    );
+    conn.batch_execute(&sql).unwrap();
+    let mut sink = StreamProbe::default();
+    let outcome = conn.execute_stream(&format!("CALL {procedure}()"), &[], &mut sink);
+    let _ = conn.batch_execute(&format!("DROP PROCEDURE {procedure}()"));
+    outcome.unwrap();
+    assert!(
+        sink.notices.iter().any(|n| n.contains("rust notice first")),
+        "{:?}",
+        sink.notices
+    );
+    assert!(
+        sink.notices
+            .iter()
+            .any(|n| n.contains("rust notice second")),
+        "{:?}",
+        sink.notices
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_native_stream_emits_procedure_notices() {
+    let Some(config) = config() else { return };
+    let mut setup = NzConnection::connect(&config).unwrap();
+    let procedure = unique_name("RUST_ASYNC_NOTICE");
+    setup.batch_execute(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure}() RETURNS INTEGER EXECUTE AS OWNER LANGUAGE NZPLSQL AS BEGIN_PROC BEGIN RAISE NOTICE 'rust async first'; RAISE NOTICE 'rust async second'; END; END_PROC;"
+    )).unwrap();
+    let (client, connection) = nz_rust::connect(&config).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let mut events = client
+        .query_stream_events(&format!("CALL {procedure}()"), &[])
+        .await
+        .unwrap();
+    let mut notices = Vec::new();
+    while let Some(event) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut events).poll_next(cx)).await
+    {
+        if let QueryStreamEvent::Notice(message) = event.unwrap() {
+            notices.push(message);
+        }
+    }
+    client.close().await.unwrap();
+    driver.await.unwrap().unwrap();
+    let _ = setup.batch_execute(&format!("DROP PROCEDURE {procedure}()"));
+    assert!(
+        notices.iter().any(|n| n.contains("rust async first")),
+        "{notices:?}"
+    );
+    assert!(
+        notices.iter().any(|n| n.contains("rust async second")),
+        "{notices:?}"
+    );
+}
+
+#[test]
+fn live_large_external_import_and_export_round_trip() {
+    let Some(config) = config() else { return };
+    let mut conn = NzConnection::connect(&config).unwrap();
+    let first = unique_name("RUST_EXT_SRC");
+    let second = unique_name("RUST_EXT_DST");
+    let file = std::env::temp_dir().join(format!("{}.txt", unique_name("rust_nz_export")));
+    let file_sql = file.to_string_lossy().replace('\'', "''");
+    let log_dir = std::env::temp_dir().to_string_lossy().replace('\'', "''");
+    let import_id = format!("virtual://{}", unique_name("rust_nz_import"));
+    let expected_rows = 10_000usize;
+    let data: String = (0..expected_rows)
+        .map(|i| format!("{i}|value_{i:05}\n"))
+        .collect();
+    assert!(data.len() > 65_536);
+    conn.batch_execute(&format!(
+        "CREATE TABLE {first}(id INTEGER, val VARCHAR(32))"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
+        "CREATE TABLE {second}(id INTEGER, val VARCHAR(32))"
+    ))
+    .unwrap();
+    nz_rust::register_import_reader(&import_id, std::io::Cursor::new(data.into_bytes()));
+    let result = (|| -> Result<(), NzError> {
+        conn.batch_execute(&format!(
+            "INSERT INTO {first} SELECT * FROM EXTERNAL '{import_id}' USING (REMOTESOURCE 'jdbc' DELIMITER '|' LOGDIR '{log_dir}')"
+        ))?;
+        conn.batch_execute(&format!(
+            "CREATE EXTERNAL TABLE '{file_sql}' USING (REMOTESOURCE 'jdbc' DELIMITER '|' LOGDIR '{log_dir}') AS SELECT * FROM {first} ORDER BY id"
+        ))?;
+        assert!(std::fs::metadata(&file).unwrap().len() > 65_536);
+        conn.batch_execute(&format!(
+            "INSERT INTO {second} SELECT * FROM EXTERNAL '{file_sql}' USING (REMOTESOURCE 'jdbc' DELIMITER '|' LOGDIR '{log_dir}')"
+        ))?;
+        let row = conn
+            .query(
+                &format!("SELECT COUNT(*), MIN(id), MAX(id) FROM {second}"),
+                &[],
+            )?
+            .rows()[0]
+            .clone();
+        assert_eq!(row.try_get::<_, i64>(0).unwrap(), expected_rows as i64);
+        assert_eq!(row.try_get::<_, i32>(1).unwrap(), 0);
+        assert_eq!(row.try_get::<_, i32>(2).unwrap(), expected_rows as i32 - 1);
+        Ok(())
+    })();
+    nz_rust::unregister_import_data(&import_id);
+    let _ = conn.batch_execute(&format!("DROP TABLE {first}"));
+    let _ = conn.batch_execute(&format!("DROP TABLE {second}"));
+    let _ = std::fs::remove_file(&file);
+    result.unwrap();
+}
+
+#[test]
+fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
+    let Some(config) = config() else { return };
+    let mut conn = NzConnection::connect(&config).unwrap();
+    let table = unique_name("RUST_META_T");
+    let view = unique_name("RUST_META_V");
+    let procedure = unique_name("RUST_META_P");
+    let synonym = unique_name("RUST_META_S");
+    let external = unique_name("RUST_META_E");
+    conn.batch_execute(&format!(
+        "CREATE TABLE {table}(id INTEGER, name VARCHAR(30)) DISTRIBUTE ON (id)"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
+        "CREATE VIEW {view} AS SELECT id, name FROM {table}"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure}() RETURNS INTEGER EXECUTE AS OWNER LANGUAGE NZPLSQL AS BEGIN_PROC BEGIN RETURN 1; END; END_PROC;"
+    )).unwrap();
+    conn.batch_execute(&format!("CREATE SYNONYM {synonym} FOR {table}"))
+        .unwrap();
+    conn.batch_execute(&format!(
+        "CREATE EXTERNAL TABLE {external}(id INTEGER) USING (DATAOBJECT('/tmp/{external}.txt') REMOTESOURCE 'jdbc')"
+    )).unwrap();
+    let result = (|| -> Result<(), NzError> {
+        let metadata = &mut conn.metadata();
+        assert!(metadata.current_database()?.is_some());
+        let table_ddl = metadata.table_ddl(&table, None, None)?;
+        let view_ddl = metadata.view_ddl(&view, None, None)?;
+        let procedure_ddl = metadata.procedure_ddl(&procedure, None, None)?;
+        assert!(table_ddl.contains("CREATE TABLE"));
+        assert!(view_ddl.contains("CREATE OR REPLACE VIEW"));
+        assert!(procedure_ddl.contains("CREATE OR REPLACE PROCEDURE"));
+        let synonym_ddl = metadata.synonym_ddl(&synonym, None, None)?;
+        let external_ddl = metadata.external_table_ddl(&external, None, None)?;
+        assert!(synonym_ddl.contains("CREATE SYNONYM"));
+        assert!(external_ddl.contains("CREATE EXTERNAL TABLE"));
+        assert_eq!(
+            metadata
+                .tables_ddl(None, None, Some(std::slice::from_ref(&table)))?
+                .len(),
+            1
+        );
+        conn.batch_execute(&format!("DROP VIEW {view}"))?;
+        conn.batch_execute(&format!("DROP PROCEDURE {procedure}()"))?;
+        conn.batch_execute(&format!("DROP SYNONYM {synonym}"))?;
+        conn.batch_execute(&format!("DROP TABLE {external}"))?;
+        conn.batch_execute(&format!("DROP TABLE {table}"))?;
+        conn.batch_execute(&table_ddl)?;
+        conn.batch_execute(&view_ddl)?;
+        conn.batch_execute(&procedure_ddl)?;
+        conn.batch_execute(&synonym_ddl)?;
+        conn.batch_execute(&external_ddl)?;
+        Ok(())
+    })();
+    let _ = conn.batch_execute(&format!("DROP VIEW {view}"));
+    let _ = conn.batch_execute(&format!("DROP PROCEDURE {procedure}()"));
+    let _ = conn.batch_execute(&format!("DROP SYNONYM {synonym}"));
+    let _ = conn.batch_execute(&format!("DROP TABLE {external}"));
+    let _ = conn.batch_execute(&format!("DROP TABLE {table}"));
+    result.unwrap();
 }

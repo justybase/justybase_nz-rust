@@ -73,22 +73,29 @@ pub use asynchronous::AsyncNzConnection;
 pub use blocking::BlockingClient;
 pub use config::{parse_connection_string, NzConnectionConfig, SecurityLevel};
 pub use connection::{
-    register_import_data, unregister_import_data, NzCommand, NzConnection, QueryResult,
-    QueryStreamSink, ResultSet, Row, RowIndex, StreamResultSet, StreamSummary,
+    register_async_import_reader, register_import_data, register_import_reader,
+    unregister_import_data, NzCommand, NzConnection, QueryResult, QueryStreamSink, ResultSet, Row,
+    RowIndex, StreamResultSet, StreamSummary,
 };
 pub use error::{NzDatabaseError, NzError, NzResult};
 pub use export::{render_value, result_to_text, write_result_to_txt};
 pub use metadata::{
-    NzColumnInfo, NzConstraintInfo, NzDatabaseInfo, NzDistributionKeyInfo, NzFunctionInfo,
-    NzMetadata, NzObjectDetailInfo, NzObjectInfo, NzOrganizeKeyInfo, NzProcedureInfo,
-    NzSessionInfo, NzSynonymInfo, NzTableInfo, NzTableSizeInfo, NzViewInfo,
+    NzColumnInfo, NzConstraintInfo, NzDatabaseInfo, NzDdlBatchResult, NzDetailedColumnInfo,
+    NzDistributionKeyInfo, NzFunctionInfo, NzGroupInfo, NzMetadata, NzObjectDetailInfo,
+    NzObjectInfo, NzOrganizeKeyInfo, NzProcedureInfo, NzQueryHistoryInfo, NzSequenceInfo,
+    NzSessionInfo, NzSynonymInfo, NzTableInfo, NzTableKeyInfo, NzTableSizeInfo, NzUserInfo,
+    NzViewInfo,
 };
-pub use native_async::{connect, Client, Connection, RowStream};
+pub use native_async::{
+    connect, Client, Connection, QueryEventStream, QueryStreamEvent, RowStream,
+};
 pub use params::{substitute_bound_parameters, NzParameter};
 pub use pool::{NzPool, NzPoolConfig, PooledConnection};
 pub use reader::{ColumnDataType, ColumnMetadata, NzDataReader, SchemaRow, SchemaTable};
 pub use rust_decimal::Decimal;
 pub use tuple_desc::{ColumnDesc, DbosTupleDesc};
+#[cfg(feature = "chrono")]
+pub use types::value::NzTimeTz;
 pub use types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
 
 /// Netezza client type identifiers sent during the handshake.

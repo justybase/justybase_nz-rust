@@ -126,7 +126,7 @@ enum Request {
     },
     Stream {
         sql: String,
-        rows: mpsc::Sender<NzResult<Row>>,
+        events: mpsc::Sender<NzResult<QueryStreamEvent>>,
         notices: Arc<Mutex<Vec<String>>>,
     },
     Close {
@@ -137,8 +137,39 @@ enum Request {
 /// Bounded row stream for one query. The connection task keeps draining the
 /// wire while `poll_next` applies backpressure through the bounded channel.
 pub struct RowStream {
-    receiver: mpsc::Receiver<NzResult<Row>>,
+    receiver: mpsc::Receiver<NzResult<QueryStreamEvent>>,
     notices: Arc<Mutex<Vec<String>>>,
+}
+
+/// A row or a server notice observed while a native Tokio query is running.
+#[derive(Debug)]
+pub enum QueryStreamEvent {
+    Row(Row),
+    Notice(String),
+}
+
+/// Bounded stream of rows and notices in wire order.
+pub struct QueryEventStream {
+    receiver: mpsc::Receiver<NzResult<QueryStreamEvent>>,
+    notices: Arc<Mutex<Vec<String>>>,
+}
+
+impl QueryEventStream {
+    /// Snapshot of all notices received so far.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|items| items.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Stream for QueryEventStream {
+    type Item = NzResult<QueryStreamEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().receiver.poll_recv(cx)
+    }
 }
 
 impl RowStream {
@@ -155,7 +186,18 @@ impl Stream for RowStream {
     type Item = NzResult<Row>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().receiver.poll_recv(cx)
+        let receiver = &mut self.get_mut().receiver;
+        loop {
+            match receiver.poll_recv(cx) {
+                Poll::Ready(Some(Ok(QueryStreamEvent::Notice(_)))) => continue,
+                Poll::Ready(Some(Ok(QueryStreamEvent::Row(row)))) => {
+                    return Poll::Ready(Some(Ok(row)));
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -243,6 +285,20 @@ impl Client {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> NzResult<RowStream> {
+        let stream = self.query_stream_events(sql, params).await?;
+        Ok(RowStream {
+            receiver: stream.receiver,
+            notices: stream.notices,
+        })
+    }
+
+    /// Stream rows and notices in their arrival order while the query runs.
+    /// The bounded channel applies backpressure to both event kinds.
+    pub async fn query_stream_events(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> NzResult<QueryEventStream> {
         let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
         let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
         let (sender, receiver) = mpsc::channel(32);
@@ -250,12 +306,12 @@ impl Client {
         self.requests
             .send(Request::Stream {
                 sql,
-                rows: sender,
+                events: sender,
                 notices: notices.clone(),
             })
             .await
             .map_err(|_| NzError::Closed("connection task is closed".into()))?;
-        Ok(RowStream { receiver, notices })
+        Ok(QueryEventStream { receiver, notices })
     }
 
     pub async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
@@ -334,10 +390,14 @@ async fn run_connection(
                     return Ok(());
                 }
             }
-            Request::Stream { sql, rows, notices } => {
-                if let Err(error) = session.stream_query(&sql, &rows, &notices).await {
+            Request::Stream {
+                sql,
+                events,
+                notices,
+            } => {
+                if let Err(error) = session.stream_query(&sql, &events, &notices).await {
                     let reusable = matches!(&error, NzError::Database(_));
-                    let _ = rows.send(Err(error)).await;
+                    let _ = events.send(Err(error)).await;
                     if !reusable {
                         return Ok(());
                     }
@@ -617,12 +677,12 @@ impl AsyncSession {
     async fn stream_query(
         &mut self,
         sql: &str,
-        rows: &mpsc::Sender<NzResult<Row>>,
+        events: &mpsc::Sender<NzResult<QueryStreamEvent>>,
         notices: &Arc<Mutex<Vec<String>>>,
     ) -> NzResult<()> {
         let timeout = (self.config.command_timeout > 0)
             .then(|| Duration::from_secs(self.config.command_timeout));
-        let future = self.stream_query_inner(sql, rows, notices);
+        let future = self.stream_query_inner(sql, events, notices);
         if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, future)
                 .await
@@ -635,7 +695,7 @@ impl AsyncSession {
     async fn stream_query_inner(
         &mut self,
         sql: &str,
-        rows: &mpsc::Sender<NzResult<Row>>,
+        events: &mpsc::Sender<NzResult<QueryStreamEvent>>,
         notices: &Arc<Mutex<Vec<String>>>,
     ) -> NzResult<()> {
         self.command_number = (self.command_number % 100_000) + 1;
@@ -648,7 +708,7 @@ impl AsyncSession {
             .write_all(&packet)
             .await
             .map_err(NzError::Io)?;
-        self.drain_response_stream(rows, notices).await
+        self.drain_response_stream(events, notices).await
     }
 
     async fn drain_response(&mut self) -> NzResult<QueryResult> {
@@ -832,7 +892,7 @@ impl AsyncSession {
 
     async fn drain_response_stream(
         &mut self,
-        rows: &mpsc::Sender<NzResult<Row>>,
+        events: &mpsc::Sender<NzResult<QueryStreamEvent>>,
         notices: &Arc<Mutex<Vec<String>>>,
     ) -> NzResult<()> {
         let mut cached_columns: Option<Arc<[ColumnDesc]>> = None;
@@ -865,12 +925,12 @@ impl AsyncSession {
                         .unwrap_or_else(|| Arc::from(descriptor.to_column_descs()));
                     let row = Row::from_dbos_raw(columns, payload, descriptor.clone())?;
                     if result_set_index == 0 && stream_open {
-                        if rows.send(Ok(row)).await.is_err() {
+                        if events.send(Ok(QueryStreamEvent::Row(row))).await.is_err() {
                             stream_open = false;
                         }
                     } else if result_set_index > 0 && stream_open && !multiple_result_error_sent {
                         multiple_result_error_sent = true;
-                        if rows
+                        if events
                             .send(Err(NzError::Config(
                                 "query_stream only exposes the first result set".into(),
                             )))
@@ -916,7 +976,7 @@ impl AsyncSession {
                     let data = self.read_bytes(len).await?;
                     if result_set_index > 0 && stream_open && !multiple_result_error_sent {
                         multiple_result_error_sent = true;
-                        if rows
+                        if events
                             .send(Err(NzError::Config(
                                 "query_stream only exposes the first result set".into(),
                             )))
@@ -941,12 +1001,12 @@ impl AsyncSession {
                     })?;
                     let row = Row::from_text_raw(columns, data)?;
                     if result_set_index == 0 && stream_open {
-                        if rows.send(Ok(row)).await.is_err() {
+                        if events.send(Ok(QueryStreamEvent::Row(row))).await.is_err() {
                             stream_open = false;
                         }
                     } else if result_set_index > 0 && stream_open && !multiple_result_error_sent {
                         multiple_result_error_sent = true;
-                        if rows
+                        if events
                             .send(Err(NzError::Config(
                                 "query_stream only exposes the first result set".into(),
                             )))
@@ -966,7 +1026,7 @@ impl AsyncSession {
                     let data = self.read_bytes(len).await?;
                     if result_set_index > 0 && stream_open && !multiple_result_error_sent {
                         multiple_result_error_sent = true;
-                        if rows
+                        if events
                             .send(Err(NzError::Config(
                                 "query_stream only exposes the first result set".into(),
                             )))
@@ -1009,7 +1069,15 @@ impl AsyncSession {
                         notices
                             .lock()
                             .map_err(|_| NzError::Closed("notice state unavailable".into()))?
-                            .push(message);
+                            .push(message.clone());
+                        if stream_open
+                            && events
+                                .send(Ok(QueryStreamEvent::Notice(message)))
+                                .await
+                                .is_err()
+                        {
+                            stream_open = false;
+                        }
                     }
                 }
                 code::ERROR_RESPONSE => {
@@ -1136,28 +1204,52 @@ impl AsyncSession {
             "externalTableImportBufferSize",
             true,
         )? as usize;
-        let data = if let Some(data) = crate::connection::take_import_data(&filename) {
-            data
-        } else {
-            match tokio::fs::read(&filename).await {
-                Ok(data) => data,
+        if let Some(source) = crate::connection::take_import_source(&filename) {
+            return match source {
+                crate::connection::ImportSource::Bytes(data) => {
+                    self.send_import_reader(std::io::Cursor::new(data), buffer_size)
+                        .await
+                }
+                crate::connection::ImportSource::AsyncReader(reader) => {
+                    self.send_import_reader(reader, buffer_size).await
+                }
+                crate::connection::ImportSource::Reader(_) => {
+                    self.write_raw(&2i32.to_be_bytes()).await?;
+                    Ok(())
+                }
+            };
+        }
+        match File::open(&filename).await {
+            Ok(file) => self.send_import_reader(file, buffer_size).await,
+            Err(_) => {
+                self.write_raw(&2i32.to_be_bytes()).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_import_reader(
+        &mut self,
+        mut reader: impl AsyncRead + Unpin,
+        buffer_size: usize,
+    ) -> NzResult<()> {
+        let mut chunk = vec![0; buffer_size.clamp(1, 64 * 1024)];
+        loop {
+            let count = match reader.read(&mut chunk).await {
+                Ok(count) => count,
                 Err(_) => {
                     self.write_raw(&2i32.to_be_bytes()).await?;
                     return Ok(());
                 }
+            };
+            if count == 0 {
+                break;
             }
-        };
-        let chunk_size = buffer_size.max(1);
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + chunk_size).min(data.len());
-            let chunk = &data[offset..end];
-            let mut frame = Vec::with_capacity(8 + chunk.len());
-            frame.extend_from_slice(&1i32.to_be_bytes());
-            frame.extend_from_slice(&(chunk.len() as i32).to_be_bytes());
-            frame.extend_from_slice(chunk);
-            self.write_raw(&frame).await?;
-            offset = end;
+            let mut header = [0u8; 8];
+            header[..4].copy_from_slice(&1i32.to_be_bytes());
+            header[4..].copy_from_slice(&(count as i32).to_be_bytes());
+            self.write_raw(&header).await?;
+            self.write_raw(&chunk[..count]).await?;
         }
         self.write_raw(&3i32.to_be_bytes()).await
     }

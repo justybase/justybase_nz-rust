@@ -21,7 +21,17 @@
 //! round-trip losslessly and match the Node driver's output when canonicalized.
 
 use crate::error::{NzError, NzResult};
+#[cfg(feature = "chrono")]
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
+
+/// A Netezza `TIMETZ` value without inventing a calendar date.
+#[cfg(feature = "chrono")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NzTimeTz {
+    pub time: NaiveTime,
+    pub offset: FixedOffset,
+}
 
 /// A single Netezza value.
 #[derive(Debug, Clone, PartialEq)]
@@ -402,6 +412,103 @@ impl FromSql for f64 {
     }
 }
 
+impl FromSql for Decimal {
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        match value {
+            NzValue::Decimal(value) => Ok(*value),
+            NzValue::Numeric(text) | NzValue::Text(text) => text
+                .trim()
+                .parse::<Decimal>()
+                .map_err(|_| unexpected(value, "Decimal")),
+            NzValue::Int2(value) => Ok(Decimal::from(*value)),
+            NzValue::Int4(value) => Ok(Decimal::from(*value)),
+            NzValue::Int8(value) => Ok(Decimal::from(*value)),
+            other => Err(unexpected(other, "Decimal")),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl FromSql for NaiveDate {
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        match value {
+            NzValue::Date(text) => {
+                NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unexpected(value, "DATE"))
+            }
+            other => Err(unexpected(other, "DATE")),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl FromSql for NaiveTime {
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        match value {
+            NzValue::Time(text) => parse_naive_time(text).map_err(|_| unexpected(value, "TIME")),
+            other => Err(unexpected(other, "TIME")),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl FromSql for NaiveDateTime {
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        match value {
+            NzValue::Timestamp(text) => NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
+                .map_err(|_| unexpected(value, "TIMESTAMP")),
+            other => Err(unexpected(other, "TIMESTAMP")),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn parse_naive_time(text: &str) -> Result<NaiveTime, chrono::ParseError> {
+    NaiveTime::parse_from_str(text, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(text, "%H:%M:%S"))
+}
+
+#[cfg(feature = "chrono")]
+impl FromSql for NzTimeTz {
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        let NzValue::Timetz(text) = value else {
+            return Err(unexpected(value, "TIMETZ"));
+        };
+        let Some(index) = text
+            .char_indices()
+            .skip(1)
+            .find_map(|(i, c)| (c == '+' || c == '-').then_some(i))
+        else {
+            return Err(unexpected(value, "TIMETZ"));
+        };
+        let time = parse_naive_time(&text[..index]).map_err(|_| unexpected(value, "TIMETZ"))?;
+        let offset_text = &text[index + 1..];
+        let parts: Vec<&str> = offset_text.split(':').collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return Err(unexpected(value, "TIMETZ"));
+        }
+        let numbers: Vec<i32> = parts
+            .iter()
+            .map(|part| part.parse::<i32>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| unexpected(value, "TIMETZ"))?;
+        let hours = numbers[0];
+        let minutes = *numbers.get(1).unwrap_or(&0);
+        let seconds = *numbers.get(2).unwrap_or(&0);
+        if hours > 23 || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+            return Err(unexpected(value, "TIMETZ"));
+        }
+        let sign = if text.as_bytes()[index] == b'-' {
+            -1
+        } else {
+            1
+        };
+        let offset = FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60 + seconds))
+            .ok_or_else(|| unexpected(value, "TIMETZ"))?;
+        Ok(NzTimeTz { time, offset })
+    }
+}
+
 impl FromSql for String {
     fn from_sql(value: &NzValue) -> NzResult<Self> {
         match value {
@@ -442,7 +549,20 @@ macro_rules! from_sql_option {
     };
 }
 
-from_sql_option!(NzValue, bool, i16, i32, i64, f32, f64, String, Vec<u8>);
+from_sql_option!(
+    NzValue,
+    bool,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    Decimal,
+    String,
+    Vec<u8>
+);
+#[cfg(feature = "chrono")]
+from_sql_option!(NaiveDate, NaiveTime, NaiveDateTime, NzTimeTz);
 
 impl<'a> FromSqlRaw<'a> for NzValue {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
@@ -485,6 +605,23 @@ impl<'a> FromSqlRaw<'a> for f64 {
         <Self as FromSql>::from_sql(&decoded)
     }
 }
+
+macro_rules! from_sql_raw_decoded {
+    ($($t:ty),*) => {
+        $(
+            impl<'a> FromSqlRaw<'a> for $t {
+                fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
+                    let decoded = value.to_nz_value()?;
+                    <Self as FromSql>::from_sql(&decoded)
+                }
+            }
+        )*
+    };
+}
+
+from_sql_raw_decoded!(Decimal);
+#[cfg(feature = "chrono")]
+from_sql_raw_decoded!(NaiveDate, NaiveTime, NaiveDateTime, NzTimeTz);
 
 impl<'a> FromSqlRaw<'a> for String {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
