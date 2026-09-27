@@ -342,7 +342,7 @@ impl NzMetadata<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_object_name;
+    use super::{normalize_object_name, split_identifier_path};
     use crate::error::NzError;
 
     #[test]
@@ -366,6 +366,87 @@ mod tests {
             normalize_object_name("\"Schema.Name\".\"Table.Name\"", None).unwrap(),
             (Some("Schema.Name".into()), "Table.Name".into())
         );
+    }
+
+    #[test]
+    fn synonym_target_parser_keeps_quoted_dots_and_unescapes_quotes() {
+        assert_eq!(
+            split_identifier_path("\"Data.Schema\".\"Tar\"\"get\"").unwrap(),
+            vec!["Data.Schema", "Tar\"get"]
+        );
+        assert_eq!(
+            split_identifier_path("  \" Schema Name \" . \" Target Name \"  ").unwrap(),
+            vec![" Schema Name ", " Target Name "]
+        );
+    }
+
+    #[test]
+    fn synonym_target_parser_preserves_omitted_schema_and_rejects_bad_paths() {
+        assert_eq!(
+            split_identifier_path("OTHER_DB..TARGET").unwrap(),
+            vec!["OTHER_DB", "", "TARGET"]
+        );
+        assert!(split_identifier_path("DB....TARGET").is_err());
+        assert!(split_identifier_path("A.B.C.D").is_err());
+    }
+
+    #[test]
+    fn external_layout_is_emitted_as_zone_syntax() {
+        assert_eq!(
+            super::format_external_layout("BYTES 4, BYTES 8"),
+            "(BYTES 4, BYTES 8)"
+        );
+        assert_eq!(super::format_external_layout("(BYTES 4)"), "(BYTES 4)");
+    }
+
+    #[test]
+    fn external_layout_reconstructs_zone_metadata() {
+        let zones = [
+            super::ExternalLayoutZoneInfo {
+                use_type: "FILLER".into(),
+                name: "F1".into(),
+                type_name: "CHAR(2)".into(),
+                style: "INTERNAL".into(),
+                length: "BYTES 2".into(),
+                ..Default::default()
+            },
+            super::ExternalLayoutZoneInfo {
+                name: "SELECT".into(),
+                type_name: "INT4".into(),
+                style: "DECIMAL".into(),
+                length: "BYTES 4".into(),
+                null_if: "&&2 = ''".into(),
+                ..Default::default()
+            },
+            super::ExternalLayoutZoneInfo {
+                name: "DT".into(),
+                type_name: "DATE".into(),
+                style: "YMD".into(),
+                delimiter: "-".into(),
+                length: "BYTES 10".into(),
+                ..Default::default()
+            },
+            super::ExternalLayoutZoneInfo {
+                name: " DATE FIELD ".into(),
+                type_name: "DATE".into(),
+                style: "YMD".into(),
+                delimiter: " ".into(),
+                length: "BYTES 10".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            super::format_external_layout_zones(&zones).unwrap(),
+            "FILLER F1 CHAR(2) INTERNAL BYTES 2, \"SELECT\" INT4 DECIMAL BYTES 4 NULLIF &&2 = '', DT DATE YMD '-' BYTES 10, \" DATE FIELD \" DATE YMD ' ' BYTES 10"
+        );
+        assert_eq!(super::layout_zone_count("0"), None);
+        assert_eq!(super::layout_zone_count("3"), Some(3));
+    }
+
+    #[test]
+    fn quotes_reserved_identifiers_and_underscore_prefixes() {
+        assert_eq!(super::quote_identifier("SELECT"), "\"SELECT\"");
+        assert_eq!(super::quote_identifier("_PRIVATE"), "\"_PRIVATE\"");
     }
 }
 
@@ -459,14 +540,16 @@ fn normalize_identifier(part: &str) -> NzResult<String> {
 }
 
 fn quote_identifier(name: &str) -> String {
+    const RESERVED: &str = "ABORT ALL ALLOCATE ANALYSE ANALYZE AND ANY AS ASC AUTOMAINT AWSS3 AZUREBLOB BETWEEN BINARY BIT BOTH CASE CAST CHAR CHARACTER CHECK CLUSTER COALESCE COLLATE COLLATION COLUMN CONSTRAINT COPY CROSS CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_DB CURRENT_SCHEMA CURRENT_SID CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURRENT_USERID CURRENT_USEROID DAYSPERROW DEALLOCATE DEC DECIMAL DECODE DEFAULT DEREGISTER DESC DISTINCT DISTRIBUTE DO ELSE END EXCEPT EXCLUDE EXISTS EXPLAIN EXPRESS EXTEND EXTERNAL EXTRACT FALSE FIRST FLOAT FOLLOWING FOR FOREIGN FROM FULL FUNCTION GENSTATS GLOBAL GROUP HAVING HISTOGRAM IDENTIFIER_CASE ILIKE IN INDEX INITIALLY INNER INOUT INTERSECT INTERVAL INTO JOURNAL LEADING LEFT LIKE LIMIT LOAD LOCAL LOCK MINUS MOVE NATURAL NCHAR NEW NOCASCADE NOT NOTNULL NULL NULLS NUMERIC NVL NVL2 OFFSET OFF OLD ON ONLINE ONLY OR ORDER OTHERS OUT OUTER OVER OVERLAPS PAUSESTEPS PAUSETIME PARTITION POSITION PRECEDING PRECISION PRESERVE PRIMARY REGISTER RESET REUSE RIGHT ROWS SELECT SESSION_USER SETOF SHOW SOME TABLE TEMPORAL THEN TIES TIME TIME_TRAVEL_ENABLE TIMESTAMP TO TRAILING TRANSACTION TRIGGER TRIM TRUE UNBOUNDED UNION UNIQUE USER USING VACUUM VARCHAR VERBOSE VERSION VIEW WHEN WHERE WITH WRITE CTID OID XMIN CMIN XMAX CMAX TABLEOID ROWID DATASLICEID CREATEXID DELETEXID";
     if !name.is_empty()
         && name
             .chars()
             .next()
-            .is_some_and(|ch| ch.is_ascii_uppercase() || ch == '_')
+            .is_some_and(|ch| ch.is_ascii_uppercase())
         && name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && !RESERVED.split_whitespace().any(|word| word == name)
     {
         name.to_owned()
     } else {
@@ -562,9 +645,8 @@ impl NzMetadata<'_> {
             Some(database) => database.to_owned(),
             None => self.current_database()?.unwrap_or_else(|| "UNKNOWN".into()),
         };
-        let body = definition.trim().trim_end_matches(';').trim_end();
         Ok(format!(
-            "CREATE OR REPLACE VIEW {} AS\n{body};",
+            "CREATE OR REPLACE VIEW {} AS\n{definition}",
             qualified(&database, &schema, &view)
         ))
     }
@@ -602,6 +684,7 @@ impl NzMetadata<'_> {
             .ok_or_else(|| NzError::Config(format!("procedure {procedure} not found")))?;
         let schema = text(row, 0)?;
         let name = text(row, 1)?;
+        let signature = optional_text(row, 2)?.unwrap_or_default();
         let args = optional_text(row, 3)?.unwrap_or_default();
         let args = args.trim();
         let args = if args.is_empty() {
@@ -628,9 +711,14 @@ impl NzMetadata<'_> {
             "CREATE OR REPLACE PROCEDURE {full_name}{args}\nRETURNS {returns}\nEXECUTE AS {}\nLANGUAGE NZPLSQL AS\nBEGIN_PROC\n{source}\nEND_PROC;",
             if execute_as_owner { "OWNER" } else { "CALLER" }
         );
-        if let Some(description) = description {
+        if let Some(description) = description.filter(|value| !value.is_empty()) {
+            let signature_open = signature.find('(');
+            let signature_open = signature_open.ok_or_else(|| {
+                NzError::Config(format!("procedure {name} has a comment but no signature"))
+            })?;
+            let comment_signature = &signature[signature_open..];
             ddl.push_str(&format!(
-                "\nCOMMENT ON PROCEDURE {full_name} IS '{}';",
+                "\nCOMMENT ON PROCEDURE {full_name}{comment_signature} IS '{}';",
                 sql_string(&description)
             ));
         }
@@ -852,6 +940,23 @@ enum ExternalOptionKind {
     String,
     Number,
     Boolean,
+    Compression,
+    Layout,
+}
+
+#[derive(Default)]
+struct ExternalLayoutZoneInfo {
+    use_type: String,
+    name: String,
+    type_name: String,
+    style: String,
+    length: String,
+    delimiter: String,
+    around: String,
+    null_if: String,
+    endian: String,
+    alignment: String,
+    modulus: String,
 }
 
 const EXTERNAL_OPTIONS: &[(&str, &str, ExternalOptionKind)] = &[
@@ -877,7 +982,7 @@ const EXTERNAL_OPTIONS: &[(&str, &str, ExternalOptionKind)] = &[
     ),
     ("Y2BASE", "Y2BASE", ExternalOptionKind::Number),
     ("FILLRECORD", "FILLRECORD", ExternalOptionKind::Boolean),
-    ("COMPRESS", "COMPRESS", ExternalOptionKind::Boolean),
+    ("COMPRESS", "COMPRESS", ExternalOptionKind::Compression),
     (
         "INCLUDEHEADER",
         "INCLUDEHEADER",
@@ -900,6 +1005,13 @@ const EXTERNAL_OPTIONS: &[(&str, &str, ExternalOptionKind)] = &[
     ("RECORDLENGTH", "RECORDLENGTH", ExternalOptionKind::Number),
     ("DATETIMEDELIM", "DATETIMEDELIM", ExternalOptionKind::String),
     ("REJECTFILE", "REJECTFILE", ExternalOptionKind::String),
+    ("LAYOUT", "LAYOUT", ExternalOptionKind::Layout),
+    (
+        "INCLUDEZEROSECONDS",
+        "INCLUDEZEROSECONDS",
+        ExternalOptionKind::Boolean,
+    ),
+    ("MERIDIANDELIM", "MERIDIANDELIM", ExternalOptionKind::String),
 ];
 
 impl NzMetadata<'_> {
@@ -930,6 +1042,50 @@ impl NzMetadata<'_> {
             .ok_or_else(|| NzError::Config(format!("external table {table} not found")))?;
         let schema = text(row, 0)?;
         let object = optional_text(row, 2)?;
+        let layout_index = EXTERNAL_OPTIONS
+            .iter()
+            .position(|(keyword, _, _)| *keyword == "LAYOUT")
+            .expect("LAYOUT external option")
+            + 3;
+        let catalog_layout = optional_text(row, layout_index)?.unwrap_or_default();
+        let layout = if let Some(expected_count) = layout_zone_count(&catalog_layout) {
+            let zone_sql = format!(
+                "SELECT Z.USETYPE, Z.NAME, Z.TYPE, Z.STYLE, Z.LENGTH, Z.DELIMITER, Z.AROUND, Z.NULLIF, Z.ENDIAN, Z.ALIGNMENT, Z.MODULUS FROM _v_external E JOIN _v_extzones Z ON E.RELID = Z.RELID WHERE E.SCHEMA = {} AND E.TABLENAME = {} ORDER BY Z.ZONEID",
+                literal(&schema)?,
+                literal(&table)?
+            );
+            let zone_rows = self.query_rows(&zone_sql)?;
+            if zone_rows.len() != expected_count {
+                return Err(NzError::Config(format!(
+                    "cannot reconstruct external table LAYOUT: catalog reports {expected_count} zones, but _V_EXTZONES returned {}",
+                    zone_rows.len()
+                )));
+            }
+            let zones = zone_rows
+                .iter()
+                .map(|zone| {
+                    Ok(ExternalLayoutZoneInfo {
+                        use_type: optional_text(zone, 0)?.unwrap_or_default(),
+                        name: optional_text(zone, 1)?.unwrap_or_default(),
+                        type_name: optional_text(zone, 2)?.unwrap_or_default(),
+                        style: optional_text(zone, 3)?.unwrap_or_default(),
+                        length: optional_text(zone, 4)?.unwrap_or_default(),
+                        delimiter: optional_text(zone, 5)?.unwrap_or_default(),
+                        around: optional_text(zone, 6)?.unwrap_or_default(),
+                        null_if: optional_text(zone, 7)?.unwrap_or_default(),
+                        endian: optional_text(zone, 8)?.unwrap_or_default(),
+                        alignment: optional_text(zone, 9)?.unwrap_or_default(),
+                        modulus: optional_text(zone, 10)?.unwrap_or_default(),
+                    })
+                })
+                .collect::<NzResult<Vec<_>>>()?;
+            Some(format_external_layout_zones(&zones)?)
+        } else if catalog_layout.trim().parse::<usize>().is_ok() || catalog_layout.trim().is_empty()
+        {
+            None
+        } else {
+            Some(catalog_layout)
+        };
         let database = match database {
             Some(database) => database.to_owned(),
             None => self.current_database()?.unwrap_or_else(|| "UNKNOWN".into()),
@@ -976,12 +1132,28 @@ impl NzMetadata<'_> {
             lines.push(format!("    DATAOBJECT('{}')", sql_string(&object)));
         }
         for (index, (keyword, _, kind)) in EXTERNAL_OPTIONS.iter().enumerate() {
-            let Some(value) = optional_text(row, index + 3)? else {
+            let value = if matches!(kind, ExternalOptionKind::Layout) {
+                layout.clone()
+            } else {
+                optional_text(row, index + 3)?
+            };
+            let Some(value) = value else {
                 continue;
             };
             let rendered = match kind {
                 ExternalOptionKind::String => format!("'{}'", sql_string(&value)),
-                ExternalOptionKind::Number => value,
+                ExternalOptionKind::Layout => format_external_layout(&value),
+                ExternalOptionKind::Number => value.clone(),
+                ExternalOptionKind::Compression => {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    if ["true", "t", "1", "yes", "on"].contains(&normalized.as_str()) {
+                        "true".into()
+                    } else if ["false", "f", "0", "no", "off"].contains(&normalized.as_str()) {
+                        "false".into()
+                    } else {
+                        value.clone()
+                    }
+                }
                 ExternalOptionKind::Boolean => if bool_value(row, index + 3)? {
                     "true"
                 } else {
@@ -989,6 +1161,9 @@ impl NzMetadata<'_> {
                 }
                 .into(),
             };
+            if matches!(kind, ExternalOptionKind::Layout) && rendered.is_empty() {
+                continue;
+            }
             lines.push(format!("    {keyword} {rendered}"));
         }
         lines.push(");".into());
@@ -1025,28 +1200,187 @@ impl NzMetadata<'_> {
             Some(database) => database.to_owned(),
             None => self.current_database()?.unwrap_or_else(|| "UNKNOWN".into()),
         };
-        let target = if reference.contains('.') {
-            reference
-                .split('.')
-                .map(quote_identifier)
-                .collect::<Vec<_>>()
-                .join(".")
-        } else if let (Some(db), Some(schema)) = (reference_database, reference_schema) {
-            qualified(&db, &schema, &reference)
-        } else {
-            quote_identifier(&reference)
-        };
+        let mut reference_parts = split_identifier_path(&reference)?;
+        if reference_parts.len() == 1 {
+            if let Some(db) = reference_database {
+                reference_parts.splice(0..0, [db, reference_schema.unwrap_or_default()]);
+            } else if let Some(schema) = reference_schema {
+                reference_parts.insert(0, schema);
+            }
+        } else if reference_parts.len() == 2 {
+            if let Some(db) = reference_database {
+                reference_parts.insert(0, db);
+            }
+        }
+        let target = reference_parts
+            .iter()
+            .map(|part| {
+                if part.is_empty() {
+                    String::new()
+                } else {
+                    quote_identifier(part)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".");
         let mut ddl = format!(
             "CREATE SYNONYM {} FOR {target};",
             qualified(&database, &schema, &synonym)
         );
-        if let Some(description) = description {
+        if let Some(description) = description.filter(|value| !value.is_empty()) {
             ddl.push_str(&format!(
                 "\nCOMMENT ON SYNONYM {} IS '{}';",
-                quote_identifier(&synonym),
+                qualified(&database, &schema, &synonym),
                 sql_string(&description)
             ));
         }
         Ok(ddl)
     }
+}
+
+fn layout_zone_count(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+}
+
+fn format_external_layout_zones(zones: &[ExternalLayoutZoneInfo]) -> NzResult<String> {
+    let mut definitions = Vec::with_capacity(zones.len());
+    for (index, zone) in zones.iter().enumerate() {
+        let use_type = zone.use_type.trim().to_ascii_uppercase();
+        if !use_type.is_empty() && use_type != "REF" && use_type != "FILLER" {
+            return Err(NzError::Config(format!(
+                "cannot reconstruct external table LAYOUT: unsupported zone use type {use_type}"
+            )));
+        }
+        let length = zone.length.trim();
+        if length.is_empty() {
+            return Err(NzError::Config(format!(
+                "cannot reconstruct external table LAYOUT: zone {} has no length",
+                index + 1
+            )));
+        }
+        for (field, value) in [
+            ("AROUND", zone.around.as_str()),
+            ("ENDIAN", zone.endian.as_str()),
+            ("ALIGNMENT", zone.alignment.as_str()),
+            ("MODULUS", zone.modulus.as_str()),
+        ] {
+            if !value.trim().is_empty() {
+                return Err(NzError::Config(format!(
+                    "cannot reconstruct external table LAYOUT: zone {} uses unsupported {field} metadata",
+                    index + 1
+                )));
+            }
+        }
+        let style = zone.style.trim();
+        let mut parts = Vec::new();
+        if !use_type.is_empty() {
+            parts.push(use_type);
+        }
+        if !zone.name.is_empty() {
+            parts.push(quote_identifier(&zone.name));
+        }
+        if !zone.type_name.trim().is_empty() {
+            parts.push(zone.type_name.trim().to_owned());
+        }
+        if !style.is_empty() {
+            parts.push(style.to_owned());
+        }
+        if !zone.delimiter.is_empty() {
+            if style.is_empty() {
+                return Err(NzError::Config(format!(
+                    "cannot reconstruct external table LAYOUT: zone {} has a delimiter without a style",
+                    index + 1
+                )));
+            }
+            if !style.contains('\'') {
+                parts.push(format!("'{}'", sql_string(&zone.delimiter)));
+            }
+        }
+        parts.push(length.to_owned());
+        let null_if = zone.null_if.trim();
+        if !null_if.is_empty() {
+            if null_if.to_ascii_uppercase().starts_with("NULLIF") {
+                parts.push(null_if.to_owned());
+            } else {
+                parts.push(format!("NULLIF {null_if}"));
+            }
+        }
+        definitions.push(parts.join(" "));
+    }
+    Ok(definitions.join(", "))
+}
+
+fn format_external_layout(value: &str) -> String {
+    let layout = value.trim();
+    if layout.is_empty() {
+        String::new()
+    } else if layout.starts_with('(') && layout.ends_with(')') {
+        layout.to_owned()
+    } else {
+        format!("({layout})")
+    }
+}
+
+fn split_identifier_path(value: &str) -> NzResult<Vec<String>> {
+    let mut raw_parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push_str("\"\"");
+                chars.next();
+            }
+            '"' => {
+                current.push(ch);
+                quoted = !quoted;
+            }
+            '.' if !quoted => {
+                raw_parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    if quoted {
+        return Err(NzError::Config("invalid synonym target".into()));
+    }
+    raw_parts.push(current);
+    let mut parts = Vec::with_capacity(raw_parts.len());
+    for raw_part in raw_parts {
+        let part = raw_part.trim();
+        if !part.starts_with('"') {
+            if part.contains('"') {
+                return Err(NzError::Config("invalid synonym target".into()));
+            }
+            parts.push(part.to_owned());
+            continue;
+        }
+        if part.len() < 2 || !part.ends_with('"') {
+            return Err(NzError::Config("invalid synonym target".into()));
+        }
+        let mut identifier = String::new();
+        let mut chars = part[1..part.len() - 1].chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                if chars.next() != Some('"') {
+                    return Err(NzError::Config("invalid synonym target".into()));
+                }
+                identifier.push('"');
+            } else {
+                identifier.push(ch);
+            }
+        }
+        parts.push(identifier);
+    }
+    let has_omitted_schema =
+        parts.len() == 3 && !parts[0].is_empty() && parts[1].is_empty() && !parts[2].is_empty();
+    if parts.len() > 3 || (parts.iter().any(String::is_empty) && !has_omitted_schema) {
+        return Err(NzError::Config("invalid synonym target".into()));
+    }
+    Ok(parts)
 }

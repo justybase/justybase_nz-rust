@@ -2,6 +2,14 @@
 
 All notable changes to `nz_rust` will be documented here.
 
+## [0.2.1] - 2026-09-27
+
+### Fixed
+
+- Reconstructed metadata DDL now handles quoted and reserved identifiers,
+  synonym targets, procedure comments, and external-table layouts.
+- External-table compression and layout options are emitted in valid SQL form.
+
 ## [Unreleased]
 
 ## [0.2.0] - 2026-09-27

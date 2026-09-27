@@ -413,20 +413,28 @@ fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
     let synonym = unique_name("RUST_META_S");
     let external = unique_name("RUST_META_E");
     conn.batch_execute(&format!(
-        "CREATE TABLE {table}(id INTEGER, name VARCHAR(30)) DISTRIBUTE ON (id)"
+        "CREATE TABLE {table}(\"SELECT\" INTEGER, name VARCHAR(30)) DISTRIBUTE ON (\"SELECT\")"
     ))
     .unwrap();
     conn.batch_execute(&format!(
-        "CREATE VIEW {view} AS SELECT id, name FROM {table}"
+        "CREATE VIEW {view} AS SELECT \"SELECT\", name FROM {table}"
     ))
     .unwrap();
     conn.batch_execute(&format!(
         "CREATE OR REPLACE PROCEDURE {procedure}() RETURNS INTEGER EXECUTE AS OWNER LANGUAGE NZPLSQL AS BEGIN_PROC BEGIN RETURN 1; END; END_PROC;"
     )).unwrap();
+    conn.batch_execute(&format!(
+        "COMMENT ON PROCEDURE {procedure}() IS 'DDL round-trip comment'"
+    ))
+    .unwrap();
     conn.batch_execute(&format!("CREATE SYNONYM {synonym} FOR {table}"))
         .unwrap();
     conn.batch_execute(&format!(
-        "CREATE EXTERNAL TABLE {external}(id INTEGER) USING (DATAOBJECT('/tmp/{external}.txt') REMOTESOURCE 'jdbc')"
+        "COMMENT ON SYNONYM {synonym} IS 'DDL round-trip comment'"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
+        "CREATE EXTERNAL TABLE {external}(id INTEGER, label CHAR(10), event_date DATE) USING (DATAOBJECT('/tmp/{external}.txt') FORMAT 'FIXED' RECORDLENGTH 24 RECORDDELIM '\r\n' LAYOUT (BYTES 4, BYTES 10, DATE YMD ' ' BYTES 10))"
     )).unwrap();
     let result = (|| -> Result<(), NzError> {
         let metadata = &mut conn.metadata();
