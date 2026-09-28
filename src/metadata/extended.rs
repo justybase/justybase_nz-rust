@@ -391,6 +391,29 @@ mod tests {
     }
 
     #[test]
+    fn view_ddl_includes_escaped_object_and_column_comments() {
+        let columns = [super::NzDetailedColumnInfo {
+            schema: "ADMIN".into(),
+            name: "SELECT".into(),
+            ordinal: 1,
+            type_name: "INTEGER".into(),
+            not_null: false,
+            default_value: None,
+            description: Some("owner's identifier".into()),
+        }];
+        let ddl = super::build_view_ddl(
+            "DB",
+            "ADMIN",
+            "V",
+            "SELECT ID FROM T;",
+            Some("owner's view"),
+            &columns,
+        );
+        assert!(ddl.contains("COMMENT ON VIEW DB.ADMIN.V IS 'owner''s view';"));
+        assert!(ddl.contains("COMMENT ON COLUMN DB.ADMIN.V.\"SELECT\" IS 'owner''s identifier';"));
+    }
+
+    #[test]
     fn external_layout_is_emitted_as_zone_syntax() {
         assert_eq!(
             super::format_external_layout("BYTES 4, BYTES 8"),
@@ -557,6 +580,42 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
+fn build_view_ddl(
+    database: &str,
+    schema: &str,
+    view: &str,
+    definition: &str,
+    view_comment: Option<&str>,
+    columns: &[NzDetailedColumnInfo],
+) -> String {
+    let name = qualified(database, schema, view);
+    let mut lines = vec![
+        format!("CREATE OR REPLACE VIEW {name} AS"),
+        definition.to_owned(),
+    ];
+    if let Some(comment) = view_comment.filter(|value| !value.trim().is_empty()) {
+        lines.push(String::new());
+        lines.push(format!(
+            "COMMENT ON VIEW {name} IS '{}';",
+            sql_string(comment.trim())
+        ));
+    }
+    for column in columns {
+        if let Some(description) = column
+            .description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!(
+                "COMMENT ON COLUMN {name}.{} IS '{}';",
+                quote_identifier(&column.name),
+                sql_string(description.trim())
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 fn qualified(database: &str, schema: &str, name: &str) -> String {
     format!(
         "{}.{}.{}",
@@ -645,9 +704,17 @@ impl NzMetadata<'_> {
             Some(database) => database.to_owned(),
             None => self.current_database()?.unwrap_or_else(|| "UNKNOWN".into()),
         };
-        Ok(format!(
-            "CREATE OR REPLACE VIEW {} AS\n{definition}",
-            qualified(&database, &schema, &view)
+        let quoted_view = quote_identifier(&view);
+        let quoted_schema = quote_identifier(&schema);
+        let columns = self.detailed_columns(&quoted_view, Some(&quoted_schema))?;
+        let comment = self.table_comment(&quoted_view, Some(&quoted_schema))?;
+        Ok(build_view_ddl(
+            &database,
+            &schema,
+            &view,
+            &definition,
+            comment.as_deref(),
+            &columns,
         ))
     }
 

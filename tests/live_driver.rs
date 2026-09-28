@@ -421,6 +421,14 @@ fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
     ))
     .unwrap();
     conn.batch_execute(&format!(
+        "COMMENT ON VIEW {view} IS 'DDL round-trip view comment'"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
+        "COMMENT ON COLUMN {view}.\"SELECT\" IS 'DDL round-trip view column comment'"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!(
         "CREATE OR REPLACE PROCEDURE {procedure}() RETURNS INTEGER EXECUTE AS OWNER LANGUAGE NZPLSQL AS BEGIN_PROC BEGIN RETURN 1; END; END_PROC;"
     )).unwrap();
     conn.batch_execute(&format!(
@@ -444,6 +452,14 @@ fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
         let procedure_ddl = metadata.procedure_ddl(&procedure, None, None)?;
         assert!(table_ddl.contains("CREATE TABLE"));
         assert!(view_ddl.contains("CREATE OR REPLACE VIEW"));
+        assert!(view_ddl.contains("DDL round-trip view comment"));
+        assert!(view_ddl.contains("DDL round-trip view column comment"));
+        let view_batch = metadata.views_ddl(None, None, Some(std::slice::from_ref(&view)))?;
+        assert_eq!(view_batch.len(), 1);
+        assert!(view_batch[0].ddl.contains("DDL round-trip view comment"));
+        assert!(view_batch[0]
+            .ddl
+            .contains("DDL round-trip view column comment"));
         assert!(procedure_ddl.contains("CREATE OR REPLACE PROCEDURE"));
         let synonym_ddl = metadata.synonym_ddl(&synonym, None, None)?;
         let external_ddl = metadata.external_table_ddl(&external, None, None)?;
