@@ -68,8 +68,8 @@ fn parse_args() -> Args {
                 println!("dump_to_txt [--conn URI | env NZ_*] [--sql SQL] [--out FILE] [--no-header] [--demo]");
                 exit(0);
             }
-            other => {
-                eprintln!("unknown argument: {other}");
+            _other => {
+                eprintln!("unknown argument (try --help)");
                 exit(2);
             }
         }

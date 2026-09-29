@@ -460,4 +460,18 @@ mod tests {
         pool.close();
         assert!(pool.get().is_err());
     }
+
+    #[test]
+    fn pool_config_debug_redacts_nested_password() {
+        let config = NzPoolConfig::new(NzConnectionConfig::new(
+            "localhost",
+            "db",
+            "user",
+            "pool-secret",
+        ));
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("pool-secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

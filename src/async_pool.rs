@@ -341,4 +341,18 @@ mod tests {
             assert!(matches!(pool.get().await, Err(NzError::Closed(_))));
         });
     }
+
+    #[test]
+    fn async_pool_config_debug_redacts_nested_password() {
+        let config = AsyncNzPoolConfig::new(NzConnectionConfig::new(
+            "localhost",
+            "db",
+            "user",
+            "pool-secret",
+        ));
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("pool-secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

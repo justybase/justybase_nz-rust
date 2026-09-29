@@ -17,6 +17,7 @@
 //! Port of the Node driver `connectionString.ts`.
 
 use crate::error::{NzError, NzResult};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityLevel {
@@ -48,7 +49,7 @@ impl SecurityLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NzConnectionConfig {
     pub host: String,
     pub port: u16,
@@ -72,6 +73,27 @@ pub struct NzConnectionConfig {
     pub client_host_name: String,
     /// Numeric Netezza client type (default: Node = 15).
     pub client_type: i16,
+}
+
+impl fmt::Debug for NzConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NzConnectionConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("security_level", &self.security_level)
+            .field("ssl_cert_path", &self.ssl_cert_path)
+            .field("reject_unauthorized", &self.reject_unauthorized)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("command_timeout", &self.command_timeout)
+            .field("app_name", &self.app_name)
+            .field("os_user", &self.os_user)
+            .field("client_host_name", &self.client_host_name)
+            .field("client_type", &self.client_type)
+            .finish()
+    }
 }
 
 impl Default for NzConnectionConfig {
@@ -159,9 +181,9 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
     } else if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("nz://") {
         &trimmed[5..]
     } else {
-        return Err(NzError::Config(format!(
-            "Invalid connection string: {connection_string}"
-        )));
+        return Err(NzError::Config(
+            "Invalid connection string scheme; expected netezza:// or nz://".into(),
+        ));
     };
 
     let (authority, query) = match rest.split_once('?') {
@@ -316,6 +338,35 @@ mod tests {
     #[test]
     fn rejects_missing_database() {
         assert!(parse_connection_string("nz://u:p@h").is_err());
+    }
+
+    #[test]
+    fn connection_string_errors_do_not_expose_uri_or_password() {
+        let uri = "https://user:secret@host/db";
+        let error = parse_connection_string(uri).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Invalid connection string scheme"));
+        assert!(!message.contains(uri));
+        assert!(!message.contains("secret"));
+    }
+
+    #[test]
+    fn parses_the_audited_credential_bearing_uri() {
+        let cfg = parse_connection_string("netezza://user:secret@host/db").unwrap();
+        assert_eq!(cfg.host, "host");
+        assert_eq!(cfg.database, "db");
+        assert_eq!(cfg.user, "user");
+        assert_eq!(cfg.password, "secret");
+    }
+
+    #[test]
+    fn connection_config_debug_redacts_password() {
+        let cfg = NzConnectionConfig::new("host", "db", "user", "secret");
+        let debug = format!("{cfg:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret"));
     }
 
     #[test]

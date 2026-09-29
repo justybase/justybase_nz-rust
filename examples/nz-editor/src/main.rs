@@ -82,8 +82,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut it: I) -> Args {
                 );
                 exit(0);
             }
-            other => {
-                eprintln!("nz-editor: unknown argument `{other}` (try --help)");
+            _other => {
+                eprintln!("nz-editor: unknown argument (try --help)");
                 exit(2);
             }
         }
