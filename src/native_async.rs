@@ -14,8 +14,8 @@
 
 //! Native Tokio transport and a tokio-postgres-shaped client facade.
 //!
-//! The legacy [`crate::asynchronous::AsyncNzConnection`] remains available as
-//! a compatibility wrapper.  This module is the new transport: socket reads
+//! The legacy `AsyncNzConnection` remains available with the `compat` feature
+//! as a compatibility wrapper. This module is the new transport: socket reads
 //! and writes are performed by Tokio directly, while one connection still
 //! serializes SQL operations because that is a property of the Netezza
 //! simple-query protocol.

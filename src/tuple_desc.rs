@@ -43,7 +43,7 @@ impl ColumnDesc {
     /// The two references agree on the OID set but not on every spelling:
     /// C# reports `SMALLINT`/`INTEGER`/`BIGINT`/`REAL`/`DOUBLE`, Node reports
     /// `INT2`/`INT4`/`INT8`/`FLOAT4`/`FLOAT8`. This table follows C#; the Node
-    /// spellings are available on [`crate::reader::ColumnMetadata`]'s
+    /// spellings are available on the compatibility `ColumnMetadata` type's
     /// `type_name` field.
     ///
     /// Unknown OIDs fall back to `OID(n)` — the C# falls back to the server's

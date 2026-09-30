@@ -574,7 +574,7 @@ impl ResultSet {
     }
 }
 
-/// Buffered result of [`NzConnection::query`]: every result set of a
+/// Buffered result of [`crate::Client::query_multi`]: every result set of a
 /// (possibly multi-statement) batch, the accumulated affected-row count and
 /// the server notices collected while draining the response.
 #[derive(Debug, Clone)]
@@ -601,7 +601,8 @@ pub trait QueryStreamSink {
 
     fn on_row(&mut self, result_set_index: usize, row: Row) -> NzResult<()>;
 
-    /// Borrowed hot-path callback used by [`NzConnection::execute_stream`].
+    /// Borrowed hot-path callback used by the compatibility
+    /// `NzConnection::execute_stream` API.
     ///
     /// The default preserves the owned [`Row`] callback contract. A consumer
     /// that only needs to inspect/count values can override this method and
