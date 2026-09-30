@@ -12,6 +12,13 @@ All notable changes to `nz_rust` will be documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-30
+
+### Fixed
+
+- Corrected the repository links in crate metadata to
+  `https://github.com/justybase/justybase_nz-rust`.
+
 ## [0.3.0] - 2026-09-30
 
 ### Fixed

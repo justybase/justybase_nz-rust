@@ -1,12 +1,12 @@
 [package]
 name = "nz_rust"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
 authors = ["Krzysztof Duśko"]
-repository = "https://github.com/justybase/justybase_netezza_driver_rust"
-homepage = "https://github.com/justybase/justybase_netezza_driver_rust"
+repository = "https://github.com/justybase/justybase_nz-rust"
+homepage = "https://github.com/justybase/justybase_nz-rust"
 documentation = "https://docs.rs/nz_rust"
 description = "Pure Rust driver for IBM Netezza / PureData — port of JustyBase.NetezzaDriver (C#) and @justybase/netezza-driver (Node/TS)"
 readme = "README.md"

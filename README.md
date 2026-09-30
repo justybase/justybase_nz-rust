@@ -3,7 +3,7 @@
 Pure Rust client driver for IBM Netezza and PureData System for Analytics.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![CI](https://github.com/justybase/justybase_netezza_driver_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/justybase/justybase_netezza_driver_rust/actions/workflows/ci.yml)
+[![CI](https://github.com/justybase/justybase_nz-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/justybase/justybase_nz-rust/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/nz_rust.svg)](https://crates.io/crates/nz_rust)
 [![docs.rs](https://docs.rs/nz_rust/badge.svg)](https://docs.rs/nz_rust)
 
@@ -75,7 +75,7 @@ and a sanitized error or protocol trace.
 
 ## 0.3 API and migration
 
-This checkout prepares version 0.3.0; no release has been published by this work.
+Version 0.3.1 is published on crates.io.
 Use `Client` for Tokio, `blocking::Client` for synchronous code, `Pool` for
 Tokio pooling and `blocking::Pool` for synchronous pooling. The primary
 blocking API runs the same protocol driver as the Tokio API. Use it outside
@@ -142,7 +142,7 @@ See [QUALITY_REPORT.md](QUALITY_REPORT.md) for measured results and validation.
 
 ## Installation
 
-Once 0.3 is published, the dependency declaration will be:
+Add the crate from crates.io with:
 
 ```toml
 [dependencies]
@@ -153,7 +153,7 @@ When using the workspace checkout:
 
 ```toml
 [dependencies]
-nz_rust = { path = "../justybase_netezza_driver_rust" }
+nz_rust = { path = "../justybase_nz-rust" }
 ```
 
 TLS support is opt-in:
