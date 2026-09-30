@@ -44,6 +44,7 @@ use crate::params::{substitute_bound_parameters, substitute_parameters, NzParame
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
 use crate::types::text::{build_simple_query_packet, parse_text_data_row_into, text_row_layout};
 use crate::types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -107,7 +108,11 @@ pub fn unregister_import_data(id: &str) {
 }
 
 pub(crate) fn take_import_source(id: &str) -> Option<ImportSource> {
-    import_registry().lock().ok()?.remove(id)
+    if cfg!(feature = "compat") {
+        import_registry().lock().ok()?.remove(id)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,9 +150,10 @@ enum RowStorage {
 
 #[derive(Debug)]
 struct RawRowData {
-    payload: Arc<[u8]>,
+    payload: Bytes,
     kind: RawRowKind,
     decoded: OnceLock<Vec<NzValue>>,
+    cells: OnceLock<Box<[OnceLock<NzValue>]>>,
 }
 
 #[derive(Debug)]
@@ -162,6 +168,29 @@ enum RawRowKind {
 }
 
 impl RawRowData {
+    fn value(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<&NzValue> {
+        if let Some(values) = self.decoded.get() {
+            return values
+                .get(index)
+                .ok_or_else(|| NzError::Config("row index out of range".into()));
+        }
+        let cells = self
+            .cells
+            .get_or_init(|| (0..columns.len()).map(|_| OnceLock::new()).collect());
+        let cell = cells
+            .get(index)
+            .ok_or_else(|| NzError::Config("row index out of range".into()))?;
+        if cell.get().is_none() {
+            let value = self.decode_value(index, columns).map_err(|error| {
+                NzError::Protocol(format!(
+                    "cannot decode column {index} (type {}): {error}",
+                    columns[index].type_oid
+                ))
+            })?;
+            let _ = cell.set(value);
+        }
+        Ok(cell.get().expect("cell initialized above"))
+    }
     fn decode_value(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<NzValue> {
         match &self.kind {
             RawRowKind::Text { fields } => {
@@ -169,15 +198,12 @@ impl RawRowData {
                     return Ok(NzValue::Null);
                 };
                 let bytes = &self.payload[range.clone()];
-                let text = String::from_utf8_lossy(bytes);
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
                 let column = columns.get(index).ok_or_else(|| {
                     NzError::Protocol("text row has more fields than its description".into())
                 })?;
-                Ok(crate::types::text::parse_text_value(
-                    &text,
-                    column.type_oid,
-                    column.type_mod,
-                ))
+                crate::types::text::try_parse_text_value(text, column.type_oid, column.type_mod)
             }
             RawRowKind::Dbos { descriptor, fields } => {
                 let field = fields.get(index).ok_or_else(|| {
@@ -202,17 +228,18 @@ impl RawRowData {
                     None => Ok(NzValue::Null),
                     Some(range) => {
                         let bytes = &self.payload[range.clone()];
-                        let text = String::from_utf8_lossy(bytes);
+                        let text = std::str::from_utf8(bytes)
+                            .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
                         let column = columns.get(index).ok_or_else(|| {
                             NzError::Protocol(
                                 "text row has more fields than its description".into(),
                             )
                         })?;
-                        Ok(crate::types::text::parse_text_value(
-                            &text,
+                        crate::types::text::try_parse_text_value(
+                            text,
                             column.type_oid,
                             column.type_mod,
-                        ))
+                        )
                     }
                 })
                 .collect(),
@@ -233,7 +260,7 @@ impl RawRowData {
                 if field.is_null {
                     None
                 } else if descriptor.field_fixed_size.get(index).copied().unwrap_or(0) != 0 {
-                    let size = descriptor.field_fixed_size[index] as usize;
+                    let size = descriptor.fixed_width(index).ok()?;
                     let end = field.start.checked_add(size)?;
                     self.payload.get(field.start..end)
                 } else {
@@ -250,7 +277,38 @@ impl RawRowData {
     }
 }
 
+/// Column metadata with explicitly separate PostgreSQL OID and DBOS wire type.
+#[derive(Debug, Clone, Copy)]
+pub struct TypeInfo<'a> {
+    pub column: &'a ColumnDesc,
+    pub dbos_type: Option<i32>,
+    pub wire_format: u8,
+}
+
 impl Row {
+    pub fn type_info<I: RowIndex>(&self, index: I) -> NzResult<TypeInfo<'_>> {
+        let position = index
+            .position(self)
+            .ok_or_else(|| NzError::Config("column index out of range".into()))?;
+        let column = &self.columns[position];
+        let dbos_type = match &self.storage {
+            RowStorage::Raw(raw) => match &raw.kind {
+                RawRowKind::Dbos { descriptor, .. } => Some(descriptor.field_type[position]),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(TypeInfo {
+            column,
+            dbos_type,
+            wire_format: if dbos_type.is_some() {
+                1
+            } else {
+                column.format
+            },
+        })
+    }
+
     pub fn new(columns: Vec<ColumnDesc>, values: Vec<NzValue>) -> Self {
         Row {
             columns: Arc::from(columns),
@@ -258,32 +316,49 @@ impl Row {
         }
     }
 
-    pub(crate) fn from_text_raw(columns: Arc<[ColumnDesc]>, payload: Vec<u8>) -> NzResult<Self> {
+    pub(crate) fn from_text_raw(
+        columns: Arc<[ColumnDesc]>,
+        payload: impl Into<Bytes>,
+    ) -> NzResult<Self> {
+        let payload = payload.into();
         let fields = text_row_layout(&payload, &columns).map_err(NzError::Protocol)?;
         Ok(Self {
             columns,
             storage: RowStorage::Raw(Arc::new(RawRowData {
-                payload: Arc::from(payload),
+                payload,
                 kind: RawRowKind::Text { fields },
                 decoded: OnceLock::new(),
+                cells: OnceLock::new(),
             })),
         })
     }
 
     pub(crate) fn from_dbos_raw(
         columns: Arc<[ColumnDesc]>,
-        payload: Vec<u8>,
+        payload: impl Into<Bytes>,
         descriptor: Arc<DbosTupleDesc>,
     ) -> NzResult<Self> {
+        let payload = payload.into();
         let fields = descriptor.row_layout(&payload)?;
         Ok(Self {
             columns,
             storage: RowStorage::Raw(Arc::new(RawRowData {
-                payload: Arc::from(payload),
+                payload,
                 kind: RawRowKind::Dbos { descriptor, fields },
                 decoded: OnceLock::new(),
+                cells: OnceLock::new(),
             })),
         })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match &self.storage {
+            RowStorage::Raw(raw) => raw.payload.len().saturating_add(self.len() * std::mem::size_of::<Option<Range<usize>>>()).saturating_add(std::mem::size_of::<RawRowData>() + std::mem::size_of::<Row>()),
+            RowStorage::Values(values) => values.iter().map(|value| match value {
+                NzValue::Text(s) | NzValue::Numeric(s) | NzValue::Date(s) | NzValue::Time(s) | NzValue::Timestamp(s) | NzValue::Timetz(s) | NzValue::Interval(s) => s.len(),
+                NzValue::Bytea(bytes) => bytes.len(), _ => 0,
+            } + std::mem::size_of::<NzValue>()).sum(),
+        }
     }
 
     pub fn columns(&self) -> &[ColumnDesc] {
@@ -299,12 +374,21 @@ impl Row {
     }
 
     pub fn values(&self) -> &[NzValue] {
+        self.try_values()
+            .unwrap_or_else(|e| panic!("row.values failed: {e}"))
+    }
+
+    /// Materialize all fields, preserving decoding errors rather than inventing NULLs.
+    pub fn try_values(&self) -> NzResult<&[NzValue]> {
         match &self.storage {
-            RowStorage::Values(values) => values,
-            RowStorage::Raw(raw) => raw.decoded.get_or_init(|| {
-                raw.decode_all(&self.columns)
-                    .unwrap_or_else(|_| vec![NzValue::Null; self.columns.len()])
-            }),
+            RowStorage::Values(values) => Ok(values),
+            RowStorage::Raw(raw) => {
+                if raw.decoded.get().is_none() {
+                    let values = raw.decode_all(&self.columns)?;
+                    let _ = raw.decoded.set(values);
+                }
+                Ok(raw.decoded.get().expect("row initialized above"))
+            }
         }
     }
 
@@ -322,7 +406,12 @@ impl Row {
     /// [`Row::try_get`] or [`Row::try_get_raw_value`].
     pub fn try_get_value<I: RowIndex>(&self, idx: I) -> NzResult<&NzValue> {
         match idx.position(self) {
-            Some(p) => Ok(&self.values()[p]),
+            Some(p) => match &self.storage {
+                RowStorage::Values(values) => values
+                    .get(p)
+                    .ok_or_else(|| NzError::Config("row values do not match columns".into())),
+                RowStorage::Raw(raw) => raw.value(p, &self.columns),
+            },
             None => Err(NzError::Config(format!(
                 "row index out of range: {}",
                 idx.describe()
@@ -350,18 +439,31 @@ impl Row {
         })?;
         match &self.storage {
             RowStorage::Values(values) => Ok(RawValue::from_decoded(
-                &values[position],
+                values
+                    .get(position)
+                    .ok_or_else(|| NzError::Protocol("row values do not match columns".into()))?,
                 column.type_oid,
                 column.type_mod,
                 column.format,
             )),
-            RowStorage::Raw(raw) => Ok(RawValue::from_parts(
-                raw.field_bytes(position),
-                None,
-                column.type_oid,
-                column.type_mod,
-                column.format,
-            )),
+            RowStorage::Raw(raw) => {
+                let value = RawValue::from_parts(
+                    raw.field_bytes(position),
+                    None,
+                    column.type_oid,
+                    column.type_mod,
+                    column.format,
+                );
+                match &raw.kind {
+                    RawRowKind::Dbos { descriptor, fields } => Ok(value.with_dbos(
+                        descriptor,
+                        &raw.payload,
+                        fields[position].start,
+                        position,
+                    )),
+                    RawRowKind::Text { .. } => Ok(value),
+                }
+            }
         }
     }
 
@@ -374,7 +476,7 @@ impl Row {
 
     /// Checked typed extraction.
     pub fn try_get<I: RowIndex, T: FromSql>(&self, idx: I) -> NzResult<T> {
-        T::from_sql(self.try_get_raw(idx)?)
+        T::from_raw(self.try_get_raw_value(idx)?)
     }
 
     /// Panicking typed extraction through the lazy raw-value interface.
@@ -385,39 +487,7 @@ impl Row {
 
     /// Checked typed extraction through the lazy raw-value interface.
     pub fn try_get_raw_typed<'a, I: RowIndex, T: FromSqlRaw<'a>>(&'a self, idx: I) -> NzResult<T> {
-        let position = idx.position(self).ok_or_else(|| {
-            NzError::Config(format!("row index out of range: {}", idx.describe()))
-        })?;
-        let column = self.columns.get(position).ok_or_else(|| {
-            NzError::Config(format!("row index out of range: ordinal {position}"))
-        })?;
-        match &self.storage {
-            RowStorage::Values(values) => T::from_sql_raw(RawValue::from_decoded(
-                &values[position],
-                column.type_oid,
-                column.type_mod,
-                column.format,
-            )),
-            RowStorage::Raw(raw) => {
-                if raw.decoded.get().is_none() {
-                    let decoded = raw.decode_all(&self.columns)?;
-                    let _ = raw.decoded.set(decoded);
-                }
-                let decoded = raw.decoded.get().ok_or_else(|| {
-                    NzError::Protocol("lazy row value cache was not initialized".into())
-                })?;
-                let value = decoded.get(position).ok_or_else(|| {
-                    NzError::Config(format!("row index out of range: ordinal {position}"))
-                })?;
-                T::from_sql_raw(RawValue::from_parts(
-                    raw.field_bytes(position),
-                    Some(value),
-                    column.type_oid,
-                    column.type_mod,
-                    column.format,
-                ))
-            }
-        }
+        T::from_sql_raw(self.try_get_raw_value(idx)?)
     }
 
     /// Row as `name → value` pairs in column order.
@@ -558,6 +628,19 @@ pub trait QueryStreamSink {
     }
 }
 
+struct DiscardSink;
+impl QueryStreamSink for DiscardSink {
+    fn on_columns(&mut self, _: usize, _: &[ColumnDesc], _: Option<&[bool]>) -> NzResult<()> {
+        Ok(())
+    }
+    fn on_row(&mut self, _: usize, _: Row) -> NzResult<()> {
+        Ok(())
+    }
+    fn on_values(&mut self, _: usize, _: &[ColumnDesc], _: &[NzValue]) -> NzResult<()> {
+        Ok(())
+    }
+}
+
 /// Metadata and counters returned after a streaming execution.
 #[derive(Debug, Clone, Default)]
 pub struct StreamSummary {
@@ -574,6 +657,14 @@ pub struct StreamResultSet {
 }
 
 impl QueryResult {
+    /// Move the first result set's rows without cloning them.
+    pub fn into_rows(self) -> Vec<Row> {
+        self.result_sets
+            .into_iter()
+            .next()
+            .map(|set| set.rows)
+            .unwrap_or_default()
+    }
     /// Rows of the first result set (empty when the batch returns none).
     pub fn rows(&self) -> &[Row] {
         self.result_sets
@@ -690,6 +781,7 @@ pub struct NzConnection {
     executing: bool,
     in_transaction: bool,
     export_file: Option<File>,
+    import_source: Option<(String, ImportSource)>,
     /// Absolute deadline for the command currently being drained.  Keeping
     /// the deadline on the connection lets every low-level buffered read
     /// enforce one wall-clock budget, including multi-row payloads.
@@ -705,6 +797,7 @@ impl NzConnection {
 
     /// Open a TCP connection and run the handshake + authentication.
     pub fn connect(config: &NzConnectionConfig) -> NzResult<Self> {
+        config.validate()?;
         let timeout = Duration::from_secs(config.connection_timeout.max(1));
         let addr_str = if config.host.contains(':') && !config.host.starts_with('[') {
             format!("[{}]:{}", config.host, config.port)
@@ -733,6 +826,7 @@ impl NzConnection {
                         executing: false,
                         in_transaction: false,
                         export_file: None,
+                        import_source: None,
                         command_deadline: None,
                         protocol_sync_required: false,
                     };
@@ -779,6 +873,7 @@ impl NzConnection {
         self.in_transaction = false;
         self.connected = false;
         self.export_file.take();
+        self.import_source.take();
         if let Some(mut s) = self.stream.take() {
             let _ = s.shutdown();
         }
@@ -884,15 +979,19 @@ impl NzConnection {
 
     /// First-set rows only (closest to `tokio_postgres::Client::query`).
     pub fn query_rows(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
-        Ok(self.query(sql, params)?.rows().to_vec())
+        Ok(self.query(sql, params)?.into_rows())
     }
 
     /// Exactly one row; errors when the first set holds none.
     pub fn query_one(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Row> {
         let rows = self.query_rows(sql, params)?;
-        rows.into_iter()
-            .next()
-            .ok_or_else(|| NzError::Config("query_one: no rows returned".into()))
+        if rows.len() != 1 {
+            return Err(NzError::Config(format!(
+                "query_one: expected one row, got {}",
+                rows.len()
+            )));
+        }
+        Ok(rows.into_iter().next().expect("one row checked above"))
     }
 
     /// Zero or one row; errors when more than one row is returned.
@@ -907,6 +1006,24 @@ impl NzConnection {
         Ok(rows.into_iter().next())
     }
 
+    /// Bind a one-shot import reader to this operation, without a global registry.
+    /// The appliance must request exactly `id`; unused readers are dropped on return.
+    pub fn query_with_import_reader(
+        &mut self,
+        sql: &str,
+        params: &[&dyn ToSql],
+        id: &str,
+        reader: impl Read + Send + 'static,
+    ) -> NzResult<QueryResult> {
+        if id.is_empty() || id.contains('\0') {
+            return Err(NzError::Config("invalid import identifier".into()));
+        }
+        self.import_source = Some((id.to_owned(), ImportSource::Reader(Box::new(reader))));
+        let result = self.query(sql, params);
+        self.import_source.take();
+        result
+    }
+
     /// Execute a non-query batch; returns affected rows (`-1` for DDL, same
     /// as the C# driver when the backend reports no count).
     pub fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
@@ -916,8 +1033,9 @@ impl NzConnection {
 
     pub fn execute_values(&mut self, sql: &str, params: &[NzValue]) -> NzResult<i64> {
         let final_sql = substitute_parameters(sql, params).map_err(NzError::Config)?;
-        let res = self.run_batch(&final_sql)?;
-        Ok(res.rows_affected)
+        Ok(self
+            .run_batch_stream(&final_sql, self.config.command_timeout, &mut DiscardSink)?
+            .rows_affected)
     }
 
     /// Execute a non-query with an explicit wall-clock timeout.
@@ -940,13 +1058,14 @@ impl NzConnection {
     ) -> NzResult<i64> {
         let final_sql = substitute_parameters(sql, params).map_err(NzError::Config)?;
         Ok(self
-            .run_batch_with_duration(&final_sql, timeout)?
+            .run_batch_stream_with_duration(&final_sql, timeout, &mut DiscardSink)?
             .rows_affected)
     }
 
     /// Execute without parameters and discard rows (DDL / `SET` / scripts).
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
-        self.run_batch(sql).map(|_| ())
+        self.run_batch_stream(sql, self.config.command_timeout, &mut DiscardSink)
+            .map(|_| ())
     }
 
     /// Streaming reader (ADO.NET style). The response is buffered through the
@@ -1097,6 +1216,7 @@ impl NzConnection {
         self.protocol_faulted = true;
         self.connected = false;
         self.export_file.take();
+        self.import_source.take();
         if let Some(mut s) = self.stream.take() {
             let _ = s.shutdown();
         }
@@ -1115,6 +1235,9 @@ impl NzConnection {
         sql: &str,
         timeout: Option<Duration>,
     ) -> NzResult<QueryResult> {
+        if sql.contains('\0') {
+            return Err(NzError::Config("SQL contains NUL".into()));
+        }
         self.assert_can_execute()?;
         self.executing = true;
         self.command_deadline = timeout.map(|duration| Instant::now() + duration);
@@ -1186,6 +1309,9 @@ impl NzConnection {
         timeout: Option<Duration>,
         sink: &mut S,
     ) -> NzResult<StreamSummary> {
+        if sql.contains('\0') {
+            return Err(NzError::Config("SQL contains NUL".into()));
+        }
         self.assert_can_execute()?;
         self.executing = true;
         self.command_deadline = timeout.map(|duration| Instant::now() + duration);
@@ -1257,6 +1383,11 @@ impl NzConnection {
             .stream
             .as_mut()
             .ok_or_else(|| NzError::Closed("Connection is closed".into()))?;
+        stream.set_read_timeout(self.command_deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_nanos(1))
+        }))?;
         apply_deadline_to_stream(self.command_deadline, stream, true)?;
         match stream.write_all(&packet) {
             Ok(()) => {
@@ -1732,7 +1863,7 @@ impl NzConnection {
 
     fn read_type_byte(&mut self) -> NzResult<u8> {
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = (|| loop {
             let b = buf.read_byte(&mut guard)?;
             if b != 0 {
@@ -1745,7 +1876,7 @@ impl NzConnection {
 
     fn skip_frame_header(&mut self) -> NzResult<()> {
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = buf.skip(&mut guard, 4);
         self.stream_restore(guard, buf);
         r
@@ -1753,7 +1884,7 @@ impl NzConnection {
 
     fn read_len(&mut self, field: &str) -> NzResult<usize> {
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = (|| {
             let len = buf.read_i32(&mut guard)?;
             let len = validate_protocol_length(len, field, true)?;
@@ -1766,7 +1897,7 @@ impl NzConnection {
     fn read_payload(&mut self, len: usize, field: &str) -> NzResult<Vec<u8>> {
         let _ = field;
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = buf.read_bytes(&mut guard, len);
         self.stream_restore(guard, buf);
         r
@@ -1784,7 +1915,7 @@ impl NzConnection {
             ));
         }
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let result = (|| {
             buf.skip(&mut guard, 4)?;
             let row_len = buf.read_i32(&mut guard)?;
@@ -1836,7 +1967,7 @@ impl NzConnection {
             ));
         }
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = (|| {
             // The first four bytes are a DBOS row marker/reserved field; the
             // second word is the payload length. Read them directly instead
@@ -1958,7 +2089,7 @@ impl NzConnection {
             }
             let msg_type = {
                 let mut guard = self.stream_take()?;
-                let mut buf = std::mem::take(&mut self.buffer);
+                let mut buf = self.buffer.take();
                 let r = buf.read_byte(&mut guard);
                 self.stream_restore(guard, buf);
                 r?
@@ -1983,7 +2114,7 @@ impl NzConnection {
                 }
                 let row_len: i32 = {
                     let mut guard = self.stream_take()?;
-                    let mut buf = std::mem::take(&mut self.buffer);
+                    let mut buf = self.buffer.take();
                     let r: NzResult<i32> = (|| {
                         buf.ensure_data(&mut guard, 8)?;
                         let h = buf.read_bytes(&mut guard, 8)?;
@@ -2027,7 +2158,7 @@ impl NzConnection {
             }
             let len = {
                 let mut guard = self.stream_take()?;
-                let mut buf = std::mem::take(&mut self.buffer);
+                let mut buf = self.buffer.take();
                 let r = buf.read_i32(&mut guard);
                 self.stream_restore(guard, buf);
                 r?
@@ -2079,7 +2210,7 @@ impl NzConnection {
                 // timeout here just means "no more orphaned bytes yet".
                 let want = (self.buffer.available() + 1).min(n);
                 let mut guard = self.stream_take()?;
-                let mut buf = std::mem::take(&mut self.buffer);
+                let mut buf = self.buffer.take();
                 let r = buf.ensure_data(&mut guard, want);
                 let avail = buf.available();
                 self.stream_restore(guard, buf);
@@ -2105,7 +2236,7 @@ impl NzConnection {
 
     fn skip_bytes_raw(&mut self, n: usize) -> NzResult<()> {
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let r = buf.skip(&mut guard, n);
         self.stream_restore(guard, buf);
         r
@@ -2131,8 +2262,13 @@ impl NzConnection {
             ));
         }
         let name = self.read_payload(len, "externalTableExportFilename")?;
-        let filename = String::from_utf8_lossy(&name).replace('\0', "");
-        match File::create(&filename) {
+        let filename = crate::external::decode_filename(&name)?;
+        match self
+            .config
+            .external_files
+            .resolve(std::path::Path::new(&filename))
+            .and_then(File::create)
+        {
             Ok(f) => {
                 self.export_file = Some(f);
                 self.write_all_raw(&[0, 0, 0, 0])?;
@@ -2157,7 +2293,7 @@ impl NzConnection {
         loop {
             let status = {
                 let mut guard = self.stream_take()?;
-                let mut buf = std::mem::take(&mut self.buffer);
+                let mut buf = self.buffer.take();
                 let r = buf.read_i32(&mut guard);
                 self.stream_restore(guard, buf);
                 r?
@@ -2167,7 +2303,7 @@ impl NzConnection {
                     // DATA
                     let n: usize = {
                         let mut guard = self.stream_take()?;
-                        let mut buf = std::mem::take(&mut self.buffer);
+                        let mut buf = self.buffer.take();
                         let r: NzResult<usize> = (|| {
                             let v = buf.read_i32(&mut guard)?;
                             Ok(
@@ -2196,7 +2332,7 @@ impl NzConnection {
                     // ERROR: len(u16) + message
                     let len: usize = {
                         let mut guard = self.stream_take()?;
-                        let mut buf = std::mem::take(&mut self.buffer);
+                        let mut buf = self.buffer.take();
                         let r: NzResult<usize> = (|| {
                             buf.ensure_data(&mut guard, 2)?;
                             let b = buf.read_bytes(&mut guard, 2)?;
@@ -2236,9 +2372,9 @@ impl NzConnection {
                 ));
             }
         }
-        let filename = String::from_utf8_lossy(&name_bytes).to_string();
+        let filename = crate::external::decode_filename(&name_bytes)?;
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let header = (|| {
             let _host_version = buf.read_i32(&mut guard)?;
             Ok::<_, NzError>(())
@@ -2247,7 +2383,7 @@ impl NzConnection {
         header?;
         self.write_all_raw(&1i32.to_be_bytes())?;
         let mut guard = self.stream_take()?;
-        let mut buf = std::mem::take(&mut self.buffer);
+        let mut buf = self.buffer.take();
         let cfg: NzResult<usize> = (|| {
             let _format = buf.read_i32(&mut guard)?;
             let size = buf.read_i32(&mut guard)?;
@@ -2257,7 +2393,16 @@ impl NzConnection {
         let buf_size = cfg?.max(1);
 
         // Virtual stream first, then the filesystem (Node parity).
-        if let Some(source) = take_import_source(&filename) {
+        let source = if self
+            .import_source
+            .as_ref()
+            .is_some_and(|(id, _)| id == &filename)
+        {
+            self.import_source.take().map(|(_, source)| source)
+        } else {
+            take_import_source(&filename)
+        };
+        if let Some(source) = source {
             return match source {
                 ImportSource::Bytes(data) => {
                     self.send_import_reader(std::io::Cursor::new(data), buf_size)
@@ -2269,7 +2414,12 @@ impl NzConnection {
                 }
             };
         }
-        match File::open(&filename) {
+        match self
+            .config
+            .external_files
+            .resolve(std::path::Path::new(&filename))
+            .and_then(File::open)
+        {
             Ok(file) => self.send_import_reader(file, buf_size),
             Err(_) => {
                 // File missing → ERROR status (C#/Node parity).
@@ -2317,7 +2467,7 @@ impl NzConnection {
         let payload_len = len.saturating_sub(1);
         let dir = self.read_payload(payload_len, "fileTransfer.logDirectoryPayloadLength")?;
         let _ = self.read_payload(1, "fileTransfer.logDirectoryTerminator")?;
-        let log_dir = String::from_utf8_lossy(&dir).to_string();
+        let log_dir = crate::external::decode_filename(&dir)?;
         let mut name_bytes: Vec<u8> = Vec::new();
         loop {
             let b = self.read_payload(1, "fileTransfer.logFilename")?;
@@ -2326,13 +2476,13 @@ impl NzConnection {
             }
             name_bytes.push(b[0]);
             if name_bytes.len() > 4096 {
-                break;
+                return Err(NzError::Protocol("external filename is too long".into()));
             }
         }
-        let filename = String::from_utf8_lossy(&name_bytes).to_string();
+        let filename = crate::external::decode_filename(&name_bytes)?;
         let log_type = {
             let mut guard = self.stream_take()?;
-            let mut buf = std::mem::take(&mut self.buffer);
+            let mut buf = self.buffer.take();
             let r = buf.read_i32(&mut guard);
             self.stream_restore(guard, buf);
             r?
@@ -2344,11 +2494,16 @@ impl NzConnection {
             _ => ".log",
         };
         let path = std::path::Path::new(&log_dir).join(format!("{filename}{ext}"));
-        let mut file = File::create(&path).ok();
+        let mut file = self
+            .config
+            .external_files
+            .resolve(&path)
+            .and_then(File::create)
+            .ok();
         loop {
             let n: usize = {
                 let mut guard = self.stream_take()?;
-                let mut buf = std::mem::take(&mut self.buffer);
+                let mut buf = self.buffer.take();
                 let r: NzResult<usize> = (|| {
                     let v = buf.read_i32(&mut guard)?;
                     Ok(validate_protocol_length(v, "externalTableLogChunk", true)? as usize)
@@ -2618,6 +2773,11 @@ fn apply_deadline_to_stream(
     write: bool,
 ) -> NzResult<()> {
     let Some(deadline) = deadline else {
+        if write {
+            stream.set_write_timeout(None)?;
+        } else {
+            stream.set_read_timeout(None)?;
+        }
         return Ok(());
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2832,6 +2992,7 @@ mod tests {
             executing: false,
             in_transaction: false,
             export_file: None,
+            import_source: None,
             command_deadline: None,
             protocol_sync_required: false,
         };
@@ -2889,5 +3050,64 @@ mod tests {
         ] {
             assert!(validate_catalog_identifier(invalid).is_err(), "{invalid:?}");
         }
+    }
+    #[test]
+    fn long_binary_varchar_and_single_field_access_preserve_data() {
+        for size in [32760usize, 32766, 32767, 40000, 64000] {
+            let desc = Arc::new(DbosTupleDesc {
+                num_fields: 2,
+                num_fixed_fields: 1,
+                num_varying_fields: 1,
+                fixed_fields_size: 6,
+                field_type: vec![3, 16],
+                field_size: vec![4, size as i32],
+                field_true_size: vec![4, size as i32],
+                field_offset: vec![2, 0],
+                field_fixed_size: vec![4, 0],
+                field_null_byte_offset: vec![2, 2],
+                field_null_bit_mask: vec![1, 2],
+                ..Default::default()
+            });
+            let mut bytes = vec![0, 0];
+            bytes.extend_from_slice(&123i32.to_le_bytes());
+            bytes.extend_from_slice(&((size + 2) as u16).to_le_bytes());
+            bytes.extend(std::iter::repeat_n(b'x', size));
+            if !size.is_multiple_of(2) {
+                bytes.push(0);
+            }
+            let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), bytes, desc).unwrap();
+            assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
+            let RowStorage::Raw(raw) = &row.storage else {
+                panic!("expected raw row");
+            };
+            assert!(raw.decoded.get().is_none());
+            assert!(raw.cells.get().is_none());
+            assert_eq!(row.try_get::<_, String>(1).unwrap().len(), size);
+            assert_eq!(row.try_values().unwrap()[0], NzValue::Int4(123));
+        }
+    }
+
+    #[test]
+    fn a_decode_error_is_not_sql_null_and_does_not_poison_other_fields() {
+        let desc = Arc::new(DbosTupleDesc {
+            num_fields: 2,
+            num_fixed_fields: 2,
+            fixed_fields_size: 8,
+            field_type: vec![3, 15],
+            field_size: vec![4, 2],
+            field_true_size: vec![4, 2],
+            field_offset: vec![2, 6],
+            field_fixed_size: vec![4, 2],
+            field_null_byte_offset: vec![0, 0],
+            field_null_bit_mask: vec![0, 0],
+            ..Default::default()
+        });
+        let mut bytes = vec![0, 0];
+        bytes.extend_from_slice(&123i32.to_le_bytes());
+        bytes.extend([0xff, 0xff]);
+        let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), bytes, desc).unwrap();
+        assert!(row.try_get::<_, Option<String>>(1).is_err());
+        assert!(row.try_values().is_err());
+        assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
     }
 }

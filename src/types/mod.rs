@@ -13,7 +13,9 @@
 // limitations under the License.
 
 pub mod datetime;
+pub mod exact_numeric;
 pub mod numeric;
+pub mod temporal;
 pub mod text;
 pub mod value;
 

@@ -194,6 +194,33 @@ pub(crate) struct DbosFieldLayout {
 }
 
 impl DbosTupleDesc {
+    fn validate_row_bitmap(&self, row: &[u8]) -> NzResult<()> {
+        let vectors = [
+            self.field_type.len(),
+            self.field_size.len(),
+            self.field_true_size.len(),
+            self.field_offset.len(),
+            self.field_fixed_size.len(),
+            self.field_null_byte_offset.len(),
+            self.field_null_bit_mask.len(),
+        ];
+        if vectors.iter().any(|&n| n != self.num_fields)
+            || self.num_varying_fields < 0
+            || self.num_varying_fields as usize > self.num_fields
+        {
+            return Err(NzError::Protocol("inconsistent DBOS descriptor".into()));
+        }
+        if row.len() < 2
+            || (self.nulls_allowed != 0
+                && self
+                    .field_null_byte_offset
+                    .iter()
+                    .any(|&off| off >= row.len()))
+        {
+            return Err(NzError::Protocol("truncated DBOS row null bitmap".into()));
+        }
+        Ok(())
+    }
     /// Parse the descriptor. `cached_columns` supplies the text-path column
     /// metadata (used for the abstime OID 702 fix, nzpy issue #61).
     pub fn parse(data: &[u8], cached_columns: Option<&[ColumnDesc]>) -> NzResult<Self> {
@@ -226,6 +253,22 @@ impl DbosTupleDesc {
             )));
         }
         desc.num_fields = num_fields_i as usize;
+        if desc.num_fixed_fields < 0
+            || desc.num_varying_fields < 0
+            || desc.num_fixed_fields as usize > desc.num_fields
+            || desc.num_varying_fields as usize > desc.num_fields
+            || desc.fixed_fields_size < 0
+            || desc.max_record_size < 0
+        {
+            return Err(NzError::Protocol(
+                "invalid DBOS field counts or record sizes".into(),
+            ));
+        }
+        if cached_columns.is_some_and(|columns| columns.len() != desc.num_fields) {
+            return Err(NzError::Protocol(
+                "text and DBOS column counts differ".into(),
+            ));
+        }
 
         let descriptor_len = 36 + desc.num_fields * 36 + 8;
         validate_protocol_length(
@@ -255,6 +298,16 @@ impl DbosTupleDesc {
             desc.field_true_size.push(be32(idx + 8));
             desc.field_offset.push(be32(idx + 12));
             let phys_field = be32(idx + 16);
+            if !(0..=100_000).contains(&phys_field)
+                || be32(idx + 4) < -1
+                || be32(idx + 8) < -1
+                || be32(idx + 12) < 0
+                || be32(idx + 28) < 0
+            {
+                return Err(NzError::Protocol(format!(
+                    "invalid DBOS column {ix} layout"
+                )));
+            }
             desc.field_phys_field.push(phys_field);
             desc.field_log_field.push(be32(idx + 20));
             desc.field_null_allowed.push(be32(idx + 24) != 0);
@@ -277,12 +330,62 @@ impl DbosTupleDesc {
         (0..self.num_fields)
             .map(|i| ColumnDesc {
                 name: format!("col{}", i + 1),
-                type_oid: self.field_type[i],
-                type_len: self.field_size[i] as i16,
-                type_mod: self.field_size[i],
+                type_oid: match self.field_type[i] {
+                    2 => 701,
+                    3 => 23,
+                    4 => 700,
+                    6 => 1082,
+                    7 => 1700,
+                    8 => 1083,
+                    9 => 1114,
+                    10 => 1186,
+                    11 => 1266,
+                    12 => 16,
+                    13 => 2500,
+                    14 | 23 => 17,
+                    15 => 1042,
+                    16 | 21 => 1043,
+                    19 => 21,
+                    20 => 20,
+                    25 => 2522,
+                    26 => 2530,
+                    _ => 0,
+                },
+                type_len: if self.field_fixed_size[i] == 0
+                    || matches!(self.field_type[i], 7 | 15 | 25)
+                {
+                    -1
+                } else {
+                    self.fixed_width(i)
+                        .ok()
+                        .and_then(|width| i16::try_from(width).ok())
+                        .unwrap_or(-1)
+                },
+                type_mod: match self.field_type[i] {
+                    7 => {
+                        ((field_precision(self.field_size[i]) << 16)
+                            | field_scale(self.field_size[i]))
+                            + 16
+                    }
+                    15 | 16 | 21 | 25 | 26 => self.field_size[i].saturating_add(16),
+                    _ => -1,
+                },
                 format: 1,
             })
             .collect()
+    }
+
+    pub(crate) fn fixed_width(&self, index: usize) -> NzResult<usize> {
+        let width = match self.field_type[index] {
+            2 | 8 | 9 | 20 => 8,
+            3 | 4 | 6 => 4,
+            19 => 2,
+            12 | 13 => 1,
+            10 | 11 => 12,
+            15 => self.field_size[index],
+            _ => self.field_true_size[index],
+        };
+        usize::try_from(width).map_err(|_| NzError::Protocol("invalid fixed field width".into()))
     }
 
     fn is_null(&self, row: &[u8], base: usize, field_ix: usize) -> bool {
@@ -299,6 +402,7 @@ impl DbosTupleDesc {
     /// Validate and locate every field without decoding its value. This is
     /// the lazy-row counterpart of `parse_row_into_with_scratch`.
     pub(crate) fn row_layout(&self, row: &[u8]) -> NzResult<Vec<DbosFieldLayout>> {
+        self.validate_row_bitmap(row)?;
         let num_varying = self.num_varying_fields.max(0) as usize;
         let mut var_starts = Vec::with_capacity(num_varying);
         if num_varying > 0 {
@@ -356,7 +460,7 @@ impl DbosTupleDesc {
                 }
                 let off = off as usize;
                 if off
-                    .checked_add(fixed_size as usize)
+                    .checked_add(self.fixed_width(i)?)
                     .is_none_or(|end| end > row.len())
                 {
                     return Err(NzError::Protocol(format!(
@@ -427,6 +531,7 @@ impl DbosTupleDesc {
         out: &mut Vec<NzValue>,
         var_starts: &mut Vec<usize>,
     ) -> NzResult<()> {
+        self.validate_row_bitmap(row)?;
         let num_fields = self.num_fields;
         if out.capacity() < num_fields {
             out.reserve(num_fields - out.capacity());
@@ -498,7 +603,10 @@ impl DbosTupleDesc {
                     )));
                 }
                 field_start = off as usize;
-                if field_start + fixed_size as usize > row.len() {
+                if field_start
+                    .checked_add(self.fixed_width(i)?)
+                    .is_none_or(|end| end > row.len())
+                {
                     return Err(NzError::Protocol(format!(
                         "Invalid RowStandard payload: fixed field {i} extends beyond the row; reconnect is required."
                     )));
@@ -552,8 +660,12 @@ impl DbosTupleDesc {
 
         match fld_type {
             nz_type::NZ_TYPE_CHAR => {
-                let s = slice_of(row, off, fld_len);
-                let text = String::from_utf8_lossy(s);
+                let s = off
+                    .checked_add(fld_len)
+                    .and_then(|end| row.get(off..end))
+                    .ok_or_else(|| protocol_trunc(i))?;
+                let text = std::str::from_utf8(s)
+                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
                 let target = string_value_slot(out, StringValueKind::Text);
                 target.clear();
                 target.push_str(text.trim_end_matches(' '));
@@ -562,27 +674,32 @@ impl DbosTupleDesc {
                 if off + 2 > row.len() {
                     return Err(protocol_trunc(i));
                 }
-                let cursize = i16::from_le_bytes(row[off..off + 2].try_into().unwrap()) as i32 - 2;
+                let cursize = u16::from_le_bytes(row[off..off + 2].try_into().unwrap()) as i32 - 2;
                 if cursize < 0 || off + 2 + cursize as usize > row.len() {
                     return Err(protocol_trunc(i));
                 }
-                let text = String::from_utf8_lossy(slice_of(row, off + 2, cursize as usize));
+                let text = std::str::from_utf8(slice_of(row, off + 2, cursize as usize))
+                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
                 let target = string_value_slot(out, StringValueKind::Text);
                 target.clear();
                 target.push_str(text.trim_end_matches('\0'));
             }
-            nz_type::NZ_TYPE_VARCHAR | nz_type::NZ_TYPE_VAR_FIXED_CHAR => {
+            nz_type::NZ_TYPE_VARCHAR
+            | nz_type::NZ_TYPE_VAR_FIXED_CHAR
+            | nz_type::NZ_TYPE_JSON
+            | nz_type::NZ_TYPE_JSONPATH => {
                 if off + 2 > row.len() {
                     return Err(protocol_trunc(i));
                 }
-                let cursize = i16::from_le_bytes(row[off..off + 2].try_into().unwrap()) as i32 - 2;
+                let cursize = u16::from_le_bytes(row[off..off + 2].try_into().unwrap()) as i32 - 2;
                 if cursize < 0 || off + 2 + cursize as usize > row.len() {
                     return Err(protocol_trunc(i));
                 }
-                let text = String::from_utf8_lossy(slice_of(row, off + 2, cursize as usize));
+                let text = std::str::from_utf8(slice_of(row, off + 2, cursize as usize))
+                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
                 let target = string_value_slot(out, StringValueKind::Text);
                 target.clear();
-                target.push_str(&text);
+                target.push_str(text);
             }
             nz_type::NZ_TYPE_INT8 => {
                 if off + 8 > row.len() {
@@ -644,7 +761,7 @@ impl DbosTupleDesc {
                 datetime::interval_from_12bytes_into(&row[off..off + 12], target);
             }
             nz_type::NZ_TYPE_TIME_TZ => {
-                if off + fld_len > row.len() || fld_len < 12 {
+                if off.checked_add(fld_len).is_none_or(|end| end > row.len()) || fld_len < 12 {
                     return Err(protocol_trunc(i));
                 }
                 let target = string_value_slot(out, StringValueKind::Timetz);
@@ -662,7 +779,11 @@ impl DbosTupleDesc {
                 if off >= row.len() {
                     return Err(protocol_trunc(i));
                 }
-                *out = NzValue::Bool(row[off] == 0x01);
+                *out = match row[off] {
+                    0 => NzValue::Bool(false),
+                    1 => NzValue::Bool(true),
+                    _ => return Err(NzError::Protocol("invalid binary BOOLEAN".into())),
+                };
             }
             nz_type::NZ_TYPE_NUMERIC => {
                 let p = field_precision(self.field_size[i]);
@@ -685,10 +806,24 @@ impl DbosTupleDesc {
                 }
             }
             _ => {
-                let text = String::from_utf8_lossy(slice_of(row, off, fld_len));
-                let target = string_value_slot(out, StringValueKind::Text);
-                target.clear();
-                target.push_str(&text);
+                // Unknown/binary DBOS types remain opaque, preserving every byte.
+                let bytes = if self.field_fixed_size[i] != 0 {
+                    off.checked_add(self.fixed_width(i)?)
+                        .and_then(|end| row.get(off..end))
+                } else {
+                    let prefix = off
+                        .checked_add(2)
+                        .and_then(|end| row.get(off..end))
+                        .ok_or_else(|| protocol_trunc(i))?;
+                    let length = usize::from(u16::from_le_bytes(prefix.try_into().unwrap()));
+                    if length < 2 {
+                        return Err(protocol_trunc(i));
+                    }
+                    off.checked_add(length)
+                        .and_then(|end| row.get(off + 2..end))
+                }
+                .ok_or_else(|| protocol_trunc(i))?;
+                *out = NzValue::Bytea(bytes.to_vec());
             }
         }
         Ok(())
@@ -696,7 +831,7 @@ impl DbosTupleDesc {
 }
 
 fn slice_of(r: &[u8], o: usize, n: usize) -> &[u8] {
-    let end = (o + n).min(r.len());
+    let end = o.saturating_add(n).min(r.len());
     let start = o.min(r.len()).min(end);
     &r[start..end]
 }

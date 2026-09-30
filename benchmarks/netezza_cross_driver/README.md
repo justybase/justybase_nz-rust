@@ -1,7 +1,7 @@
 # Cross-driver Netezza benchmark
 
 This benchmark runs the same SQL scenarios against the same live appliance
-with the C#, Node and Rust drivers. It measures an already-open connection and
+with the local C#, Node, Rust and nzpy_extended drivers. It measures an already-open connection and
 includes query execution, protocol decoding and scalar value access.
 
 It is deliberately split into text-protocol scalar decoding, fixed-width
@@ -39,7 +39,7 @@ NZ_DEV_HOST=... NZ_DEV_PORT=5480 NZ_DEV_USER=... NZ_DEV_PASSWORD=... \
 
 Results are JSON files under `target/netezza-cross-benchmark`. The tabular
 summary sorts each scenario by average latency and also reports p50/p95 and
-throughput. The rows/cells and SQL are identical for all three runners; warmup
+throughput. The rows/cells and SQL are identical for all four runners; warmup
 and measured samples are recorded in every output.
 
 ## Numeric decoder replay
@@ -86,6 +86,31 @@ Run only the numeric precision matrix with:
 
 ```bash
 NZ_BENCH_SCENARIOS="$PWD/benchmarks/netezza_cross_driver/numeric_scenarios.json" \
-NZ_BENCH_RUST_BIN="$PWD/target/release/netezza-bench" \
+NZ_BENCH_RUST_BIN="$PWD/target/release/examples/netezza_bench" \
   benchmarks/netezza_cross_driver/run.sh
 ```
+
+## Runner and measurement notes
+
+`run.sh` builds `examples/netezza_bench.rs`, copies local C# library sources
+into `target` before building them, and runs all four drivers on the same
+manifest. It leaves the reference checkouts untouched. Override source roots
+with `NZ_CSHARP_DRIVER_ROOT`, `NZ_NODE_DRIVER_ROOT` and
+`NZ_PYTHON_DRIVER_ROOT`. Reports record reference versions and whether Python
+loaded its C extension. Rust supports `NZ_BENCH_MODE=stream`; the default is
+materialized compatibility values. Compare identical modes and workloads.
+
+Rust samples include allocated bytes/counts, CPU time (Linux clock ticks),
+peak RSS and first observed row. In materialized mode first-row time includes
+fetching the whole result. RSS is process-wide, and these measurements include
+server execution and network time. Numeric replay runs without an appliance:
+
+```bash
+cargo run --release -p nz_rust --features compat \
+  --example netezza_bench --offline -- \
+  --numeric-replay --output target/numeric-replay.json
+```
+
+Use at least one warmup and several repeated samples. Allocation totals count
+all requested allocation sizes, including reallocations; they are not live
+heap size. Large queries and decoder replay should be measured separately.

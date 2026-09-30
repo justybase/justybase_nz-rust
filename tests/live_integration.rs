@@ -1224,7 +1224,7 @@ fn command_timeout_property_defaults_and_set() {
         return;
     };
     let mut cmd = conn.create_command("SELECT 1", vec![]);
-    assert_eq!(cmd.command_timeout, 30);
+    assert_eq!(cmd.command_timeout, 0);
     cmd.command_timeout = 60;
     assert_eq!(cmd.command_timeout, 60);
 }

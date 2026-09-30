@@ -25,7 +25,7 @@ cargo test --workspace --all-targets --offline
 The example can be smoke-tested without a database:
 
 ```bash
-cargo run -p nz_rust --example dump_to_txt -- --demo --out demo.txt
+cargo run -p nz_rust --features compat --example dump_to_txt -- --demo --out demo.txt
 ```
 
 Live tests require `NZ_RUN_LIVE_TESTS=1`, `NZ_DEV_HOST`,

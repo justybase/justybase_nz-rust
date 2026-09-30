@@ -34,6 +34,17 @@ impl Default for ReadBuffer {
 }
 
 impl ReadBuffer {
+    /// Move the allocation out without allocating a replacement buffer.
+    pub(crate) fn take(&mut self) -> Self {
+        std::mem::replace(
+            self,
+            Self {
+                buf: Vec::new(),
+                start: 0,
+                end: 0,
+            },
+        )
+    }
     pub fn new() -> Self {
         ReadBuffer {
             buf: vec![0u8; 65_536],
@@ -270,5 +281,15 @@ mod tests {
         let mut rb = ReadBuffer::new();
         let mut data = Cursor::new(vec![0u8; 4]);
         assert!(rb.read_bytes(&mut data, usize::MAX).is_err());
+    }
+    #[test]
+    fn taking_buffer_does_not_allocate_and_preserves_bytes() {
+        let mut buffer = ReadBuffer::new();
+        buffer.ensure_data(&mut Cursor::new([1, 2, 3]), 3).unwrap();
+        let moved = buffer.take();
+        assert_eq!(moved.slice(), [1, 2, 3]);
+        assert_eq!(buffer.buf.capacity(), 0);
+        buffer = moved;
+        assert_eq!(buffer.read_byte(&mut Cursor::new([])).unwrap(), 1);
     }
 }

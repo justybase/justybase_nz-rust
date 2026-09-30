@@ -5,7 +5,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
-  <ItemGroup>
+  <ItemGroup Condition="'$(NZ_BENCH_CSHARP_PROJECT)' == ''">
     <PackageReference Include="JustyBase.NetezzaDriver" Version="1.7.2" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NZ_BENCH_CSHARP_PROJECT)' != ''">
+    <ProjectReference Include="$(NZ_BENCH_CSHARP_PROJECT)" AdditionalProperties="GeneratePackageOnBuild=false" />
   </ItemGroup>
 </Project>

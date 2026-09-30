@@ -25,72 +25,108 @@
 //! connection strings, pooling, metadata, bounded streaming, TLS, testing and
 //! the current C# / Node / Rust performance measurements.
 //!
-//! Choose [`NzConnection::query`] for small or moderate buffered results and
-//! [`NzConnection::execute_stream`] for bounded-memory consumption. The
-//! [`AsyncNzConnection`] facade moves blocking protocol work to Tokio's
-//! blocking pool; it is useful in async applications while preserving the
-//! driver's single-connection serialization semantics.
+//! Use [`Client`] in Tokio applications, [`blocking::Client`] in synchronous
+//! code, and [`Pool`] or [`blocking::Pool`] when connections should be reused.
+//! Older connection and reader APIs are available with the `compat` feature.
 //!
 //! # Quick start
 //! ```no_run
-//! use nz_rust::{NzConnection, NzConnectionConfig};
+//! use nz_rust::{Client, NzConnectionConfig};
 //!
-//! let cfg = NzConnectionConfig {
-//!     host: "nz-host".into(),
-//!     database: "JUST_DATA".into(),
-//!     user: "admin".into(),
-//!     password: "password".into(),
-//!     ..Default::default()
-//! };
-//! let mut conn = NzConnection::connect(&cfg).unwrap();
-//! let result = conn.query("SELECT 1 AS ONE", &[]).unwrap();
-//! for row in &result.result_sets[0].rows {
-//!     println!("{:?}", row);
-//! }
+//! # async fn example() -> nz_rust::NzResult<()> {
+//! let config = NzConnectionConfig::new("nz-host", "JUST_DATA", "admin", "secret");
+//! let (client, connection) = Client::connect(&config).await?;
+//! let driver = tokio::spawn(connection);
+//! let row = client.query_one("SELECT 1 AS one", &[]).await?;
+//! let value: i32 = row.try_get("one")?;
+//! println!("{value}");
+//! client.close().await?;
+//! driver.await??;
+//! # Ok(())
+//! # }
 //! ```
 
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod async_pool;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod async_pool;
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod asynchronous;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod asynchronous;
 pub mod blocking;
 pub mod buffer;
 pub mod cancel;
 pub mod config;
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod connection;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod connection;
 pub mod error;
 pub mod export;
 pub mod handshake;
 pub mod messages;
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod metadata;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod metadata;
 pub mod native_async;
 pub mod params;
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod pool;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod pool;
+#[cfg(feature = "compat")]
+#[allow(dead_code)]
 pub mod reader;
+#[cfg(not(feature = "compat"))]
+#[allow(dead_code)]
+mod reader;
 pub mod tuple_desc;
 pub mod types;
 
+#[cfg(feature = "compat")]
 pub use async_pool::{AsyncNzPool, AsyncNzPoolConfig, AsyncPooledConnection};
+pub use async_pool::{Pool, PoolConfig, PooledRowStream, PooledTransaction};
+#[cfg(feature = "compat")]
 pub use asynchronous::AsyncNzConnection;
-pub use blocking::BlockingClient;
-pub use config::{parse_connection_string, NzConnectionConfig, SecurityLevel};
+#[cfg(feature = "compat")]
+pub use blocking::{BlockingClient, LegacyTransaction};
+pub use config::{parse_connection_string, ConfigBuilder, NzConnectionConfig, SecurityLevel};
+#[cfg(feature = "compat")]
+pub use connection::{NzCommand, NzConnection};
 pub use connection::{
-    register_async_import_reader, register_import_data, register_import_reader,
-    unregister_import_data, NzCommand, NzConnection, QueryResult, QueryStreamSink, ResultSet, Row,
-    RowIndex, StreamResultSet, StreamSummary,
+    QueryResult, QueryStreamSink, ResultSet, Row, RowIndex, StreamResultSet, StreamSummary,
 };
 pub use error::{NzDatabaseError, NzError, NzResult};
-pub use export::{render_value, result_to_text, write_result_to_txt};
+pub use export::{render_value, result_to_text, write_result_to_txt, TextExportSink};
+#[cfg(feature = "compat")]
+pub use metadata::NzMetadata;
 pub use metadata::{
-    NzColumnInfo, NzConstraintInfo, NzDatabaseInfo, NzDdlBatchResult, NzDetailedColumnInfo,
-    NzDistributionKeyInfo, NzFunctionInfo, NzGroupInfo, NzMetadata, NzObjectDetailInfo,
-    NzObjectInfo, NzOrganizeKeyInfo, NzProcedureInfo, NzQueryHistoryInfo, NzSequenceInfo,
-    NzSessionInfo, NzSynonymInfo, NzTableInfo, NzTableKeyInfo, NzTableSizeInfo, NzUserInfo,
-    NzViewInfo,
+    AsyncMetadata, CatalogSnapshot, NzColumnInfo, NzConstraintInfo, NzDatabaseInfo,
+    NzDdlBatchResult, NzDetailedColumnInfo, NzDistributionKeyInfo, NzFunctionInfo, NzGroupInfo,
+    NzObjectDetailInfo, NzObjectInfo, NzOrganizeKeyInfo, NzProcedureInfo, NzQueryHistoryInfo,
+    NzSequenceInfo, NzSessionInfo, NzSynonymInfo, NzTableInfo, NzTableKeyInfo, NzTableSizeInfo,
+    NzUserInfo, NzViewInfo,
 };
 pub use native_async::{
-    connect, Client, Connection, QueryEventStream, QueryStreamEvent, RowStream,
+    connect, Client, Connection, QueryEventStream, QueryOptions, QueryStreamEvent, RowBatchStream,
+    RowStream, Transaction,
 };
 pub use params::{substitute_bound_parameters, NzParameter};
+#[cfg(feature = "compat")]
 pub use pool::{NzPool, NzPoolConfig, PooledConnection};
+#[cfg(feature = "compat")]
 pub use reader::{ColumnDataType, ColumnMetadata, NzDataReader, SchemaRow, SchemaTable};
 pub use rust_decimal::Decimal;
 pub use tuple_desc::{ColumnDesc, DbosTupleDesc};
@@ -132,3 +168,30 @@ pub fn normalize_client_type(value: i16) -> i16 {
     // but reserve this hook for future validation, mirroring the Node driver.
     value
 }
+
+pub use types::exact_numeric::NzNumeric;
+
+pub mod external;
+pub use external::ExternalFilePolicy;
+
+pub use types::temporal::{NzDate, NzInterval, NzTime, NzTimestamp, NzTimetz};
+
+/// Legacy import registry and ADO.NET-style APIs, enabled explicitly for migration.
+#[cfg(feature = "compat")]
+pub mod compat {
+    pub use crate::async_pool::{AsyncNzPool, AsyncNzPoolConfig, AsyncPooledConnection};
+    pub use crate::asynchronous::AsyncNzConnection;
+    pub use crate::blocking::{BlockingClient, LegacyTransaction};
+    pub use crate::connection::{
+        register_async_import_reader, register_import_data, register_import_reader,
+        unregister_import_data, NzCommand, NzConnection,
+    };
+    pub use crate::metadata::NzMetadata;
+    pub use crate::pool::{NzPool, NzPoolConfig, PooledConnection};
+    pub use crate::reader::{ColumnDataType, ColumnMetadata, NzDataReader, SchemaRow, SchemaTable};
+}
+#[cfg(feature = "compat")]
+pub use compat::{
+    register_async_import_reader, register_import_data, register_import_reader,
+    unregister_import_data,
+};

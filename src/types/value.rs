@@ -222,6 +222,7 @@ pub struct RawValue<'a> {
     type_oid: i32,
     type_mod: i32,
     format: u8,
+    pub(crate) dbos: Option<(&'a crate::tuple_desc::DbosTupleDesc, &'a [u8], usize, usize)>,
 }
 
 impl<'a> RawValue<'a> {
@@ -237,6 +238,7 @@ impl<'a> RawValue<'a> {
             type_oid,
             type_mod,
             format,
+            dbos: None,
         }
     }
 
@@ -253,6 +255,7 @@ impl<'a> RawValue<'a> {
             type_oid,
             type_mod,
             format,
+            dbos: None,
         }
     }
 
@@ -280,9 +283,29 @@ impl<'a> RawValue<'a> {
         self.format
     }
 
-    fn to_nz_value(self) -> NzResult<NzValue> {
+    pub(crate) fn with_dbos(
+        mut self,
+        descriptor: &'a crate::tuple_desc::DbosTupleDesc,
+        row: &'a [u8],
+        offset: usize,
+        index: usize,
+    ) -> Self {
+        self.dbos = Some((descriptor, row, offset, index));
+        self.format = 1;
+        self
+    }
+
+    pub(crate) fn to_nz_value(self) -> NzResult<NzValue> {
         if let Some(value) = self.decoded {
             return Ok(value.clone());
+        }
+        if self.is_null() {
+            return Ok(NzValue::Null);
+        }
+        if let Some((descriptor, row, offset, index)) = self.dbos {
+            let mut value = NzValue::Null;
+            descriptor.parse_field_into(row, offset, index, &mut value)?;
+            return Ok(value);
         }
         let bytes = self
             .bytes
@@ -292,12 +315,9 @@ impl<'a> RawValue<'a> {
                 "direct binary FromSql decoding requires a typed Row context".into(),
             ));
         }
-        let text = String::from_utf8_lossy(bytes);
-        Ok(crate::types::text::parse_text_value(
-            &text,
-            self.type_oid,
-            self.type_mod,
-        ))
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
+        crate::types::text::try_parse_text_value(text, self.type_oid, self.type_mod)
     }
 }
 
@@ -308,6 +328,10 @@ impl<'a> RawValue<'a> {
 /// against earlier releases continue to compile.
 pub trait FromSql: Sized {
     fn from_sql(value: &NzValue) -> NzResult<Self>;
+    /// Decode only the selected field. Existing implementations receive its value.
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 /// Typed extraction from raw Netezza field bytes.
@@ -510,6 +534,22 @@ impl FromSql for NzTimeTz {
 }
 
 impl FromSql for String {
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(bytes) = value.as_bytes() {
+            let textual = value
+                .dbos
+                .map(|(d, _, _, i)| matches!(d.field_type[i], 15 | 16 | 21 | 25 | 26 | 30 | 32))
+                .unwrap_or(matches!(
+                    value.type_oid,
+                    18 | 19 | 25 | 1042 | 1043 | 2522 | 2530
+                ));
+            if textual {
+                return Ok(<&str as FromSqlRaw>::from_sql_raw(value)?.to_owned());
+            }
+            let _ = bytes;
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
     fn from_sql(value: &NzValue) -> NzResult<Self> {
         match value {
             NzValue::Text(s)
@@ -534,35 +574,22 @@ impl FromSql for Vec<u8> {
     }
 }
 
-macro_rules! from_sql_option {
-    ($($t:ty),*) => {
-        $(
-            impl FromSql for Option<$t> {
-                fn from_sql(value: &NzValue) -> NzResult<Self> {
-                    match value {
-                        NzValue::Null => Ok(None),
-                        other => Ok(Some(<$t as FromSql>::from_sql(other)?)),
-                    }
-                }
-            }
-        )*
-    };
+impl<T: FromSql> FromSql for Option<T> {
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            T::from_raw(value).map(Some)
+        }
+    }
+    fn from_sql(value: &NzValue) -> NzResult<Self> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            T::from_sql(value).map(Some)
+        }
+    }
 }
-
-from_sql_option!(
-    NzValue,
-    bool,
-    i16,
-    i32,
-    i64,
-    f32,
-    f64,
-    Decimal,
-    String,
-    Vec<u8>
-);
-#[cfg(feature = "chrono")]
-from_sql_option!(NaiveDate, NaiveTime, NaiveDateTime, NzTimeTz);
 
 impl<'a> FromSqlRaw<'a> for NzValue {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
@@ -633,8 +660,17 @@ impl<'a> FromSqlRaw<'a> for String {
 impl<'a> FromSqlRaw<'a> for &'a str {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
         if let Some(bytes) = value.as_bytes() {
-            return std::str::from_utf8(bytes)
-                .map_err(|e| NzError::Config(format!("invalid UTF-8 SQL text: {e}")));
+            let text = std::str::from_utf8(bytes)
+                .map_err(|e| NzError::Config(format!("invalid UTF-8 SQL text: {e}")))?;
+            if let Some((descriptor, _, _, index)) = value.dbos {
+                return match descriptor.field_type[index] {
+                    15 => Ok(text.trim_end_matches(' ')),
+                    25 | 26 => Ok(text.trim_end_matches('\0')),
+                    16 | 21 | 30 | 32 => Ok(text),
+                    _ => Err(NzError::Config("binary field is not text".into())),
+                };
+            }
+            return Ok(text);
         }
         match value.decoded {
             Some(NzValue::Text(s))
@@ -646,6 +682,20 @@ impl<'a> FromSqlRaw<'a> for &'a str {
             Some(NzValue::Numeric(s)) => Ok(s),
             Some(other) => Err(unexpected(other, "text")),
             None => Err(NzError::Config("cannot decode SQL NULL as text".into())),
+        }
+    }
+}
+
+impl<'a> FromSqlRaw<'a> for &'a [u8] {
+    fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
+        if let Some(bytes) = value.as_bytes() {
+            return Ok(bytes);
+        }
+        match value.decoded {
+            Some(NzValue::Bytea(bytes)) => Ok(bytes),
+            _ => Err(NzError::Config(
+                "field does not contain binary bytes".into(),
+            )),
         }
     }
 }
@@ -681,7 +731,7 @@ fn unexpected(value: &NzValue, expected: &str) -> NzError {
 // `ToSql` mirrors `tokio-postgres::types::ToSql`: any `&dyn ToSql` can be
 // bound as `$1, $2, …` and is escaped client-side (Netezza simple-query path
 // has no server-side bind — see `crate::params`).
-pub trait ToSql: std::fmt::Debug {
+pub trait ToSql: std::fmt::Debug + Sync {
     fn to_nz_value(&self) -> NzValue;
 }
 

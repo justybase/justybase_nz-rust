@@ -142,6 +142,8 @@ pub enum NzError {
     Closed(String),
     /// Operation timed out.
     Timeout(String),
+    /// Statement cancelled by its caller or by a dropped consumer.
+    Cancelled(String),
 }
 
 impl NzError {
@@ -161,11 +163,20 @@ impl fmt::Display for NzError {
             NzError::Unsupported(m) => write!(f, "unsupported: {m}"),
             NzError::Closed(m) => write!(f, "connection closed: {m}"),
             NzError::Timeout(m) => write!(f, "timeout: {m}"),
+            NzError::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }
 
-impl std::error::Error for NzError {}
+impl std::error::Error for NzError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Database(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for NzError {
     fn from(e: std::io::Error) -> Self {

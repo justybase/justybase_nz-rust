@@ -9,8 +9,8 @@
 
 use futures_core::Stream;
 use nz_rust::{
-    register_async_import_reader, register_import_reader, ColumnDesc, NzConnection,
-    NzConnectionConfig, NzError, QueryStreamEvent, QueryStreamSink, Row, SecurityLevel,
+    ColumnDesc, NzConnection, NzConnectionConfig, NzError, QueryStreamEvent, QueryStreamSink, Row,
+    SecurityLevel,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Read one `[len(4)][opcode(2)][payload]` option frame from the client.
-fn read_frame(stream: &mut TcpStream) -> (i16, Vec<u8>) {
+fn read_frame(stream: &mut impl Read) -> (i16, Vec<u8>) {
     let mut header = [0u8; 6];
     stream.read_exact(&mut header).unwrap();
     let len = i32::from_be_bytes(header[0..4].try_into().unwrap());
@@ -30,7 +30,7 @@ fn read_frame(stream: &mut TcpStream) -> (i16, Vec<u8>) {
     (opcode, payload)
 }
 
-fn write_be(stream: &mut TcpStream, bytes: &[u8]) {
+fn write_be(stream: &mut impl Write, bytes: &[u8]) {
     stream.write_all(bytes).unwrap();
     stream.flush().unwrap();
 }
@@ -52,6 +52,10 @@ fn serve_handshake(stream: &mut TcpStream) {
     assert_eq!(opcode, 11, "expected HSV2_SSL_NEGOTIATE");
     write_be(stream, b"N");
 
+    serve_handshake_options(stream);
+}
+
+fn serve_handshake_options(stream: &mut (impl Read + Write)) {
     // 4. Option loop: acknowledge every frame until CLIENT_DONE.
     loop {
         let (opcode, _payload) = read_frame(stream);
@@ -79,7 +83,7 @@ fn serve_handshake(stream: &mut TcpStream) {
     write_be(stream, &ready);
 }
 
-fn read_query(stream: &mut TcpStream) -> String {
+fn read_query(stream: &mut impl Read) -> String {
     let mut head = [0u8; 5];
     stream.read_exact(&mut head).unwrap();
     assert_eq!(head[0], b'P', "expected simple query packet");
@@ -95,7 +99,7 @@ fn read_query(stream: &mut TcpStream) -> String {
     String::from_utf8(sql).unwrap()
 }
 
-fn send_ready(stream: &mut TcpStream) {
+fn send_ready(stream: &mut impl Write) {
     let mut ready = vec![b'Z'];
     ready.extend_from_slice(&[0, 0, 0, 0]);
     write_be(stream, &ready);
@@ -103,6 +107,7 @@ fn send_ready(stream: &mut TcpStream) {
 
 fn mock_config(port: u16) -> NzConnectionConfig {
     NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port,
         database: "JUST_DATA".into(),
@@ -146,7 +151,7 @@ fn read_import_data(stream: &mut TcpStream, max_chunk: usize) -> Vec<u8> {
     }
 }
 
-fn send_select_response(stream: &mut TcpStream) {
+fn send_select_response(stream: &mut impl Write) {
     send_message(stream, b'T', &row_description_payload());
     send_message(stream, b'D', &data_row_payload());
     send_message(stream, b'C', b"SELECT 1\0");
@@ -160,7 +165,7 @@ fn send_select_with_empty_additional_result(stream: &mut TcpStream) {
     send_ready(stream);
 }
 
-fn send_select_response_without_ready(stream: &mut TcpStream) {
+fn send_select_response_without_ready(stream: &mut impl Write) {
     send_message(stream, b'T', &row_description_payload());
     send_message(stream, b'D', &data_row_payload());
     send_message(stream, b'C', b"SELECT 1\0");
@@ -238,7 +243,7 @@ impl QueryStreamSink for RowSignalSink {
 }
 
 /// Send a backend message: `[type][4-byte shared header][len(4)][payload]`.
-fn send_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) {
+fn send_message(stream: &mut impl Write, msg_type: u8, payload: &[u8]) {
     let mut frame = vec![msg_type];
     frame.extend_from_slice(&[0, 0, 0, 0]); // shared header (ignored by reader)
     frame.extend_from_slice(&(payload.len() as i32).to_be_bytes());
@@ -373,6 +378,7 @@ fn async_cancel_uses_out_of_band_connection_and_preserves_session() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -457,6 +463,7 @@ fn async_cancel_after_streamed_row_preserves_session() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -544,6 +551,7 @@ fn command_timeout_is_absolute_and_resynchronizes_the_same_session() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -599,6 +607,7 @@ fn streaming_timeout_covers_fetch_after_rows_start() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -660,6 +669,7 @@ fn streaming_sink_abort_cancels_and_preserves_same_session() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -707,6 +717,7 @@ fn only_secure_session_rejects_plaintext_downgrade() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -740,6 +751,7 @@ fn handshake_and_query_round_trip_against_mock_server() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -781,6 +793,7 @@ async fn native_async_client_round_trip_against_mock_server() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -823,6 +836,7 @@ async fn native_async_database_error_keeps_session_reusable() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -874,6 +888,7 @@ async fn native_async_row_stream_drains_and_decodes_rows() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -899,6 +914,54 @@ async fn native_async_row_stream_drains_and_decodes_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_query_batches_are_produced_in_bounded_groups() {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping TCP mock: loopback listeners are unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("cannot bind TCP mock: {error}"),
+    };
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        serve_handshake(&mut stream);
+        assert_eq!(read_query(&mut stream), "SELECT batches");
+        send_message(&mut stream, b'T', &row_description_payload());
+        for _ in 0..300 {
+            send_message(&mut stream, b'D', &data_row_payload());
+        }
+        send_message(&mut stream, b'C', b"SELECT 300\0");
+        send_ready(&mut stream);
+    });
+
+    let (client, connection) = nz_rust::connect(&mock_config(addr.port())).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let mut batches = client.query_batches("SELECT batches", &[]).await.unwrap();
+    let mut sizes = Vec::new();
+    let mut total = 0;
+    while let Some(batch) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut batches).poll_next(cx)).await
+    {
+        let batch = batch.unwrap();
+        assert!(!batch.is_empty());
+        assert!(batch.len() <= 256);
+        assert!(batch
+            .iter()
+            .all(|row| row.try_get::<_, i32>("ONE").unwrap() == 7));
+        total += batch.len();
+        sizes.push(batch.len());
+    }
+    assert_eq!(sizes, [256, 44]);
+    assert_eq!(total, 300);
+
+    client.close().await.unwrap();
+    assert!(driver.await.unwrap().is_ok());
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_async_stream_reports_empty_additional_result_set() {
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(listener) => listener,
@@ -917,6 +980,7 @@ async fn native_async_stream_reports_empty_additional_result_set() {
     });
 
     let config = NzConnectionConfig {
+        external_files: nz_rust::ExternalFilePolicy::Unrestricted,
         host: "127.0.0.1".into(),
         port: addr.port(),
         database: "JUST_DATA".into(),
@@ -948,6 +1012,48 @@ async fn native_async_stream_reports_empty_additional_result_set() {
             .is_none()
     );
 
+    client.close().await.unwrap();
+    assert!(driver.await.unwrap().is_ok());
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_query_batches_preserve_first_result_set_only_semantics() {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("cannot bind TCP mock: {error}"),
+    };
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        serve_handshake(&mut stream);
+        assert_eq!(read_query(&mut stream), "SELECT first; SELECT empty_second");
+        send_select_with_empty_additional_result(&mut stream);
+    });
+    let (client, connection) = nz_rust::connect(&mock_config(address.port()))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    let mut batches = client
+        .query_batches("SELECT first; SELECT empty_second", &[])
+        .await
+        .unwrap();
+    let first_batch = std::future::poll_fn(|cx| std::pin::Pin::new(&mut batches).poll_next(cx))
+        .await
+        .expect("first set should yield a batch")
+        .unwrap();
+    assert_eq!(first_batch.len(), 1);
+    let error = std::future::poll_fn(|cx| std::pin::Pin::new(&mut batches).poll_next(cx))
+        .await
+        .expect("second set must be reported")
+        .expect_err("query_batches exposes only the first result set");
+    assert!(matches!(error, NzError::Config(message) if message.contains("first result set")));
+    assert!(
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut batches).poll_next(cx))
+            .await
+            .is_none()
+    );
     client.close().await.unwrap();
     assert!(driver.await.unwrap().is_ok());
     server.join().unwrap();
@@ -986,6 +1092,9 @@ async fn native_async_stream_emits_notices_between_rows() {
     {
         match event.unwrap() {
             QueryStreamEvent::Notice(message) => order.push(message),
+            QueryStreamEvent::ResultSetStart { .. }
+            | QueryStreamEvent::ResultSetEnd { .. }
+            | QueryStreamEvent::CommandComplete { .. } => {}
             QueryStreamEvent::Row(row) => {
                 assert_eq!(row.try_get::<_, i32>("ONE").unwrap(), 7);
                 order.push("row".into());
@@ -1020,9 +1129,15 @@ fn synchronous_import_reader_sends_bounded_chunks() {
         send_message(&mut stream, b'C', b"INSERT 1\0");
         send_ready(&mut stream);
     });
-    register_import_reader(&source, std::io::Cursor::new(expected));
     let mut connection = NzConnection::connect(&mock_config(address.port())).unwrap();
-    connection.query("INSERT FROM EXTERNAL", &[]).unwrap();
+    connection
+        .query_with_import_reader(
+            "INSERT FROM EXTERNAL",
+            &[],
+            &source,
+            std::io::Cursor::new(expected),
+        )
+        .unwrap();
     connection.close();
     server.join().unwrap();
 }
@@ -1048,13 +1163,17 @@ async fn native_async_import_reader_sends_bounded_chunks() {
         send_message(&mut stream, b'C', b"INSERT 1\0");
         send_ready(&mut stream);
     });
-    register_async_import_reader(&source, std::io::Cursor::new(expected));
     let (client, connection) = nz_rust::connect(&mock_config(address.port()))
         .await
         .unwrap();
     let driver = tokio::spawn(connection);
     client
-        .query_multi("INSERT FROM EXTERNAL", &[])
+        .query_with_import_reader(
+            "INSERT FROM EXTERNAL",
+            &[],
+            &source,
+            std::io::Cursor::new(expected),
+        )
         .await
         .unwrap();
     client.close().await.unwrap();
@@ -1110,4 +1229,301 @@ fn external_export_writes_each_protocol_chunk() {
     server.join().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"1|alpha\n2|beta\n");
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cancel_with_full_event_queue_drains_and_reuses_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = mock_config(listener.local_addr().unwrap().port());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let server = thread::spawn(move || {
+        let (mut main, _) = listener.accept().unwrap();
+        main.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        serve_handshake(&mut main);
+        assert_eq!(read_query(&mut main), "SELECT stalled");
+        send_message(&mut main, b'T', &row_description_payload());
+        for _ in 0..512 {
+            send_message(&mut main, b'D', &data_row_payload());
+        }
+        started_tx.send(()).unwrap();
+        let (mut cancel, _) = listener.accept().unwrap();
+        let mut packet = [0; 16];
+        cancel.read_exact(&mut packet).unwrap();
+        assert_eq!(
+            i32::from_be_bytes(packet[4..8].try_into().unwrap()),
+            80877102
+        );
+        send_cancelled_response(&mut main);
+        assert_eq!(read_query(&mut main), "SELECT recovered");
+        send_select_response(&mut main);
+    });
+    let client = nz_rust::Client::connect(&config).await.unwrap();
+    let mut rows = client.query_stream("SELECT stalled", &[]).await.unwrap();
+    started_rx.await.unwrap();
+    client.cancel().await.unwrap();
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.query("SELECT recovered", &[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(recovered[0].try_get::<_, i32>(0).unwrap(), 7);
+    let mut cancelled = false;
+    while let Some(item) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut rows).poll_next(cx)).await
+    {
+        if matches!(item, Err(NzError::Cancelled(_))) {
+            cancelled = true;
+        }
+    }
+    assert!(cancelled);
+    client.close().await.unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pool_drop_returns_slot_after_cleanup() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = mock_config(listener.local_addr().unwrap().port());
+    let server = thread::spawn(move || {
+        let (mut main, _) = listener.accept().unwrap();
+        main.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        serve_handshake(&mut main);
+        assert_eq!(read_query(&mut main), "ROLLBACK");
+        send_message(&mut main, b'C', b"ROLLBACK\0");
+        send_ready(&mut main);
+        assert_eq!(read_query(&mut main), "SELECT reused");
+        send_select_response(&mut main);
+        assert_eq!(read_query(&mut main), "ROLLBACK");
+        send_message(&mut main, b'C', b"ROLLBACK\0");
+        send_ready(&mut main);
+    });
+    let mut options = nz_rust::AsyncNzPoolConfig::new(config);
+    options.max = 1;
+    options.wait_timeout = Some(Duration::from_secs(5));
+    let pool = nz_rust::AsyncNzPool::new(options).unwrap();
+    drop(pool.get().await.unwrap());
+    let holder = pool.get().await.unwrap();
+    assert_eq!(holder.query("SELECT reused", &[]).await.unwrap().len(), 1);
+    holder.release().await;
+    assert_eq!(pool.total_count().await, 1);
+    assert_eq!(pool.idle_count().await, 1);
+    pool.end().await;
+    assert_eq!(pool.total_count().await, 0);
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transaction_guard_serializes_clones_and_rolls_back_on_drop() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = mock_config(listener.local_addr().unwrap().port());
+    let server = thread::spawn(move || {
+        let (mut main, _) = listener.accept().unwrap();
+        main.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        serve_handshake(&mut main);
+        for sql in ["BEGIN", "ROLLBACK"] {
+            assert_eq!(read_query(&mut main), sql);
+            send_message(&mut main, b'C', format!("{sql}\0").as_bytes());
+            send_ready(&mut main);
+        }
+        assert_eq!(read_query(&mut main), "SELECT outside");
+        send_select_response(&mut main);
+    });
+    let client = nz_rust::Client::connect(&config).await.unwrap();
+    let transaction = client.transaction().await.unwrap();
+    let clone = client.clone();
+    let outside = tokio::spawn(async move { clone.query("SELECT outside", &[]).await });
+    tokio::task::yield_now().await;
+    assert!(!outside.is_finished());
+    drop(transaction);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), outside)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
+    client.close().await.unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_pool_connect_rolls_back_reservation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = mock_config(listener.local_addr().unwrap().port());
+    let server = thread::spawn(move || {
+        let (mut stalled, _) = listener.accept().unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buffer = [0; 128];
+        while stalled.read(&mut buffer).unwrap() != 0 {}
+        let (mut main, _) = listener.accept().unwrap();
+        serve_handshake(&mut main);
+        assert_eq!(read_query(&mut main), "ROLLBACK");
+        send_message(&mut main, b'C', b"ROLLBACK\0");
+        send_ready(&mut main);
+    });
+    let mut options = nz_rust::PoolConfig::new(config);
+    options.max = 1;
+    options.wait_timeout = Some(Duration::from_millis(100));
+    let pool = nz_rust::Pool::new(options).unwrap();
+    assert!(matches!(pool.get().await, Err(NzError::Timeout(_))));
+    assert_eq!(pool.total_count().await, 0);
+    let holder = pool.get().await.unwrap();
+    holder.release().await;
+    assert_eq!(pool.idle_count().await, 1);
+    pool.close().await;
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_timeout_retains_parser_mid_frame_and_reuses_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = mock_config(listener.local_addr().unwrap().port());
+    let server = thread::spawn(move || {
+        let (mut main, _) = listener.accept().unwrap();
+        serve_handshake(&mut main);
+        assert_eq!(read_query(&mut main), "SELECT slow_frame");
+        send_message(&mut main, b'T', &row_description_payload());
+        let body = data_row_payload();
+        let mut header = vec![b'D'];
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&(body.len() as i32).to_be_bytes());
+        header.extend_from_slice(&body[..3]);
+        write_be(&mut main, &header);
+        let (mut cancel, _) = listener.accept().unwrap();
+        let mut packet = [0; 16];
+        cancel.read_exact(&mut packet).unwrap();
+        write_be(&mut main, &body[3..]);
+        send_cancelled_response(&mut main);
+        assert_eq!(read_query(&mut main), "SELECT recovered");
+        send_select_response(&mut main);
+    });
+    let client = nz_rust::Client::connect(&config).await.unwrap();
+    let mut rows = client
+        .query_stream_with_options(
+            "SELECT slow_frame",
+            &[],
+            nz_rust::QueryOptions {
+                timeout: Some(Duration::from_millis(50)),
+            },
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut rows).poll_next(cx)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Some(Err(NzError::Timeout(_)))));
+    assert_eq!(
+        client.query("SELECT recovered", &[]).await.unwrap().len(),
+        1
+    );
+    client.close().await.unwrap();
+    server.join().unwrap();
+}
+
+#[cfg(feature = "ssl")]
+fn serve_tls_transport(
+    mut stream: TcpStream,
+) -> rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    // Static localhost fixture keys are exclusively for tests.
+    assert_eq!(read_frame(&mut stream).0, 1);
+    write_be(&mut stream, b"N");
+    assert_eq!(read_frame(&mut stream).0, 2);
+    write_be(&mut stream, b"N");
+    assert_eq!(read_frame(&mut stream).0, 11);
+    write_be(&mut stream, b"S");
+    assert_eq!(read_frame(&mut stream).0, 12);
+    let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(include_bytes!(
+        "fixtures/tls/localhost-cert.pem"
+    )))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(include_bytes!(
+        "fixtures/tls/localhost-key.pem"
+    )))
+    .unwrap()
+    .unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .unwrap();
+    rustls::StreamOwned::new(
+        rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap(),
+        stream,
+    )
+}
+
+#[cfg(feature = "ssl")]
+fn serve_tls_handshake(
+    stream: TcpStream,
+) -> rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    let mut stream = serve_tls_transport(stream);
+    write_be(&mut stream, b"N");
+    serve_handshake_options(&mut stream);
+    stream
+}
+
+#[cfg(feature = "ssl")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_and_legacy_tls_handshake_query_and_certificate_validation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = mock_config(listener.local_addr().unwrap().port());
+    config.security_level = SecurityLevel::OnlySecuredSession;
+    config.ssl_cert_path = Some(format!(
+        "{}/tests/fixtures/tls/localhost-cert.pem",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = serve_tls_handshake(stream);
+            assert_eq!(read_query(&mut stream), "SELECT tls");
+            send_select_response(&mut stream);
+        }
+    });
+    let client = nz_rust::Client::connect(&config).await.unwrap();
+    assert_eq!(client.query("SELECT tls", &[]).await.unwrap().len(), 1);
+    client.close().await.unwrap();
+    let sync_config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = NzConnection::connect(&sync_config).unwrap();
+        assert_eq!(connection.query("SELECT tls", &[]).unwrap().rows().len(), 1);
+        connection.close();
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+}
+
+#[cfg(feature = "ssl")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_and_legacy_tls_reject_untrusted_certificate() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = mock_config(listener.local_addr().unwrap().port());
+    config.security_level = SecurityLevel::OnlySecuredSession;
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut tls = serve_tls_transport(stream);
+            assert!(tls.conn.complete_io(&mut tls.sock).is_err());
+        }
+    });
+    assert!(nz_rust::Client::connect(&config).await.is_err());
+    tokio::task::spawn_blocking(move || {
+        assert!(NzConnection::connect(&config).is_err());
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
 }

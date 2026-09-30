@@ -168,15 +168,18 @@ impl AsyncNzConnection {
     }
 
     pub async fn query_rows(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
-        Ok(self.query(sql, params).await?.rows().to_vec())
+        Ok(self.query(sql, params).await?.into_rows())
     }
 
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Row> {
-        self.query_rows(sql, params)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| NzError::Config("query_one: no rows returned".into()))
+        let rows = self.query_rows(sql, params).await?;
+        if rows.len() != 1 {
+            return Err(NzError::Config(format!(
+                "query_one: expected one row, got {}",
+                rows.len()
+            )));
+        }
+        Ok(rows.into_iter().next().expect("one row checked above"))
     }
 
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Option<Row>> {

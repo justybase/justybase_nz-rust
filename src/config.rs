@@ -51,6 +51,7 @@ impl SecurityLevel {
 
 #[derive(Clone)]
 pub struct NzConnectionConfig {
+    pub external_files: crate::ExternalFilePolicy,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -63,7 +64,7 @@ pub struct NzConnectionConfig {
     pub reject_unauthorized: bool,
     /// Connection timeout in seconds (default 10).
     pub connection_timeout: u64,
-    /// Default per-command timeout in seconds; 0 disables (default 30).
+    /// Default per-command timeout in seconds; 0 disables (default 0).
     pub command_timeout: u64,
     /// Application name reported to Netezza for Guardium audit.
     pub app_name: String,
@@ -78,6 +79,7 @@ pub struct NzConnectionConfig {
 impl fmt::Debug for NzConnectionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NzConnectionConfig")
+            .field("external_files", &self.external_files)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("database", &self.database)
@@ -99,6 +101,7 @@ impl fmt::Debug for NzConnectionConfig {
 impl Default for NzConnectionConfig {
     fn default() -> Self {
         Self {
+            external_files: crate::ExternalFilePolicy::Disabled,
             host: String::new(),
             port: 5480,
             database: String::new(),
@@ -108,7 +111,7 @@ impl Default for NzConnectionConfig {
             ssl_cert_path: None,
             reject_unauthorized: true,
             connection_timeout: 10,
-            command_timeout: 30,
+            command_timeout: 0,
             app_name: String::from("netezza-rust"),
             os_user: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
             client_host_name: hostname_or_unknown(),
@@ -137,17 +140,25 @@ impl NzConnectionConfig {
     }
 }
 
-fn percent_decode(s: &str, plus_as_space: bool) -> String {
+fn percent_decode(s: &str, plus_as_space: bool) -> NzResult<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                let v = (hi << 4) | lo;
-                out.push(v);
-                i += 3;
-                continue;
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).and_then(|byte| hex_value(*byte));
+            let lo = bytes.get(i + 2).and_then(|byte| hex_value(*byte));
+            match (hi, lo) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                _ => {
+                    return Err(NzError::Config(
+                        "Invalid percent encoding in connection string".into(),
+                    ))
+                }
             }
         }
         if plus_as_space && bytes[i] == b'+' {
@@ -157,7 +168,12 @@ fn percent_decode(s: &str, plus_as_space: bool) -> String {
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    let value = String::from_utf8(out)
+        .map_err(|_| NzError::Config("Connection string contains invalid UTF-8".into()))?;
+    if value.contains('\0') {
+        return Err(NzError::Config("Connection string contains NUL".into()));
+    }
+    Ok(value)
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -176,9 +192,15 @@ fn hex_value(byte: u8) -> Option<u8> {
 /// - `nz://user:pass@host/database`
 pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnectionConfig> {
     let trimmed = connection_string.trim();
-    let rest = if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("netezza://") {
+    let rest = if trimmed
+        .get(..10)
+        .is_some_and(|s| s.eq_ignore_ascii_case("netezza://"))
+    {
         &trimmed[10..]
-    } else if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("nz://") {
+    } else if trimmed
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("nz://"))
+    {
         &trimmed[5..]
     } else {
         return Err(NzError::Config(
@@ -224,21 +246,29 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
         };
         (host, port)
     } else if let Some((h, p)) = host_port.rsplit_once(':') {
-        if let Ok(port) = p.parse::<u16>() {
-            (h, Some(port))
-        } else {
-            (host_port, None)
+        if h.contains(':') {
+            return Err(NzError::Config("IPv6 host must be bracketed".into()));
         }
+        (
+            h,
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| NzError::Config("Invalid port in connection string".into()))?,
+            ),
+        )
     } else {
         (host_port, None)
     };
 
-    if host.is_empty() {
+    if port == Some(0) {
+        return Err(NzError::Config("Port must be nonzero".into()));
+    }
+    if host.is_empty() || host.contains('\0') {
         return Err(NzError::Config(
             "Connection string must include a host".into(),
         ));
     }
-    let database = percent_decode(path, false);
+    let database = percent_decode(path, false)?;
     if database.is_empty() {
         return Err(NzError::Config(
             "Connection string must include a database path, e.g. netezza://user:pass@host/db"
@@ -254,8 +284,8 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
     let mut config = NzConnectionConfig {
         host: host.into(),
         database,
-        user: percent_decode(user, false),
-        password: percent_decode(password, false),
+        user: percent_decode(user, false)?,
+        password: percent_decode(password, false)?,
         ..Default::default()
     };
     if let Some(p) = port {
@@ -268,17 +298,26 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
                 Some((k, v)) => (k, v),
                 None => (pair, ""),
             };
-            let key = percent_decode(key, true);
-            let value = percent_decode(value, true);
+            let key = percent_decode(key, true)?;
+            let value = percent_decode(value, true)?;
             match key.to_ascii_lowercase().as_str() {
                 "securitylevel" | "security_level" => {
-                    if let Some(level) = SecurityLevel::parse(&value) {
-                        config.security_level = level;
-                    }
+                    config.security_level = SecurityLevel::parse(&value)
+                        .ok_or_else(|| NzError::Config("Invalid security level".into()))?;
                 }
-                "sslcerfilepath" | "ssl_cert" | "sslcert" => config.ssl_cert_path = Some(value),
+                "sslcertfilepath" | "sslcerfilepath" | "ssl_cert" | "sslcert" => {
+                    config.ssl_cert_path = Some(value)
+                }
                 "rejectunauthorized" | "reject_unauthorized" => {
-                    config.reject_unauthorized = value == "true" || value == "1";
+                    config.reject_unauthorized = match value.as_str() {
+                        "true" | "1" => true,
+                        "false" | "0" => false,
+                        _ => {
+                            return Err(NzError::Config(
+                                "Invalid rejectUnauthorized boolean".into(),
+                            ))
+                        }
+                    };
                 }
                 "sslmode" => match value.as_str() {
                     "disable" => config.security_level = SecurityLevel::OnlyUnsecuredSession,
@@ -288,12 +327,17 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
                             config.reject_unauthorized = false;
                         }
                     }
-                    _ => {}
+                    _ => return Err(NzError::Config("Invalid sslmode".into())),
                 },
                 "connectiontimeout" | "connection_timeout" => {
-                    if let Ok(v) = value.parse() {
-                        config.connection_timeout = v;
-                    }
+                    config.connection_timeout = value
+                        .parse()
+                        .map_err(|_| NzError::Config("Invalid connection timeout".into()))?;
+                }
+                "commandtimeout" | "command_timeout" => {
+                    config.command_timeout = value
+                        .parse()
+                        .map_err(|_| NzError::Config("Invalid command timeout".into()))?
                 }
                 "appname" | "application_name" => config.app_name = value,
                 "osuser" | "os_user" => config.os_user = value,
@@ -304,6 +348,92 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
     }
 
     Ok(config)
+}
+
+/// Fluent connection settings. `build` checks required fields without displaying secrets.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigBuilder {
+    config: NzConnectionConfig,
+}
+impl ConfigBuilder {
+    pub fn host(mut self, value: impl Into<String>) -> Self {
+        self.config.host = value.into();
+        self
+    }
+    pub fn port(mut self, value: u16) -> Self {
+        self.config.port = value;
+        self
+    }
+    pub fn database(mut self, value: impl Into<String>) -> Self {
+        self.config.database = value.into();
+        self
+    }
+    pub fn user(mut self, value: impl Into<String>) -> Self {
+        self.config.user = value.into();
+        self
+    }
+    pub fn password(mut self, value: impl Into<String>) -> Self {
+        self.config.password = value.into();
+        self
+    }
+    pub fn security_level(mut self, value: SecurityLevel) -> Self {
+        self.config.security_level = value;
+        self
+    }
+    pub fn external_files(mut self, value: crate::ExternalFilePolicy) -> Self {
+        self.config.external_files = value;
+        self
+    }
+    pub fn connection_timeout(mut self, seconds: u64) -> Self {
+        self.config.connection_timeout = seconds;
+        self
+    }
+    pub fn command_timeout(mut self, seconds: u64) -> Self {
+        self.config.command_timeout = seconds;
+        self
+    }
+    pub fn application_name(mut self, value: impl Into<String>) -> Self {
+        self.config.app_name = value.into();
+        self
+    }
+    pub fn build(self) -> NzResult<NzConnectionConfig> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
+}
+impl NzConnectionConfig {
+    pub fn builder() -> ConfigBuilder {
+        ConfigBuilder::default()
+    }
+    /// Validate values sent as protocol strings. Passwords are never included in errors.
+    pub fn validate(&self) -> NzResult<()> {
+        if self.host.is_empty()
+            || self.database.is_empty()
+            || self.user.is_empty()
+            || self.port == 0
+        {
+            return Err(NzError::Config(
+                "host, database, user and a nonzero port are required".into(),
+            ));
+        }
+        if [
+            &self.host,
+            &self.database,
+            &self.user,
+            &self.password,
+            &self.app_name,
+            &self.os_user,
+            &self.client_host_name,
+        ]
+        .iter()
+        .any(|value| value.contains('\0'))
+        {
+            return Err(NzError::Config(
+                "connection settings cannot contain NUL".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -393,5 +523,40 @@ mod tests {
         let cfg = parse_connection_string("nz://u:p@[::1]:5481/db").unwrap();
         assert_eq!(cfg.host, "::1");
         assert_eq!(cfg.port, 5481);
+    }
+    #[test]
+    fn unicode_and_invalid_ports_are_rejected_without_panicking() {
+        for value in ["aaaaaaaaaé://u:p@h/db", "aaaaé://u:p@h/db", "🦀🦀🦀"] {
+            assert!(parse_connection_string(value).is_err());
+        }
+    }
+    #[test]
+    fn builder_and_uri_validation_reject_invalid_settings_without_secrets() {
+        assert!(NzConnectionConfig::builder()
+            .host("h")
+            .database("d")
+            .user("u")
+            .password("secret")
+            .build()
+            .is_ok());
+        assert!(NzConnectionConfig::builder()
+            .host("h")
+            .database("d")
+            .user("u")
+            .port(0)
+            .build()
+            .is_err());
+        for uri in [
+            "nz://u:p@h:abc/db",
+            "nz://u:p@h:0/db",
+            "nz://u:p@h:65536/db",
+            "nz://u:%00@h/db",
+            "nz://u:%FF@h/db",
+            "nz://u:%x0@h/db",
+            "nz://u:p@h/db?sslmode=bad",
+            "nz://u:p@h/db?rejectUnauthorized=typo",
+        ] {
+            assert!(parse_connection_string(uri).is_err());
+        }
     }
 }

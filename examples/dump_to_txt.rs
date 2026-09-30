@@ -8,28 +8,33 @@
 //! ```text
 //! # real appliance (credentials via env or a connection URI)
 //! NZ_HOST=nz-host NZ_DATABASE=JUST_DATA NZ_USER=admin NZ_PASSWORD=secret \
-//!   cargo run -p nz_rust --example dump_to_txt -- --out result.txt \
+//!   cargo run -p nz_rust --features compat \
+//!     --example dump_to_txt -- --out result.txt \
 //!     --sql "SELECT 1 AS ONE, 'rust' AS NAME"
 //!
 //! # or a full URI
-//! cargo run -p nz_rust --example dump_to_txt -- \
+//! cargo run -p nz_rust --features compat \
+//!   --example dump_to_txt -- \
 //!   --conn "netezza://admin:secret@nz-host:5480/JUST_DATA" \
 //!   --sql "SELECT * FROM JUST_DATA..DIMACCOUNT" --out dimaccount.txt
 //!
 //! # offline smoke check (no appliance needed): writes a synthetic result
-//! cargo run -p nz_rust --example dump_to_txt -- --demo --out demo.txt
+//! cargo run -p nz_rust --features compat \
+//!   --example dump_to_txt -- --demo --out demo.txt
 //! ```
 //!
 //! Environment variables used when `--conn` is absent:
 //! `NZ_HOST`, `NZ_PORT` (default 5480), `NZ_DATABASE`, `NZ_USER`,
 //! `NZ_PASSWORD`.
 
-use nz_rust::connection::{QueryResult, ResultSet, Row};
+use nz_rust::compat::NzConnection;
 use nz_rust::tuple_desc::ColumnDesc;
 use nz_rust::types::value::NzValue;
-use nz_rust::{write_result_to_txt, NzConnection, NzConnectionConfig};
+use nz_rust::{
+    write_result_to_txt, NzConnectionConfig, QueryResult, ResultSet, Row, TextExportSink,
+};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::process::exit;
 
 struct Args {
@@ -160,8 +165,21 @@ fn demo_result() -> QueryResult {
 fn main() {
     let args = parse_args();
 
-    let result = if args.demo {
-        demo_result()
+    let file = match File::create(&args.out) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("cannot create output: {error}");
+            exit(1);
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let (rows, sets) = if args.demo {
+        let result = demo_result();
+        if let Err(error) = write_result_to_txt(&mut writer, &result, args.header) {
+            eprintln!("write failed: {error}");
+            exit(1);
+        }
+        (result.row_count() as u64, result.result_sets.len())
     } else {
         let mut conn = match &args.conn {
             Some(uri) => match NzConnection::connect_with_str(uri) {
@@ -190,32 +208,26 @@ fn main() {
                 }
             }
         };
-        match conn.query(&args.sql, &[]) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("query failed: {e}");
+        let mut sink = TextExportSink::new(&mut writer, args.header);
+        let summary = match conn.execute_stream(&args.sql, &[], &mut sink) {
+            Ok(summary) => summary,
+            Err(error) => {
+                eprintln!("query/export failed: {error}");
                 exit(1);
             }
-        }
+        };
+        conn.close();
+        (
+            summary.result_sets.iter().map(|set| set.row_count).sum(),
+            summary.result_sets.len(),
+        )
     };
-
-    let file = match File::create(&args.out) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("cannot create {}: {e}", args.out);
-            exit(1);
-        }
-    };
-    let mut writer = BufWriter::new(file);
-    if let Err(e) = write_result_to_txt(&mut writer, &result, args.header) {
-        eprintln!("write failed: {e}");
+    if let Err(error) = writer.flush() {
+        eprintln!("flush failed: {error}");
         exit(1);
     }
-
     println!(
-        "wrote {} row(s) in {} result set(s) to {}",
-        result.row_count(),
-        result.result_sets.len(),
+        "wrote {rows} row(s) in {sets} result set(s) to {}",
         args.out
     );
 }

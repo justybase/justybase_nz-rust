@@ -14,7 +14,8 @@ if [[ -n "${NZ_BENCH_RUST_BIN:-}" ]]; then
       --output "$OUTPUT_DIR/rust-numeric-replay.json"
 else
   NZ_BENCH_NUMERIC_ITERATIONS="$ITERATIONS" NZ_BENCH_NUMERIC_SAMPLES="$SAMPLES" \
-    cargo run --release -p netezza-bench --offline -- \
+    cargo run --release -p nz_rust --features compat \
+      --example netezza_bench --offline -- \
       --numeric-replay --output "$OUTPUT_DIR/rust-numeric-replay.json"
 fi
 

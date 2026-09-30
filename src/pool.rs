@@ -222,7 +222,7 @@ impl NzPool {
     }
 
     pub fn query_rows(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
-        Ok(self.query(sql, params)?.rows().to_vec())
+        Ok(self.query(sql, params)?.into_rows())
     }
 
     pub fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {

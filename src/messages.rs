@@ -208,10 +208,6 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             let quote = ch;
             i += 1;
             while i < bytes.len() {
-                if quote == '\'' && bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
                 if bytes[i] as char != quote {
                     i += 1;
                     continue;
@@ -233,8 +229,9 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 || !(bytes[i - 1].is_ascii_alphanumeric()
                     || bytes[i - 1] == b'_'
                     || bytes[i - 1] == b'$'))
-            && rest.len() >= 10
-            && rest[..10].eq_ignore_ascii_case("begin_proc")
+            && rest
+                .get(..10)
+                .is_some_and(|s| s.eq_ignore_ascii_case("begin_proc"))
         {
             let after = &rest[10..];
             let end_off = find_word_ci(after, "end_proc");
@@ -353,6 +350,11 @@ mod tests {
         let parts = split_statements(sql);
         assert_eq!(parts.len(), 4);
         assert!(parts[1].contains("a;COMMIT"));
+    }
+
+    #[test]
+    fn backslash_is_literal_in_netezza_statement_strings() {
+        assert_eq!(split_statements("SELECT '\\'; COMMIT").len(), 2);
     }
 
     #[test]

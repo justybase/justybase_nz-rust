@@ -101,13 +101,22 @@ pub(crate) fn time_from_8bytes_into(micros: i64, out: &mut String) {
 }
 
 fn append_time_from_8bytes(micros: i64, out: &mut String) {
-    let secs = micros.div_euclid(1_000_000);
-    let frac = micros.rem_euclid(1_000_000);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    append_hms(hh, mm, ss, out);
+    if micros < 0 {
+        out.push('-');
+    }
+    let magnitude = micros.unsigned_abs();
+    let secs = magnitude / 1_000_000;
+    let frac = magnitude % 1_000_000;
+    let _ = write!(
+        out,
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    );
     if frac != 0 {
         out.push('.');
-        append_fixed_digits(frac, 6, out);
+        append_fixed_digits(frac as i64, 6, out);
     }
 }
 
@@ -193,7 +202,7 @@ pub(crate) fn interval_from_12bytes_into(data: &[u8], out: &mut String) {
     }
     let years = months / 12;
     let remaining = months % 12;
-    if years > 0 {
+    if years != 0 {
         let _ = write!(out, "{years} years {remaining} mons ");
     } else {
         let _ = write!(out, "{remaining} mons ");
@@ -317,5 +326,23 @@ mod tests {
     fn parse_time_text_works() {
         assert_eq!(parse_time_text("02:00:00"), (2, 0, 0, 0));
         assert_eq!(parse_time_text("10:12:13.5"), (10, 12, 13, 500_000));
+    }
+    #[test]
+    fn signed_and_large_intervals_preserve_components() {
+        for months in [-25i32, -13, -12, 0, 12, 13] {
+            let mut bytes = [0u8; 12];
+            bytes[8..].copy_from_slice(&months.to_le_bytes());
+            let value = interval_from_12bytes(&bytes);
+            if months < -11 {
+                assert!(
+                    value.starts_with(&format!("{} years", months / 12)),
+                    "{value}"
+                );
+            }
+        }
+        assert_eq!(time_from_8bytes(-1), "-00:00:00.000001");
+        assert_eq!(time_from_8bytes(-3_600_000_000), "-01:00:00");
+        assert_eq!(time_from_8bytes(360_000_000_000), "100:00:00");
+        assert!(time_from_8bytes(i64::MIN).starts_with('-'));
     }
 }

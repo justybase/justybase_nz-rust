@@ -473,7 +473,7 @@ mod tests {
     }
 }
 
-fn bool_value(row: &Row, index: usize) -> NzResult<bool> {
+pub(super) fn bool_value(row: &Row, index: usize) -> NzResult<bool> {
     Ok(matches!(
         row.try_get_value(index)?
             .to_display_string()
@@ -484,11 +484,11 @@ fn bool_value(row: &Row, index: usize) -> NzResult<bool> {
     ))
 }
 
-fn missing_relation(error: &NzError) -> bool {
+pub(super) fn missing_relation(error: &NzError) -> bool {
     matches!(error, NzError::Database(database) if database.code.as_deref() == Some("42P01"))
 }
 
-fn require_unique_schema(rows: &[Row], name: &str) -> NzResult<()> {
+pub(super) fn require_unique_schema(rows: &[Row], name: &str) -> NzResult<()> {
     let mut schema: Option<String> = None;
     for row in rows {
         let current = text(row, 0)?;
@@ -502,7 +502,10 @@ fn require_unique_schema(rows: &[Row], name: &str) -> NzResult<()> {
     Ok(())
 }
 
-fn normalize_object_name(name: &str, schema: Option<&str>) -> NzResult<(Option<String>, String)> {
+pub(super) fn normalize_object_name(
+    name: &str,
+    schema: Option<&str>,
+) -> NzResult<(Option<String>, String)> {
     let mut parts = Vec::new();
     let mut part = String::new();
     let mut in_quotes = false;
@@ -562,7 +565,7 @@ fn normalize_identifier(part: &str) -> NzResult<String> {
     }
 }
 
-fn quote_identifier(name: &str) -> String {
+pub(super) fn quote_identifier(name: &str) -> String {
     const RESERVED: &str = "ABORT ALL ALLOCATE ANALYSE ANALYZE AND ANY AS ASC AUTOMAINT AWSS3 AZUREBLOB BETWEEN BINARY BIT BOTH CASE CAST CHAR CHARACTER CHECK CLUSTER COALESCE COLLATE COLLATION COLUMN CONSTRAINT COPY CROSS CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_DB CURRENT_SCHEMA CURRENT_SID CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURRENT_USERID CURRENT_USEROID DAYSPERROW DEALLOCATE DEC DECIMAL DECODE DEFAULT DEREGISTER DESC DISTINCT DISTRIBUTE DO ELSE END EXCEPT EXCLUDE EXISTS EXPLAIN EXPRESS EXTEND EXTERNAL EXTRACT FALSE FIRST FLOAT FOLLOWING FOR FOREIGN FROM FULL FUNCTION GENSTATS GLOBAL GROUP HAVING HISTOGRAM IDENTIFIER_CASE ILIKE IN INDEX INITIALLY INNER INOUT INTERSECT INTERVAL INTO JOURNAL LEADING LEFT LIKE LIMIT LOAD LOCAL LOCK MINUS MOVE NATURAL NCHAR NEW NOCASCADE NOT NOTNULL NULL NULLS NUMERIC NVL NVL2 OFFSET OFF OLD ON ONLINE ONLY OR ORDER OTHERS OUT OUTER OVER OVERLAPS PAUSESTEPS PAUSETIME PARTITION POSITION PRECEDING PRECISION PRESERVE PRIMARY REGISTER RESET REUSE RIGHT ROWS SELECT SESSION_USER SETOF SHOW SOME TABLE TEMPORAL THEN TIES TIME TIME_TRAVEL_ENABLE TIMESTAMP TO TRAILING TRANSACTION TRIGGER TRIM TRUE UNBOUNDED UNION UNIQUE USER USING VACUUM VARCHAR VERBOSE VERSION VIEW WHEN WHERE WITH WRITE CTID OID XMIN CMIN XMAX CMAX TABLEOID ROWID DATASLICEID CREATEXID DELETEXID";
     if !name.is_empty()
         && name
@@ -580,7 +583,7 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
-fn build_view_ddl(
+pub(super) fn build_view_ddl(
     database: &str,
     schema: &str,
     view: &str,
@@ -616,7 +619,7 @@ fn build_view_ddl(
     lines.join("\n")
 }
 
-fn qualified(database: &str, schema: &str, name: &str) -> String {
+pub(super) fn qualified(database: &str, schema: &str, name: &str) -> String {
     format!(
         "{}.{}.{}",
         quote_identifier(database),
@@ -625,11 +628,11 @@ fn qualified(database: &str, schema: &str, name: &str) -> String {
     )
 }
 
-fn sql_string(value: &str) -> String {
+pub(super) fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn fixed_return_type(value: &str) -> String {
+pub(super) fn fixed_return_type(value: &str) -> String {
     let upper = value.trim().to_uppercase();
     match upper.as_str() {
         "CHARACTER VARYING" | "NATIONAL CHARACTER VARYING" | "NATIONAL CHARACTER" | "CHARACTER" => {
@@ -893,7 +896,7 @@ enum DdlKind {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_table_ddl(
+pub(super) fn build_table_ddl(
     database: &str,
     schema: &str,
     table: &str,
@@ -1003,7 +1006,7 @@ fn build_table_ddl(
 }
 
 #[derive(Clone, Copy)]
-enum ExternalOptionKind {
+pub(super) enum ExternalOptionKind {
     String,
     Number,
     Boolean,
@@ -1012,21 +1015,21 @@ enum ExternalOptionKind {
 }
 
 #[derive(Default)]
-struct ExternalLayoutZoneInfo {
-    use_type: String,
-    name: String,
-    type_name: String,
-    style: String,
-    length: String,
-    delimiter: String,
-    around: String,
-    null_if: String,
-    endian: String,
-    alignment: String,
-    modulus: String,
+pub(super) struct ExternalLayoutZoneInfo {
+    pub(super) use_type: String,
+    pub(super) name: String,
+    pub(super) type_name: String,
+    pub(super) style: String,
+    pub(super) length: String,
+    pub(super) delimiter: String,
+    pub(super) around: String,
+    pub(super) null_if: String,
+    pub(super) endian: String,
+    pub(super) alignment: String,
+    pub(super) modulus: String,
 }
 
-const EXTERNAL_OPTIONS: &[(&str, &str, ExternalOptionKind)] = &[
+pub(super) const EXTERNAL_OPTIONS: &[(&str, &str, ExternalOptionKind)] = &[
     ("DELIMITER", "DELIM", ExternalOptionKind::String),
     ("ENCODING", "ENCODING", ExternalOptionKind::String),
     ("TIMESTYLE", "TIMESTYLE", ExternalOptionKind::String),
@@ -1305,7 +1308,7 @@ impl NzMetadata<'_> {
     }
 }
 
-fn layout_zone_count(value: &str) -> Option<usize> {
+pub(super) fn layout_zone_count(value: &str) -> Option<usize> {
     value
         .trim()
         .parse::<usize>()
@@ -1313,7 +1316,7 @@ fn layout_zone_count(value: &str) -> Option<usize> {
         .filter(|count| *count > 0)
 }
 
-fn format_external_layout_zones(zones: &[ExternalLayoutZoneInfo]) -> NzResult<String> {
+pub(super) fn format_external_layout_zones(zones: &[ExternalLayoutZoneInfo]) -> NzResult<String> {
     let mut definitions = Vec::with_capacity(zones.len());
     for (index, zone) in zones.iter().enumerate() {
         let use_type = zone.use_type.trim().to_ascii_uppercase();
@@ -1381,7 +1384,7 @@ fn format_external_layout_zones(zones: &[ExternalLayoutZoneInfo]) -> NzResult<St
     Ok(definitions.join(", "))
 }
 
-fn format_external_layout(value: &str) -> String {
+pub(super) fn format_external_layout(value: &str) -> String {
     let layout = value.trim();
     if layout.is_empty() {
         String::new()
@@ -1392,7 +1395,7 @@ fn format_external_layout(value: &str) -> String {
     }
 }
 
-fn split_identifier_path(value: &str) -> NzResult<Vec<String>> {
+pub(super) fn split_identifier_path(value: &str) -> NzResult<Vec<String>> {
     let mut raw_parts = Vec::new();
     let mut current = String::new();
     let mut chars = value.chars().peekable();

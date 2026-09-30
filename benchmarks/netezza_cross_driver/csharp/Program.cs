@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Text.Json;
 using JustyBase.NetezzaDriver;
 
+try
+{
 var output = GetArgument("--output") ?? "target/netezza-cross-benchmark/csharp.json";
 if (HasArgument("--compat"))
     return await CompatibilityRunner.RunAsync(
@@ -82,6 +84,8 @@ try
     File.WriteAllText(output, JsonSerializer.Serialize(new
     {
         driver = "csharp",
+        driver_version = typeof(NzConnection).Assembly.GetName().Version?.ToString(),
+        reference = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NZ_BENCH_CSHARP_PROJECT")) ? "package-1.7.2" : "local-source",
         generated_at = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         rows_limit = rowsLimit,
         samples = sampleCount,
@@ -96,6 +100,13 @@ finally
 }
 
 return 0;
+
+}
+catch (Exception error)
+{
+    Console.Error.WriteLine($"C# benchmark failed: {error.GetType().Name}");
+    return 1;
+}
 
 static (long rows, long cells) Consume(NzConnection connection, string query)
 {

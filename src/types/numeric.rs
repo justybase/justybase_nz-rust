@@ -71,6 +71,9 @@ pub(crate) fn get_cs_numeric_into(
     digit_count: i32,
     exact: &mut String,
 ) -> Result<NumericDecodedInto, String> {
+    if !(0..=38).contains(&prec) || !(0..=38).contains(&scale) || !(0..=5).contains(&digit_count) {
+        return Err("invalid NUMERIC precision, scale or word count".into());
+    }
     let part_count = if digit_count > 0 {
         digit_count as usize
     } else if prec <= 9 {

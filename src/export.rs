@@ -61,50 +61,163 @@ pub fn render_value(value: &NzValue) -> String {
 /// Every result set is emitted with a `# result set N (M rows)` banner; a
 /// header row is written when the set carries column metadata.
 pub fn result_to_text(result: &QueryResult, include_header: bool) -> String {
-    let mut out = String::new();
-    for (set_no, set) in result.result_sets.iter().enumerate() {
-        out.push_str(&format!(
-            "# result set {} ({} rows)\n",
-            set_no + 1,
-            set.rows.len()
-        ));
-        if include_header && !set.columns.is_empty() {
-            let header = set
-                .columns
-                .iter()
-                .map(|c| escape_cell(&c.name))
-                .collect::<Vec<_>>()
-                .join("\t");
-            out.push_str(&header);
-            out.push('\n');
-        }
-        for row in &set.rows {
-            let line = row
-                .values()
-                .iter()
-                .map(render_value)
-                .collect::<Vec<_>>()
-                .join("\t");
-            out.push_str(&line);
-            out.push('\n');
-        }
-    }
-    if !result.notices.is_empty() {
-        out.push_str("# notices\n");
-        for notice in &result.notices {
-            out.push_str(&format!("# {notice}\n"));
-        }
-    }
-    out
+    let mut out = Vec::new();
+    write_result_to_txt(&mut out, result, include_header)
+        .expect("result_to_text requires decodable rows");
+    String::from_utf8(out).expect("text export is UTF-8")
 }
 
-/// Write the rendered [`QueryResult`] to `writer`.
+fn write_escaped<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    let mut start = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        let replacement: &[u8] = match byte {
+            b'\t' => b"\\t",
+            b'\r' => b"\\r",
+            b'\n' => b"\\n",
+            b'\\' => b"\\\\",
+            _ => continue,
+        };
+        writer.write_all(&value.as_bytes()[start..index])?;
+        writer.write_all(replacement)?;
+        start = index + 1;
+    }
+    writer.write_all(&value.as_bytes()[start..])
+}
+
+fn write_cell<W: Write>(writer: &mut W, value: &NzValue) -> io::Result<()> {
+    match value {
+        NzValue::Null => writer.write_all(b"NULL"),
+        NzValue::Bool(value) => write!(writer, "{value}"),
+        NzValue::Int2(value) => write!(writer, "{value}"),
+        NzValue::Int4(value) => write!(writer, "{value}"),
+        NzValue::Int8(value) => write!(writer, "{value}"),
+        NzValue::Float4(value) => write!(writer, "{}", *value as f64),
+        NzValue::Float8(value) => write!(writer, "{value}"),
+        NzValue::Decimal(value) => write!(writer, "{value}"),
+        NzValue::Numeric(text)
+        | NzValue::Text(text)
+        | NzValue::Date(text)
+        | NzValue::Time(text)
+        | NzValue::Timetz(text)
+        | NzValue::Timestamp(text)
+        | NzValue::Interval(text) => write_escaped(writer, text),
+        NzValue::Bytea(bytes) => {
+            writer.write_all(b"0x")?;
+            for byte in bytes {
+                write!(writer, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Direct export sink for `NzConnection::execute_stream`, retaining no rows.
+/// Wrap file writers in `BufWriter`. Banners omit the row count until completion.
+pub struct TextExportSink<W> {
+    writer: W,
+    include_header: bool,
+}
+impl<W: Write> TextExportSink<W> {
+    pub fn new(writer: W, include_header: bool) -> Self {
+        Self {
+            writer,
+            include_header,
+        }
+    }
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+impl<W: Write> crate::QueryStreamSink for TextExportSink<W> {
+    fn on_columns(
+        &mut self,
+        index: usize,
+        columns: &[crate::ColumnDesc],
+        _: Option<&[bool]>,
+    ) -> crate::NzResult<()> {
+        writeln!(self.writer, "# result set {}", index + 1)?;
+        if self.include_header && !columns.is_empty() {
+            for (index, column) in columns.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write_all(b"\t")?;
+                }
+                write_escaped(&mut self.writer, &column.name)?;
+            }
+            self.writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+    fn on_row(&mut self, index: usize, row: crate::Row) -> crate::NzResult<()> {
+        self.on_values(index, row.columns(), row.try_values()?)
+    }
+    fn on_values(
+        &mut self,
+        _: usize,
+        _: &[crate::ColumnDesc],
+        values: &[NzValue],
+    ) -> crate::NzResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                self.writer.write_all(b"\t")?;
+            }
+            write_cell(&mut self.writer, value)?;
+        }
+        self.writer.write_all(b"\n")?;
+        Ok(())
+    }
+    fn on_notice(&mut self, message: &str) -> crate::NzResult<()> {
+        self.writer.write_all(b"# ")?;
+        write_escaped(&mut self.writer, message)?;
+        self.writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+/// Write each row directly, without allocating a complete result string.
+/// Decode errors are returned as `InvalidData`; writer errors are preserved.
 pub fn write_result_to_txt<W: Write>(
     writer: &mut W,
     result: &QueryResult,
     include_header: bool,
 ) -> io::Result<()> {
-    writer.write_all(result_to_text(result, include_header).as_bytes())
+    for (index, set) in result.result_sets.iter().enumerate() {
+        writeln!(
+            writer,
+            "# result set {} ({} rows)",
+            index + 1,
+            set.rows.len()
+        )?;
+        if include_header && !set.columns.is_empty() {
+            for (index, column) in set.columns.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b"\t")?;
+                }
+                write_escaped(writer, &column.name)?;
+            }
+            writer.write_all(b"\n")?;
+        }
+        for row in &set.rows {
+            for index in 0..row.len() {
+                if index != 0 {
+                    writer.write_all(b"\t")?;
+                }
+                let value = row
+                    .try_get_value(index)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                write_cell(writer, value)?;
+            }
+            writer.write_all(b"\n")?;
+        }
+    }
+    if !result.notices.is_empty() {
+        writer.write_all(b"# notices\n")?;
+        for notice in &result.notices {
+            writer.write_all(b"# ")?;
+            write_escaped(writer, notice)?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -146,6 +259,34 @@ mod tests {
         assert!(text.contains("ID\tNAME\n"));
         assert!(text.contains("1\talice\n"));
         assert!(text.contains("2\tNULL\n"));
+    }
+
+    #[test]
+    fn streaming_sink_writes_rows_and_preserves_writer_errors() {
+        use crate::QueryStreamSink;
+        let result = sample();
+        let set = &result.result_sets[0];
+        let mut sink = TextExportSink::new(Vec::new(), true);
+        sink.on_columns(0, &set.columns, None).unwrap();
+        for row in &set.rows {
+            sink.on_row(0, row.clone()).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(sink.into_inner()).unwrap(),
+            "# result set 1\nID\tNAME\n1\talice\n2\tNULL\n"
+        );
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test writer"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(TextExportSink::new(BrokenWriter, false)
+            .on_columns(0, &[], None)
+            .is_err());
     }
 
     #[test]

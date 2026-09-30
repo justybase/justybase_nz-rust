@@ -12,6 +12,49 @@ All notable changes to `nz_rust` will be documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
+### Fixed
+
+- Long binary VARCHAR uses unsigned lengths; decoding errors never become NULL.
+- Invalid descriptor fields, text scalar values, UTF-8, numeric metadata and
+  connection URIs return checked errors instead of corrupt values or panics.
+- SQL bindings validate numeric literals, missing/unused values and NUL;
+  backslashes use Netezza-compatible `chr(92)` expressions.
+- Signed intervals preserve negative months, microseconds and hours above 99.
+- Native cancellation/close bypass backpressure and resume the pinned parser
+  through ReadyForQuery, including a timeout in the middle of a TCP frame.
+- Native pool slots are reserved through connect, cancellation and cleanup;
+  dropped holders return or retire their connection without leaking capacity.
+- Benchmark and compatibility example commands enable the required `compat`
+  feature, and retired pool sessions finish shutdown before capacity is reused.
+
+### Added
+
+- A shared native transport for `Client` and `blocking::Client`, streaming
+  blocking iterators, byte-bounded event queues and row batches.
+- Exclusive RAII transaction guards, standard `Pool`/`blocking::Pool` APIs,
+  borrowed pool streams, `QueryOptions`, `ConfigBuilder` and `TypeInfo`.
+- Exact `NzNumeric` and numeric date/time/timestamp/timetz/interval getters.
+- Native core metadata with shared SQL/decoders and a batched snapshot.
+- Direct streaming text export, scoped import readers and explicit file policy.
+- Deterministic malformed-input tests, TLS mocks and four-driver benchmark
+  runners with allocation, CPU, first-row and RSS observations.
+
+### Changed
+
+- **Breaking:** 0.3 defaults to `Client`, `blocking::Client`, `Pool` and
+  `blocking::Pool`. Legacy `NzConnection`, `NzCommand`, `NzDataReader`,
+  `AsyncNzConnection`, `NzPool` and `AsyncNzPool` APIs now require the
+  `compat` feature and are re-exported from `nz_rust::compat`. Enable
+  `features = ["compat"]` during migration, then switch to the native APIs.
+- Default statement timeout is disabled. `query_one` enforces exactly one row.
+- `ToSql` requires `Debug + Sync`; binary SQL bindings are explicitly rejected.
+- External filesystem access is opt-in. The global import registry requires
+  `compat`; scoped readers are recommended.
+- Execute/batch execution discards rows, and query row extraction moves data.
+- Removed repeated replacement allocations of 64 KiB read buffers.
+
 ## [0.2.0] - 2026-09-27
 
 ### Added

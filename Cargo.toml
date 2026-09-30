@@ -1,6 +1,6 @@
 [package]
 name = "nz_rust"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -14,8 +14,10 @@ keywords = ["netezza", "database", "sql", "driver", "tokio"]
 categories = ["database", "asynchronous"]
 exclude = [
     "benchmarks/**",
+    "fuzz/**",
     "examples/nz-editor/**",
     "AGENTS.md",
+    "QUALITY_REPORT.md",
     ".github/**",
     ".agents/**",
     ".codex/**",
@@ -23,6 +25,7 @@ exclude = [
 
 [features]
 default = []
+compat = []
 chrono = ["dep:chrono"]
 ssl = [
     "dep:rustls",
@@ -47,3 +50,43 @@ webpki-roots = { version = "1.0.9", optional = true }
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+[[test]]
+name = "compatibility_matrix"
+path = "tests/compatibility_matrix.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "live_driver"
+path = "tests/live_driver.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "live_integration"
+path = "tests/live_integration.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "mock_server"
+path = "tests/mock_server.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "nzpy_extended_performance"
+path = "tests/nzpy_extended_performance.rs"
+required-features = ["compat"]
+
+[[example]]
+name = "cross_driver_compat"
+path = "examples/cross_driver_compat.rs"
+required-features = ["compat"]
+
+[[example]]
+name = "dump_to_txt"
+path = "examples/dump_to_txt.rs"
+required-features = ["compat"]
+
+[[example]]
+name = "netezza_bench"
+path = "examples/netezza_bench.rs"
+required-features = ["compat"]

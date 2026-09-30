@@ -40,7 +40,7 @@ the following areas:
 | --- | --- | --- |
 | Synchronous queries and commands | Available | Buffered and streaming APIs |
 | Native Tokio client | Available | `Client`/`Connection` follow tokio-postgres' split driver model |
-| Legacy async facade | Available | `AsyncNzConnection` uses Tokio's blocking pool for compatibility |
+| Legacy async facade | Opt-in | Enable `compat`; `AsyncNzConnection` uses Tokio's blocking pool |
 | Connection pooling | Available | Sync and async pools |
 | Transactions and cancellation | Available | Recreate a connection after an unsynchronized protocol failure |
 | Catalog metadata | Available | Schemas, tables, columns and additional catalog helpers |
@@ -73,13 +73,80 @@ and a sanitized error or protocol trace.
 - [Contributing](#contributing-and-support)
 - [License](#license)
 
+## 0.3 API and migration
+
+This checkout prepares version 0.3.0; no release has been published by this work.
+Use `Client` for Tokio, `blocking::Client` for synchronous code, `Pool` for
+Tokio pooling and `blocking::Pool` for synchronous pooling. The primary
+blocking API runs the same protocol driver as the Tokio API. Use it outside
+an existing Tokio runtime.
+
+- `query` returns rows from one result set; use `query_multi` for scripts.
+  `query_one` requires exactly one row and `query_opt` allows zero or one.
+- `query_stream_events` includes result-set metadata, boundaries, rows,
+  notices and command completions. `query_batches` yields at most 256 rows
+  or 1 MiB per batch, except a single larger row. Event queues account for
+  an 8 MiB payload budget and 256 events; oversized individual frames/rows
+  may exceed that budget. Stream notice history retains at most 1,000 notices
+  and 1 MiB; `dropped_notices()` reports evictions.
+- `blocking::Client::query_iter` streams with the same backpressure. Dropping
+  an iterator cancels delivery and waits for bounded session cleanup.
+- `client.transaction()` holds exclusive ownership across client clones.
+  Explicit `commit`/`rollback` await completion; dropping a native guard
+  schedules rollback. Pool streams and transactions borrow their lease.
+- The default query timeout is disabled (`command_timeout = 0`). Native
+  connection establishment has one 10-second deadline, and cleanup is bounded
+  to 5 seconds. `QueryOptions { timeout: Some(duration) }` overrides a query
+  or stream deadline, including fetching.
+- `row.try_get_raw_typed::<_, &str>(index)` borrows character data without
+  copying. `NzNumeric` stores a 38-digit coefficient and scale; `NzDate`,
+  `NzTime`, `NzTimestamp`, `NzTimetz` and `NzInterval` expose numeric temporal
+  components. Binary typed getters avoid string materialization. `type_info`
+  keeps PostgreSQL OIDs separate from DBOS type codes.
+- Use `try_values()` when materializing compatibility values. `values()`
+  explicitly panics on decoding failure; malformed data never becomes NULL.
+- `ToSql` implementations must implement `Debug + Sync`. Missing/unused
+  bindings, NUL and malformed numeric literals are rejected. Binary SQL
+  parameters are rejected; use external-table readers for binary transfers.
+- Filesystem access requested by the appliance is disabled by default. Set
+  `config.external_files = ExternalFilePolicy::Directory(path)` to allow
+  a directory, or `Unrestricted` for a trusted appliance and SQL source.
+  Directory checks resolve symlinks before opening; the directory must not
+  be concurrently controlled by an untrusted local process.
+- `query_with_import_reader` binds a one-shot reader to one operation and
+  drops unused readers on completion/cancellation. The global import registry
+  requires `features = ["compat"]`; migration aliases are in `compat`.
+  The legacy API is also opt-in through `compat`.
+
+Native `client.metadata()` provides core catalog lists and a five-result-set
+`snapshot` in one request and async DDL reconstruction for tables, views,
+procedures, external tables and synonyms. Multi-object table/view/procedure
+DDL batches fetch catalog rows in groups. `TextExportSink` writes directly
+from a stream without retaining rows.
+
+Version 0.3 changes the default public API compared with 0.2: `NzConnection`,
+`NzCommand`, `NzDataReader`, `AsyncNzConnection`, `NzPool` and
+`AsyncNzPool` require the `compat` feature. Enable it while migrating and
+import legacy items from `nz_rust::compat`; the modern default API is
+`Client`, `blocking::Client`, `Pool` and `blocking::Pool`.
+
+```toml
+nz_rust = { version = "0.3", features = ["compat"] }
+```
+
+For example, change `use nz_rust::NzConnection` to
+`use nz_rust::compat::NzConnection`. Remove the feature after migrating to
+the native client and pool APIs.
+
+See [QUALITY_REPORT.md](QUALITY_REPORT.md) for measured results and validation.
+
 ## Installation
 
-For a published release, add the crate to `Cargo.toml`:
+Once 0.3 is published, the dependency declaration will be:
 
 ```toml
 [dependencies]
-nz_rust = "0.1"
+nz_rust = "0.3"
 ```
 
 When using the workspace checkout:
@@ -93,7 +160,7 @@ TLS support is opt-in:
 
 ```toml
 [dependencies]
-nz_rust = { version = "0.1", features = ["ssl"] }
+nz_rust = { version = "0.3", features = ["ssl"] }
 ```
 
 The default build has no TLS dependency. The `ssl` feature enables Rustls and
@@ -106,7 +173,7 @@ set. Replace the example values with configuration from your environment or
 secret manager.
 
 ```rust,no_run
-use nz_rust::{NzConnection, NzConnectionConfig};
+use nz_rust::{blocking::Client, NzConnectionConfig};
 
 fn main() -> nz_rust::NzResult<()> {
     let config = NzConnectionConfig::new(
@@ -115,23 +182,20 @@ fn main() -> nz_rust::NzResult<()> {
         "admin",
         "secret",
     );
-    let mut connection = NzConnection::connect(&config)?;
+    let mut connection = Client::connect(&config)?;
 
-    let result = connection.query("SELECT 1 AS one, 'hello' AS message", &[])?;
-    for row in result.rows() {
-        let number: i32 = row.try_get(0)?;
-        let message: String = row.try_get(1)?;
-        println!("{number}: {message}");
-    }
+    let row = connection.query_one("SELECT 1 AS one, 'hello' AS message", &[])?;
+    let number: i32 = row.try_get("one")?;
+    let message: String = row.try_get("message")?;
+    println!("{number}: {message}");
 
-    connection.close();
+    connection.close()?;
     Ok(())
 }
 ```
 
-`NzConnection::connect` performs TCP setup, the Netezza handshake and
-authentication. `NzConnection::close` is idempotent; dropping a connection
-also releases its socket.
+`blocking::Client::connect` performs TCP setup, the Netezza handshake and
+authentication. Dropping the client closes its native Tokio session.
 
 `NzConnectionConfig::new` uses port `5480` and the default timeout values. For
 full control, construct `NzConnectionConfig` directly and set fields such as
@@ -143,9 +207,9 @@ full control, construct `NzConnectionConfig` directly and set fields such as
 Both `netezza://` and `nz://` schemes are accepted, case-insensitively:
 
 ```rust,no_run
-use nz_rust::NzConnection;
+use nz_rust::blocking::Client;
 
-let mut connection = NzConnection::connect_with_str(
+let mut connection = Client::connect_with_str(
     "netezza://admin:secret@nz.example.internal:5480/JUST_DATA?sslmode=require",
 )?;
 # connection.close();
@@ -176,7 +240,8 @@ Rows can be read by ordinal or case-insensitive column name and extracted with
 the checked `FromSql` API:
 
 ```rust,no_run
-use nz_rust::{NzConnection, NzConnectionConfig};
+use nz_rust::compat::NzConnection;
+use nz_rust::NzConnectionConfig;
 
 # fn run(mut connection: NzConnection) -> nz_rust::NzResult<()> {
 let rows = connection.query_rows(
@@ -207,7 +272,8 @@ For C#/ADO.NET-style named or positional parameters, use `NzCommand` and
 `NzParameter`:
 
 ```rust,no_run
-use nz_rust::{NzConnection, NzValue};
+use nz_rust::compat::NzConnection;
+use nz_rust::NzValue;
 
 # fn run(connection: &mut NzConnection) -> nz_rust::NzResult<()> {
 let mut command = connection.create_command(
@@ -230,7 +296,8 @@ process borrowed values immediately; the default `on_values` implementation
 creates an owned `Row` for compatibility.
 
 ```rust,no_run
-use nz_rust::{ColumnDesc, NzConnection, NzResult, NzValue, QueryStreamSink};
+use nz_rust::compat::NzConnection;
+use nz_rust::{ColumnDesc, NzResult, NzValue, QueryStreamSink};
 
 struct Counter {
     rows: u64,
@@ -297,8 +364,8 @@ continues to yield rows only.
 objects, just like `tokio-postgres`; the caller runs the connection future and
 uses the cloneable client for serialized queries. `query_stream` exposes a
 bounded `RowStream` with backpressure. The compatibility `AsyncNzConnection`
-API remains available for cancellation, metadata and existing applications;
-it moves the legacy blocking protocol work to Tokio's blocking pool.
+API is available with the `compat` feature for existing applications; it moves
+legacy blocking protocol work to Tokio's blocking pool.
 
 ```rust,no_run
 use nz_rust::{connect, NzConnectionConfig};
@@ -317,7 +384,8 @@ driver.await.map_err(|e| nz_rust::NzError::Closed(e.to_string()))??;
 ```
 
 ```rust,no_run
-use nz_rust::{AsyncNzConnection, NzConnectionConfig};
+use nz_rust::compat::AsyncNzConnection;
+use nz_rust::NzConnectionConfig;
 
 # async fn run() -> nz_rust::NzResult<()> {
 let config = NzConnectionConfig::new("nz-host", "JUST_DATA", "admin", "secret");
@@ -337,8 +405,9 @@ response before the next command. `AsyncNzConnection::cancel()` can be awaited
 from another Tokio task while a query is running and keeps the same session
 usable when the server returns `ReadyForQuery`.
 
-Use `NzPool` for synchronous applications and `AsyncNzPool` for Tokio
-applications. Both support maximum and minimum connection counts, checkout
+Use `blocking::Pool` for synchronous applications and `Pool` for Tokio
+applications. Legacy `NzPool` and `AsyncNzPool` names require `compat`. The
+modern pools support maximum and minimum connection counts, checkout
 timeouts, idle/lifetime/use rotation and rollback-on-release. SQL errors keep a
 drained session; transport, timeout and protocol errors retire it. An open
 transaction is rolled back before a connection is returned to the idle queue
@@ -349,7 +418,8 @@ when `rollback_on_release` is enabled (the default).
 Catalog helpers are available through a short-lived mutable metadata view:
 
 ```rust,no_run
-use nz_rust::{NzConnection, NzConnectionConfig};
+use nz_rust::compat::NzConnection;
+use nz_rust::NzConnectionConfig;
 
 # fn run(mut connection: NzConnection) -> nz_rust::NzResult<()> {
 let schemas = connection.metadata().schemas()?;
@@ -376,7 +446,9 @@ procedure signature when a name has multiple overloads.
 ## External-table transfer
 
 The crate also exposes the Netezza external-table import/export framing used by
-the workbench. Register import data with `register_import_data`, execute the
+the workbench. The global `register_import_data` and
+`register_async_import_reader` registry functions require `compat`; prefer
+operation-scoped readers with the native API. Register import data, execute the
 corresponding external-table command, and unregister it when the transfer is
 complete. Invalid buffer sizes are reported as errors; they are not silently
 replaced with a default.
@@ -424,9 +496,9 @@ Offline/unit validation from the workspace root:
 
 ```bash
 cargo fmt --all -- --check
-cargo test -p nz_rust --all-targets
+cargo test -p nz_rust --all-targets --all-features
 cargo clippy -p nz_rust --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --offline
+cargo test --workspace --all-targets --all-features --offline
 ```
 
 Live tests use `NZ_DEV_HOST`, `NZ_DEV_PORT`, `NZ_DEV_USER` and
@@ -434,7 +506,7 @@ Live tests use `NZ_DEV_HOST`, `NZ_DEV_PORT`, `NZ_DEV_USER` and
 
 ```bash
 NZ_RUN_LIVE_TESTS=1 \
-  cargo test -p nz_rust --test live_driver --test live_integration -- \
+  cargo test -p nz_rust --features compat --test live_driver --test live_integration -- \
   --nocapture --test-threads=1
 ```
 
@@ -497,11 +569,11 @@ private connection details.
 
 - The simple-query protocol performs client-side parameter substitution; it is
   not a server-side prepared-statement API.
-- `query` and `execute_reader` retain all result rows in memory.
-- `execute_stream` is the bounded-memory API and is the preferred choice for
-  large exports, grids and result stores.
-- `Client` uses native Tokio socket I/O; `AsyncNzConnection` is retained as a
-  blocking-pool compatibility facade.
+- `Client` uses native Tokio socket I/O; `AsyncNzConnection` is an opt-in
+  blocking-pool compatibility facade (`compat` feature).
+- Legacy `query` and `execute_reader` retain all result rows in memory.
+- Use `query_stream`, `query_batches` or `execute_stream` for bounded-memory
+  consumption.
 - The crate does not impose `chrono` or `time`; it uses `rust_decimal` for
   exact NUMERIC values within its fixed-width range and retains a string
   fallback for wider Netezza values.

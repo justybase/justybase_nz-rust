@@ -11,8 +11,10 @@ export NZ_COMPAT_MANIFEST="$MANIFEST"
 
 dotnet run -c Release --project "$CSHARP_PROJECT" -- \
     --compat --manifest "$MANIFEST" --output "$OUTPUT_DIR/csharp.json"
-cargo run --example cross_driver_compat -- \
+cargo run -p nz_rust --features compat \
+    --example cross_driver_compat -- \
     --manifest "$MANIFEST" --output "$OUTPUT_DIR/rust.json"
-cargo run --example cross_driver_compat -- \
+cargo run -p nz_rust --features compat \
+    --example cross_driver_compat -- \
     --compare "$OUTPUT_DIR/rust.json" "$OUTPUT_DIR/csharp.json" \
     --report "$OUTPUT_DIR/diff.json"

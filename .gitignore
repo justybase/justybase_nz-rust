@@ -8,6 +8,9 @@ target/
 /grcov/
 /lcov.info
 /profraw/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
 /flamegraph.svg
 
 # Local example and integration-test output
@@ -24,6 +27,8 @@ target/
 *.pem
 *.key
 *.crt
+# Public certificates and disposable private keys used only by mock TLS tests.
+!tests/fixtures/tls/*.pem
 
 # Editor and IDE files
 .idea/

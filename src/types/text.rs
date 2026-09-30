@@ -52,6 +52,42 @@ pub fn build_simple_query_packet(sql: &str, command_number: i32) -> Vec<u8> {
     buf
 }
 
+/// Checked text decoding. Malformed scalar values never become NULL or false.
+pub fn try_parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> crate::NzResult<NzValue> {
+    let invalid = || crate::NzError::Protocol(format!("invalid text scalar for OID {type_oid}"));
+    Ok(match type_oid {
+        16 => {
+            let text = raw.trim();
+            if parse_bool_text(text) {
+                NzValue::Bool(true)
+            } else if text == "0"
+                || ["f", "false", "no", "n"]
+                    .iter()
+                    .any(|value| text.eq_ignore_ascii_case(value))
+            {
+                NzValue::Bool(false)
+            } else {
+                return Err(invalid());
+            }
+        }
+        21 | 2500 => NzValue::Int2(raw.trim().parse().map_err(|_| invalid())?),
+        23 => NzValue::Int4(raw.trim().parse().map_err(|_| invalid())?),
+        26 | 28 => NzValue::Int8(i64::from(raw.trim().parse::<u32>().map_err(|_| invalid())?)),
+        20 => NzValue::Int8(raw.trim().parse().map_err(|_| invalid())?),
+        700 => NzValue::Float4(raw.trim().parse().map_err(|_| invalid())?),
+        701 => NzValue::Float8(raw.trim().parse().map_err(|_| invalid())?),
+        1700 => {
+            raw.trim()
+                .parse::<crate::NzNumeric>()
+                .map_err(|_| invalid())?;
+            parse_text_value(raw, type_oid, type_mod)
+        }
+        // Preserve the exact wire text; typed temporal getters validate it.
+        1083 => NzValue::Time(raw.trim().to_owned()),
+        _ => parse_text_value(raw, type_oid, type_mod),
+    })
+}
+
 /// Parse one text cell into an [`NzValue`].
 pub fn parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> NzValue {
     match type_oid {
@@ -173,8 +209,9 @@ pub(crate) fn text_row_layout(
         let vlen = i32::from_be_bytes(data[idx..idx + 4].try_into().unwrap());
         idx += 4;
         if vlen < 4 {
-            layout.push(None);
-            continue;
+            return Err(format!(
+                "Invalid DataRow payload: column {col_no} length is smaller than its prefix"
+            ));
         }
         let actual = (vlen - 4) as usize;
         if idx.checked_add(actual).is_none_or(|end| end > data.len()) {
@@ -219,8 +256,9 @@ pub fn parse_text_data_row_into(
         let vlen = i32::from_be_bytes(data[idx..idx + 4].try_into().unwrap());
         idx += 4;
         if vlen < 4 {
-            row.push(NzValue::Null);
-            continue;
+            return Err(format!(
+                "Invalid DataRow payload: column {col_no} length is smaller than its prefix"
+            ));
         }
         let actual = (vlen - 4) as usize;
         if idx + actual > data.len() {
@@ -229,12 +267,19 @@ pub fn parse_text_data_row_into(
             ));
         }
         if actual == 0 {
-            row.push(parse_text_value("", col.type_oid, col.type_mod));
+            row.push(
+                try_parse_text_value("", col.type_oid, col.type_mod)
+                    .map_err(|error| error.to_string())?,
+            );
             continue;
         }
-        let text = String::from_utf8_lossy(&data[idx..idx + actual]);
+        let text = std::str::from_utf8(&data[idx..idx + actual])
+            .map_err(|_| "Invalid UTF-8 DataRow field".to_owned())?;
         idx += actual;
-        row.push(parse_text_value(&text, col.type_oid, col.type_mod));
+        row.push(
+            try_parse_text_value(text, col.type_oid, col.type_mod)
+                .map_err(|error| error.to_string())?,
+        );
     }
     Ok(())
 }

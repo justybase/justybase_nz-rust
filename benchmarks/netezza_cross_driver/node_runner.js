@@ -102,6 +102,7 @@ async function main() {
     fs.mkdirSync(path.dirname(output), { recursive: true });
     fs.writeFileSync(output, JSON.stringify({
         driver: 'node',
+        driver_version: JSON.parse(fs.readFileSync(path.join(driverRoot, 'package.json'), 'utf8')).version,
         generated_at: Date.now(),
         rows_limit: rowsLimit,
         samples: sampleCount,
@@ -112,6 +113,6 @@ async function main() {
 }
 
 main().catch((error) => {
-    console.error(error);
+    console.error(`Node benchmark failed: ${error.name || "Error"}`);
     process.exitCode = 1;
 });

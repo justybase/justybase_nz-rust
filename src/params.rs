@@ -75,36 +75,106 @@ pub fn escape_literal(value: &NzValue) -> Result<String, String> {
             }
             s
         }
-        NzValue::Numeric(s) => s.clone(),
+        NzValue::Numeric(s) => {
+            if !valid_numeric_literal(s) {
+                return Err("Invalid numeric parameter".into());
+            }
+            s.clone()
+        }
         NzValue::Decimal(value) => value.to_string(),
-        NzValue::Text(s) => format!("'{}'", s.replace('\'', "''")),
-        NzValue::Date(s) => format!("'{s}'"),
-        NzValue::Time(s) => format!("'{s}'"),
-        NzValue::Timetz(s) => format!("'{s}'"),
-        NzValue::Timestamp(s) => format!("'{s}'"),
-        NzValue::Interval(s) => format!("'{s}'"),
-        NzValue::Bytea(b) => format!("E'\\\\x{}'", hex_encode(b)),
+        NzValue::Text(s)
+        | NzValue::Date(s)
+        | NzValue::Time(s)
+        | NzValue::Timetz(s)
+        | NzValue::Timestamp(s)
+        | NzValue::Interval(s) => {
+            if s.contains('\0') {
+                return Err("SQL parameters cannot contain NUL".into());
+            }
+            if s.contains('\\') {
+                let parts = s
+                    .split('\\')
+                    .map(|part| format!("'{}'", part.replace('\'', "''")))
+                    .collect::<Vec<_>>();
+                format!("({})", parts.join(" || chr(92) || "))
+            } else {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+        }
+        NzValue::Bytea(_) => {
+            return Err(
+                "Binary SQL parameters are unsupported; use an external-table reader".into(),
+            )
+        }
     })
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+fn valid_numeric_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+        digits += 1;
     }
-    out
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
+fn block_comment_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = start + 2;
+    while index + 1 < bytes.len() {
+        match &bytes[index..index + 2] {
+            b"/*" => {
+                depth += 1;
+                index += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Replace `$1`, `$2`, … placeholders with escaped literals.
-/// Unmatched placeholders are left unchanged.
+/// Missing and unused parameter values are rejected before sending SQL.
 ///
 /// The scan is a lexer: string literals, quoted identifiers, dollar-quoted
 /// bodies and comments are preserved byte-for-byte.
 pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, String> {
-    if params.is_empty() {
-        return Ok(sql.to_string());
+    if sql.contains('\0') {
+        return Err("SQL cannot contain NUL".into());
     }
-
+    let mut used = vec![false; params.len()];
     let bytes = sql.as_bytes();
     let mut result = String::with_capacity(sql.len() + 16);
     let mut i = 0usize;
@@ -143,16 +213,9 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
 
         // SQL block comments may contain arbitrary '$1'-like text.
         if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            match sql[i..].find("*/") {
-                Some(end) => {
-                    result.push_str(&sql[i..i + end + 2]);
-                    i += end + 2;
-                }
-                None => {
-                    result.push_str(&sql[i..]);
-                    break;
-                }
-            }
+            let end = block_comment_end(bytes, i);
+            result.push_str(&sql[i..end]);
+            i = end;
             continue;
         }
 
@@ -160,10 +223,6 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
             let start = i;
             i += 1;
             while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
                 if bytes[i] != b'\'' {
                     i += 1;
                     continue;
@@ -210,9 +269,10 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
                 let match_str = &rest[..1 + num_len];
                 let idx: usize = match_str[1..].parse().unwrap_or(0);
                 if idx >= 1 && idx <= params.len() {
+                    used[idx - 1] = true;
                     result.push_str(&escape_literal(&params[idx - 1])?);
                 } else {
-                    result.push_str(match_str);
+                    return Err(format!("Missing value for SQL parameter '{match_str}'"));
                 }
                 i += match_str.len();
                 continue;
@@ -224,6 +284,9 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
         i += ch_len;
     }
 
+    if used.iter().any(|used| !used) {
+        return Err("Unused SQL parameter value".into());
+    }
     Ok(result)
 }
 
@@ -232,6 +295,9 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
 /// apply, so placeholders inside literals, comments, quoted identifiers and
 /// dollar-quoted bodies are not touched.
 pub fn substitute_bound_parameters(sql: &str, params: &[NzParameter]) -> Result<String, String> {
+    if sql.contains('\0') {
+        return Err("SQL contains NUL".into());
+    }
     if params.is_empty() {
         if let Some(placeholder) = first_placeholder(sql) {
             return Err(format!("Missing value for SQL parameter '{placeholder}'."));
@@ -275,7 +341,7 @@ pub fn substitute_bound_parameters(sql: &str, params: &[NzParameter]) -> Result<
             continue;
         }
         if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            let end = sql[i..].find("*/").map(|n| i + n + 2).unwrap_or(sql.len());
+            let end = block_comment_end(bytes, i);
             result.push_str(&sql[i..end]);
             i = end;
             continue;
@@ -285,9 +351,7 @@ pub fn substitute_bound_parameters(sql: &str, params: &[NzParameter]) -> Result<
             let quote = ch as u8;
             i += 1;
             while i < bytes.len() {
-                if quote == b'\'' && bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                } else if bytes[i] == quote {
+                if bytes[i] == quote {
                     if i + 1 < bytes.len() && bytes[i + 1] == quote {
                         i += 2;
                     } else {
@@ -416,16 +480,14 @@ fn first_placeholder(sql: &str) -> Option<String> {
             continue;
         }
         if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i = sql[i..].find("*/").map(|n| i + n + 2).unwrap_or(sql.len());
+            i = block_comment_end(bytes, i);
             continue;
         }
         if ch == '\'' || ch == '"' {
             let quote = ch as u8;
             i += 1;
             while i < bytes.len() {
-                if quote == b'\'' && bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                } else if bytes[i] == quote {
+                if bytes[i] == quote {
                     if i + 1 < bytes.len() && bytes[i + 1] == quote {
                         i += 2;
                     } else {
@@ -513,10 +575,7 @@ mod tests {
             "'O''Brien'"
         );
         assert_eq!(escape_literal(&NzValue::Int4(42)).unwrap(), "42");
-        assert_eq!(
-            escape_literal(&NzValue::Bytea(vec![0xde, 0xad])).unwrap(),
-            "E'\\\\xdead'"
-        );
+        assert!(escape_literal(&NzValue::Bytea(vec![0xde, 0xad])).is_err());
     }
 
     #[test]
@@ -535,9 +594,27 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_placeholders_unchanged() {
-        let out = substitute_parameters("SELECT $1, $2", &[NzValue::Int4(1)]).unwrap();
-        assert_eq!(out, "SELECT 1, $2");
+    fn rejects_missing_and_unused_numbered_parameters() {
+        assert!(substitute_parameters("SELECT $1, $2", &[NzValue::Int4(1)]).is_err());
+        assert!(substitute_parameters("SELECT $1", &[]).is_err());
+        assert!(substitute_parameters("SELECT 1", &[NzValue::Int4(1)]).is_err());
+        assert!(substitute_parameters("SELECT $0", &[NzValue::Int4(1)]).is_err());
+        assert!(substitute_parameters("SELECT 1\0", &[]).is_err());
+    }
+    #[test]
+    fn rejects_numeric_injection_and_escapes_temporal_values() {
+        for value in ["0); SELECT 42; --", "NaN", "Infinity", "1e", "", "1 2"] {
+            assert!(escape_literal(&NzValue::Numeric(value.into())).is_err());
+        }
+        for value in ["-1.234", "+.125", "1e-5", "0"] {
+            assert_eq!(
+                escape_literal(&NzValue::Numeric(value.into())).unwrap(),
+                value
+            );
+        }
+        let sql = escape_literal(&NzValue::Timestamp("2026-01-01'; SELECT 42; --".into())).unwrap();
+        assert_eq!(sql, "'2026-01-01''; SELECT 42; --'");
+        assert!(escape_literal(&NzValue::Text("x\0y".into())).is_err());
     }
 
     #[test]
@@ -612,5 +689,24 @@ mod tests {
         );
         assert!(substitute_bound_parameters("SELECT ':x', :x", &[]).is_err());
         assert!(substitute_bound_parameters("SELECT $1", &[]).is_err());
+    }
+    #[test]
+    fn placeholders_follow_netezza_quotes_and_nested_comments() {
+        assert_eq!(
+            substitute_parameters(
+                "SELECT '\\', $1 /* outer /* inner */ $2 */",
+                &[NzValue::Int4(7)]
+            )
+            .unwrap(),
+            "SELECT '\\', 7 /* outer /* inner */ $2 */"
+        );
+        assert_eq!(
+            substitute_bound_parameters(
+                "SELECT '\\', ? /* outer /* ? */ ? */",
+                &[NzParameter::positional(NzValue::Int4(7))]
+            )
+            .unwrap(),
+            "SELECT '\\', 7 /* outer /* ? */ ? */"
+        );
     }
 }

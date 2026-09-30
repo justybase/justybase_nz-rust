@@ -15,10 +15,12 @@
 //! Netezza catalog helpers used by SQL clients and the editor.
 
 mod extended;
+mod native;
 pub use extended::{
     NzDdlBatchResult, NzDetailedColumnInfo, NzGroupInfo, NzQueryHistoryInfo, NzSequenceInfo,
     NzTableKeyInfo, NzUserInfo,
 };
+pub use native::{AsyncMetadata, CatalogSnapshot};
 
 use crate::connection::NzConnection;
 use crate::error::{NzError, NzResult};
@@ -204,58 +206,25 @@ impl<'a> NzMetadata<'a> {
         schema: Option<&str>,
         pattern: Option<&str>,
     ) -> NzResult<Vec<NzTableInfo>> {
-        let mut sql = String::from(
-            "SELECT schema, tablename, owner, objtype, objid, reltuples FROM _v_table WHERE tablename IS NOT NULL",
-        );
-        if let Some(schema) = schema {
-            sql.push_str(" AND schema = ");
-            sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
-        }
-        if let Some(pattern) = pattern {
-            sql.push_str(" AND tablename LIKE ");
-            sql.push_str(&escape_literal(&NzValue::Text(pattern.into())).map_err(NzError::Config)?);
-        }
-        sql.push_str(" AND schema NOT IN ('DEFINITION_SCHEMA', 'INZA', 'NZ_QUERY_HISTORY') AND objtype <> 'SYSTEM_TABLE' ORDER BY schema, tablename");
+        let sql = tables_sql(schema, pattern)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(table_from_row).collect()
     }
 
     pub fn columns(&mut self, table: &str, schema: Option<&str>) -> NzResult<Vec<NzColumnInfo>> {
-        let mut sql = format!(
-            "SELECT attname, attnum, format_type, CASE WHEN attnotnull THEN 'N' ELSE 'Y' END, objid, description FROM _v_relation_column WHERE name = {}",
-            escape_literal(&NzValue::Text(table.into())).map_err(NzError::Config)?
-        );
-        if let Some(schema) = schema {
-            sql.push_str(" AND schema = ");
-            sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
-        }
-        sql.push_str(" ORDER BY attnum");
+        let sql = columns_sql(table, schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(column_from_row).collect()
     }
 
     pub fn views(&mut self, schema: Option<&str>) -> NzResult<Vec<NzViewInfo>> {
-        let mut sql = String::from(
-            "SELECT schema, viewname, owner, objid, definition FROM _v_view WHERE viewname IS NOT NULL",
-        );
-        if let Some(schema) = schema {
-            sql.push_str(" AND schema = ");
-            sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
-        }
-        sql.push_str(" ORDER BY schema, viewname");
+        let sql = views_sql(schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(view_from_row).collect()
     }
 
     pub fn procedures(&mut self, schema: Option<&str>) -> NzResult<Vec<NzProcedureInfo>> {
-        let mut sql = String::from(
-            "SELECT schema, procedure, owner, objid, proceduresignature, returns, builtin, proceduresource, executedasowner, arguments, description FROM _v_procedure WHERE procedure IS NOT NULL",
-        );
-        if let Some(schema) = schema {
-            sql.push_str(" AND schema = ");
-            sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
-        }
-        sql.push_str(" ORDER BY schema, procedure");
+        let sql = procedures_sql(schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(procedure_from_row).collect()
     }
@@ -661,4 +630,57 @@ fn optional_bool(row: &crate::connection::Row, ix: usize) -> NzResult<Option<boo
             "expected boolean metadata value, got {other:?}"
         ))),
     }
+}
+
+fn tables_sql(schema: Option<&str>, pattern: Option<&str>) -> NzResult<String> {
+    let mut sql = String::from(
+            "SELECT schema, tablename, owner, objtype, objid, reltuples FROM _v_table WHERE tablename IS NOT NULL",
+        );
+    if let Some(schema) = schema {
+        sql.push_str(" AND schema = ");
+        sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
+    }
+    if let Some(pattern) = pattern {
+        sql.push_str(" AND tablename LIKE ");
+        sql.push_str(&escape_literal(&NzValue::Text(pattern.into())).map_err(NzError::Config)?);
+    }
+    sql.push_str(" AND schema NOT IN ('DEFINITION_SCHEMA', 'INZA', 'NZ_QUERY_HISTORY') AND objtype <> 'SYSTEM_TABLE' ORDER BY schema, tablename");
+    Ok(sql)
+}
+
+fn columns_sql(table: &str, schema: Option<&str>) -> NzResult<String> {
+    let mut sql = format!(
+            "SELECT attname, attnum, format_type, CASE WHEN attnotnull THEN 'N' ELSE 'Y' END, objid, description FROM _v_relation_column WHERE name = {}",
+            escape_literal(&NzValue::Text(table.into())).map_err(NzError::Config)?
+        );
+    if let Some(schema) = schema {
+        sql.push_str(" AND schema = ");
+        sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
+    }
+    sql.push_str(" ORDER BY attnum");
+    Ok(sql)
+}
+
+fn views_sql(schema: Option<&str>) -> NzResult<String> {
+    let mut sql = String::from(
+        "SELECT schema, viewname, owner, objid, definition FROM _v_view WHERE viewname IS NOT NULL",
+    );
+    if let Some(schema) = schema {
+        sql.push_str(" AND schema = ");
+        sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
+    }
+    sql.push_str(" ORDER BY schema, viewname");
+    Ok(sql)
+}
+
+fn procedures_sql(schema: Option<&str>) -> NzResult<String> {
+    let mut sql = String::from(
+            "SELECT schema, procedure, owner, objid, proceduresignature, returns, builtin, proceduresource, executedasowner, arguments, description FROM _v_procedure WHERE procedure IS NOT NULL",
+        );
+    if let Some(schema) = schema {
+        sql.push_str(" AND schema = ");
+        sql.push_str(&escape_literal(&NzValue::Text(schema.into())).map_err(NzError::Config)?);
+    }
+    sql.push_str(" ORDER BY schema, procedure");
+    Ok(sql)
 }

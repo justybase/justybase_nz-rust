@@ -1,8 +1,10 @@
 //! Shared live compatibility runner for the Rust and C# drivers.
 //!
 //! Usage:
-//!   cargo run --example cross_driver_compat -- --manifest FILE --output FILE
-//!   cargo run --example cross_driver_compat -- --compare RUST.json CSHARP.json --report FILE
+//!   cargo run -p nz_rust --features compat \
+//!     --example cross_driver_compat -- --manifest FILE --output FILE
+//!   cargo run -p nz_rust --features compat \
+//!     --example cross_driver_compat -- --compare RUST.json CSHARP.json --report FILE
 
 use nz_rust::{NzConnection, NzConnectionConfig, NzError, NzValue, QueryResult};
 use serde::{Deserialize, Serialize};
@@ -490,6 +492,7 @@ fn error_kind(error: &NzError) -> String {
         NzError::Config(_) => "config".into(),
         NzError::Unsupported(_) => "unsupported".into(),
         NzError::Closed(_) => "closed".into(),
+        NzError::Cancelled(_) => "cancelled".into(),
     }
 }
 
