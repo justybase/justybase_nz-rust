@@ -12,6 +12,26 @@ All notable changes to `nz_rust` will be documented here.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-03
+
+### Fixed
+
+- Buffered `query()` rows recover the exact `NzNumeric` coefficient from the
+  eagerly decoded value, fixing `NzNumeric` extraction for NUMERIC cells that
+  decode as `Float8` (small-precision or integral values).
+
+### Changed
+
+- `query()` now decodes cells eagerly while draining the response, so a
+  malformed cell fails the call instead of a later per-column read. Eager rows
+  expose `RawValue::as_bytes()` only for byte-preserving cells (untrimmed text
+  and binary payloads); other types must be read through the typed interface,
+  and `try_get_raw_value` no longer returns the original NUMERIC/integer wire
+  bytes.
+- Released read-buffer high-water capacity after each drained response, added
+  fast binary/text decode paths and a column-metadata cache, and added the
+  opt-in `perf_fact200k` benchmark harness.
+
 ## [0.3.1] - 2026-09-30
 
 ### Fixed

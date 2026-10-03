@@ -1,6 +1,6 @@
 [package]
 name = "nz_rust"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -48,6 +48,7 @@ tokio-rustls = { version = "0.26.5", optional = true }
 webpki-roots = { version = "1.0.9", optional = true }
 
 [dev-dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["miniz_oxide"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
@@ -74,6 +75,11 @@ required-features = ["compat"]
 [[test]]
 name = "nzpy_extended_performance"
 path = "tests/nzpy_extended_performance.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "perf_fact200k"
+path = "tests/perf_fact200k.rs"
 required-features = ["compat"]
 
 [[example]]

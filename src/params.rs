@@ -174,6 +174,13 @@ pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, St
     if sql.contains('\0') {
         return Err("SQL cannot contain NUL".into());
     }
+    if params.is_empty() {
+        // Fast path for the common parameter-less query: avoid the full
+        // lexer when the text cannot contain a placeholder.
+        if !sql.contains('$') && !sql.contains('?') && !sql.contains(':') && !sql.contains('@') {
+            return Ok(sql.to_string());
+        }
+    }
     let mut used = vec![false; params.len()];
     let bytes = sql.as_bytes();
     let mut result = String::with_capacity(sql.len() + 16);

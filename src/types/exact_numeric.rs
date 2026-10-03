@@ -1,5 +1,6 @@
 //! Exact NUMERIC(38) values with an allocation-free binary decoding path.
 use crate::{FromSql, FromSqlRaw, NzError, NzResult, NzValue, RawValue, ToSql};
+use rust_decimal::prelude::FromPrimitive;
 use std::{fmt, str::FromStr};
 
 /// A signed decimal coefficient and scale, retaining trailing zeroes.
@@ -122,6 +123,33 @@ impl FromSql for NzNumeric {
                     .parse();
             }
         }
+        // Eager buffered rows (sync `query()`) already classified the binary
+        // NUMERIC cell while draining the response: `Float8` when the value
+        // round-trips exactly (precision <= 15), `Decimal` when the exact
+        // coefficient fits 96 bits, `Numeric` text otherwise. The raw words
+        // are gone, so recover the exact coefficient/scale from the decoded
+        // float/int forms. The OID gate keeps DOUBLE/REAL/INT columns from
+        // masquerading as NUMERIC.
+        if value.type_oid() == 1700 {
+            if let Some(decoded) = value.decoded() {
+                match decoded {
+                    NzValue::Float8(number) => {
+                        let decimal = rust_decimal::Decimal::from_f64(*number)
+                            .ok_or_else(|| NzError::Config("value is not exact NUMERIC".into()))?;
+                        return Self::new(decimal.mantissa(), decimal.scale());
+                    }
+                    NzValue::Float4(number) => {
+                        let decimal = rust_decimal::Decimal::from_f64(f64::from(*number))
+                            .ok_or_else(|| NzError::Config("value is not exact NUMERIC".into()))?;
+                        return Self::new(decimal.mantissa(), decimal.scale());
+                    }
+                    NzValue::Int2(number) => return Self::new(i128::from(*number), 0),
+                    NzValue::Int4(number) => return Self::new(i128::from(*number), 0),
+                    NzValue::Int8(number) => return Self::new(i128::from(*number), 0),
+                    _ => {}
+                }
+            }
+        }
         Self::from_sql(&value.to_nz_value()?)
     }
     fn from_sql(value: &NzValue) -> NzResult<Self> {
@@ -165,5 +193,28 @@ mod tests {
         ] {
             assert!(text.parse::<NzNumeric>().is_err());
         }
+    }
+
+    #[test]
+    fn eager_float_numeric_recovers_exact_coefficient() {
+        // Buffered `query()` rows decode small NUMERICs to `Float8` while
+        // draining and drop the raw words, so `from_raw` must recover the
+        // coefficient from the decoded float, gated on the NUMERIC OID.
+        let decoded = NzValue::Float8(12.34);
+        let raw = RawValue::from_decoded(&decoded, 1700, -1, 1);
+        assert_eq!(
+            NzNumeric::from_raw(raw).unwrap(),
+            NzNumeric::new(1234, 2).unwrap()
+        );
+        // The same bit pattern from a DOUBLE column must still be rejected.
+        let raw = RawValue::from_decoded(&decoded, 701, -1, 1);
+        assert!(NzNumeric::from_raw(raw).is_err());
+        // Integral eager numeric keeps scale 0.
+        let decoded = NzValue::Float8(42.0);
+        let raw = RawValue::from_decoded(&decoded, 1700, -1, 1);
+        assert_eq!(
+            NzNumeric::from_raw(raw).unwrap(),
+            NzNumeric::new(42, 0).unwrap()
+        );
     }
 }

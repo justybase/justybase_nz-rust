@@ -569,4 +569,15 @@ mod tests {
         );
         assert_eq!(parse_numeric_text("1.54", 0), NumericDecoded::Number(1.54));
     }
+
+    #[test]
+    fn long_display_floats_still_classify_as_number() {
+        // `Display` for small/large f64 never uses exponents, so the text
+        // can exceed 24 chars (here 25) while still round-tripping.
+        let type_mod = 16 + (15 << 16) + 23;
+        assert_eq!(
+            parse_numeric_text("0.00000000000000000000001", type_mod),
+            NumericDecoded::Number(1e-23)
+        );
+    }
 }

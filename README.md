@@ -75,7 +75,7 @@ and a sanitized error or protocol trace.
 
 ## 0.3 API and migration
 
-Version 0.3.1 is published on crates.io.
+Version 0.3.2 is published on crates.io.
 Use `Client` for Tokio, `blocking::Client` for synchronous code, `Pool` for
 Tokio pooling and `blocking::Pool` for synchronous pooling. The primary
 blocking API runs the same protocol driver as the Tokio API. Use it outside

@@ -37,6 +37,11 @@ NZ_RUN_LIVE_TESTS=1 cargo test -p nz_rust \
   --test live_driver --test live_integration -- --nocapture --test-threads=1
 ```
 
+The `perf_fact200k` harness is also opt-in: set `NZ_RUN_REPLAY_PERF=1` to
+replay a recorded fixture (override its path with `NZ_REPLAY_FIXTURE`, or place
+it at `tests/fixtures/fact200k.nzreplay.gz`), and/or `NZ_RUN_PERF_TESTS=1` with
+the `NZ_DEV_*` variables for the live appliance variant.
+
 ## Coding Style & Naming Conventions
 
 Format Rust with rustfmt and keep code idiomatic for the Rust 2021 edition:

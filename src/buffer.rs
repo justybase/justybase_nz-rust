@@ -213,6 +213,28 @@ impl ReadBuffer {
     pub fn advance(&mut self, n: usize) {
         self.start = (self.start + n).min(self.end);
     }
+
+    /// Release high-water capacity after a large response. The buffer grows
+    /// geometrically (`ensure_capacity`) and otherwise never shrinks, so a
+    /// single 11 MB `fact200k` burst would pin ~16 MB on the connection for
+    /// all later queries (visible as +17 MB on the 3rd measured repeat).
+    /// Called once per drained response; keeps 64 KB steady-state.
+    pub(crate) fn shrink_if_large(&mut self) {
+        const STEADY: usize = 65_536;
+        const LIMIT: usize = 262_144;
+        if self.buf.len() <= LIMIT {
+            return;
+        }
+        if self.available() > STEADY {
+            return;
+        }
+        let remaining = self.available();
+        let mut fresh = vec![0u8; STEADY.max(remaining)];
+        fresh[..remaining].copy_from_slice(&self.buf[self.start..self.end]);
+        self.buf = fresh;
+        self.start = 0;
+        self.end = remaining;
+    }
 }
 
 fn check_len(n: usize, field: &str) -> NzResult<()> {

@@ -38,7 +38,7 @@ use crate::config::NzConnectionConfig;
 use crate::error::{parse_backend_error_fields, validate_protocol_length, NzError, NzResult};
 use crate::handshake::{handshake, NzStream};
 use crate::messages::{
-    code, parse_command_complete_rows, parse_transaction_state, TransactionState,
+    code, nz_type, parse_command_complete_rows, parse_transaction_state, TransactionState,
 };
 use crate::params::{substitute_bound_parameters, substitute_parameters, NzParameter};
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
@@ -144,7 +144,13 @@ pub struct Row {
 
 #[derive(Debug, Clone)]
 enum RowStorage {
-    Values(Vec<NzValue>),
+    Values {
+        values: Vec<NzValue>,
+        /// Binary descriptor for DBOS-decoded rows, so `type_info()` keeps
+        /// reporting the wire type after eager decoding (C#/Node parity).
+        /// `None` for text rows and `Row::new` compatibility rows.
+        dbos: Option<Arc<DbosTupleDesc>>,
+    },
     Raw(Arc<RawRowData>),
 }
 
@@ -292,11 +298,11 @@ impl Row {
             .ok_or_else(|| NzError::Config("column index out of range".into()))?;
         let column = &self.columns[position];
         let dbos_type = match &self.storage {
+            RowStorage::Values { dbos, .. } => dbos.as_ref().map(|desc| desc.field_type[position]),
             RowStorage::Raw(raw) => match &raw.kind {
                 RawRowKind::Dbos { descriptor, .. } => Some(descriptor.field_type[position]),
                 _ => None,
             },
-            _ => None,
         };
         Ok(TypeInfo {
             column,
@@ -312,7 +318,33 @@ impl Row {
     pub fn new(columns: Vec<ColumnDesc>, values: Vec<NzValue>) -> Self {
         Row {
             columns: Arc::from(columns),
-            storage: RowStorage::Values(values),
+            storage: RowStorage::Values { values, dbos: None },
+        }
+    }
+
+    /// Eager row sharing the result set's column metadata (no per-row `String`
+    /// clones). Used by the buffered protocol loop, mirroring the C# reader
+    /// which decodes a full row into `object[]` on `Read()`.
+    pub(crate) fn from_shared(columns: Arc<[ColumnDesc]>, values: Vec<NzValue>) -> Self {
+        Row {
+            columns,
+            storage: RowStorage::Values { values, dbos: None },
+        }
+    }
+
+    /// Eager binary row keeping its descriptor for `type_info()` parity with
+    /// the previous lazy representation.
+    pub(crate) fn from_shared_dbos(
+        columns: Arc<[ColumnDesc]>,
+        values: Vec<NzValue>,
+        descriptor: Arc<DbosTupleDesc>,
+    ) -> Self {
+        Row {
+            columns,
+            storage: RowStorage::Values {
+                values,
+                dbos: Some(descriptor),
+            },
         }
     }
 
@@ -354,7 +386,7 @@ impl Row {
     pub(crate) fn retained_bytes(&self) -> usize {
         match &self.storage {
             RowStorage::Raw(raw) => raw.payload.len().saturating_add(self.len() * std::mem::size_of::<Option<Range<usize>>>()).saturating_add(std::mem::size_of::<RawRowData>() + std::mem::size_of::<Row>()),
-            RowStorage::Values(values) => values.iter().map(|value| match value {
+            RowStorage::Values { values, .. } => values.iter().map(|value| match value {
                 NzValue::Text(s) | NzValue::Numeric(s) | NzValue::Date(s) | NzValue::Time(s) | NzValue::Timestamp(s) | NzValue::Timetz(s) | NzValue::Interval(s) => s.len(),
                 NzValue::Bytea(bytes) => bytes.len(), _ => 0,
             } + std::mem::size_of::<NzValue>()).sum(),
@@ -381,7 +413,7 @@ impl Row {
     /// Materialize all fields, preserving decoding errors rather than inventing NULLs.
     pub fn try_values(&self) -> NzResult<&[NzValue]> {
         match &self.storage {
-            RowStorage::Values(values) => Ok(values),
+            RowStorage::Values { values, .. } => Ok(values),
             RowStorage::Raw(raw) => {
                 if raw.decoded.get().is_none() {
                     let values = raw.decode_all(&self.columns)?;
@@ -407,7 +439,7 @@ impl Row {
     pub fn try_get_value<I: RowIndex>(&self, idx: I) -> NzResult<&NzValue> {
         match idx.position(self) {
             Some(p) => match &self.storage {
-                RowStorage::Values(values) => values
+                RowStorage::Values { values, .. } => values
                     .get(p)
                     .ok_or_else(|| NzError::Config("row values do not match columns".into())),
                 RowStorage::Raw(raw) => raw.value(p, &self.columns),
@@ -438,14 +470,19 @@ impl Row {
             NzError::Config(format!("row index out of range: ordinal {position}"))
         })?;
         match &self.storage {
-            RowStorage::Values(values) => Ok(RawValue::from_decoded(
-                values
+            RowStorage::Values { values, dbos } => {
+                let value = values
                     .get(position)
-                    .ok_or_else(|| NzError::Protocol("row values do not match columns".into()))?,
-                column.type_oid,
-                column.type_mod,
-                column.format,
-            )),
+                    .ok_or_else(|| NzError::Protocol("row values do not match columns".into()))?;
+                let bytes = eager_cell_bytes(value, dbos.as_deref(), column, position);
+                Ok(RawValue::from_parts(
+                    bytes,
+                    Some(value),
+                    column.type_oid,
+                    column.type_mod,
+                    column.format,
+                ))
+            }
             RowStorage::Raw(raw) => {
                 let value = RawValue::from_parts(
                     raw.field_bytes(position),
@@ -945,6 +982,11 @@ impl NzConnection {
     /// Buffer all result sets of `sql` (tokio-postgres `query` returns rows;
     /// here the full [`QueryResult`] is returned so multi-statement batches
     /// and notices stay visible — use `.rows()` for the first set).
+    ///
+    /// Rows are decoded eagerly while draining the response (C#/Node `Read()`
+    /// parity): a corrupt cell fails the whole `query()` instead of surfacing
+    /// only when that column is read. Use `execute_stream` to process rows
+    /// without retaining them.
     pub fn query(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         let values: Vec<NzValue> = params.iter().map(|p| p.to_nz_value()).collect();
         self.query_values(sql, &values)
@@ -1532,7 +1574,11 @@ impl NzConnection {
                                 cancel_if_sink_aborted!(new_sink_error);
                             }
                         } else {
-                            let payload = self.read_dbos_payload(has_tupdesc)?;
+                            // Eager buffered decode (C# `Read()` parity): parse
+                            // the row straight from the socket buffer into an
+                            // owned value vector. No per-row payload `Vec`,
+                            // layout `Vec` or `Arc<RawRowData>` — only the
+                            // retained `Vec<NzValue>` plus cell strings.
                             let columns = row_columns
                                 .clone()
                                 .or_else(|| {
@@ -1544,18 +1590,36 @@ impl NzConnection {
                             let descriptor = shared_tupdesc.clone().ok_or_else(|| {
                                 NzError::Protocol("DBOS row descriptor is missing".into())
                             })?;
-                            let row = Row::from_dbos_raw(columns, payload, descriptor)?;
+                            let mut values =
+                                Vec::with_capacity(columns.len().max(tupdesc.num_fields));
+                            let mut var_starts = std::mem::take(&mut self.row_var_starts_scratch);
+                            self.read_dbos_tuple_into(
+                                descriptor.as_ref(),
+                                has_tupdesc,
+                                &mut values,
+                                &mut var_starts,
+                            )?;
+                            self.row_var_starts_scratch = var_starts;
+                            let row = Row::from_shared_dbos(columns, values, descriptor.clone());
                             push_existing_row(&mut current, row, &nullability, &mut row_columns)?;
-                            while let Some(next_payload) =
-                                self.try_read_available_dbos_payload(has_tupdesc)?
-                            {
+                            loop {
                                 let columns = row_columns.clone().unwrap_or_else(|| {
-                                    Arc::from(cached_columns.as_deref().unwrap_or(&[]))
+                                    cached_columns
+                                        .as_ref()
+                                        .map(|columns| Arc::from(columns.as_slice()))
+                                        .unwrap_or_else(|| Arc::from(tupdesc.to_column_descs()))
                                 });
-                                let descriptor = shared_tupdesc.clone().ok_or_else(|| {
-                                    NzError::Protocol("DBOS row descriptor is missing".into())
-                                })?;
-                                let row = Row::from_dbos_raw(columns, next_payload, descriptor)?;
+                                let mut values =
+                                    Vec::with_capacity(columns.len().max(tupdesc.num_fields));
+                                if !self.try_read_available_dbos_row(
+                                    descriptor.as_ref(),
+                                    has_tupdesc,
+                                    &mut values,
+                                )? {
+                                    break;
+                                }
+                                let row =
+                                    Row::from_shared_dbos(columns, values, descriptor.clone());
                                 push_existing_row(
                                     &mut current,
                                     row,
@@ -1725,11 +1789,24 @@ impl NzConnection {
                             );
                             cancel_if_sink_aborted!(new_sink_error);
                         } else {
-                            let cols = current_columns(&current, &cached_columns)?;
-                            let columns = row_columns
-                                .clone()
-                                .unwrap_or_else(|| Arc::from(cols.as_slice()));
-                            let row = Row::from_text_raw(columns, data)?;
+                            // Eager text decode sharing one column `Arc` for
+                            // the whole result set (no per-row `String` clones
+                            // of column names, no layout `Vec`).
+                            let columns = row_columns.clone().or_else(|| {
+                                cached_columns
+                                    .as_ref()
+                                    .map(|cols| Arc::from(cols.as_slice()))
+                            }).or_else(|| {
+                                current.as_ref().map(|set| Arc::from(set.columns.as_slice()))
+                            }).ok_or_else(|| {
+                                NzError::Protocol(
+                                    "Invalid DataRow sequence: row description is missing; reconnect is required.".into(),
+                                )
+                            })?;
+                            let mut values = Vec::with_capacity(columns.len());
+                            parse_text_data_row_into(&data, &columns, &mut values)
+                                .map_err(NzError::Protocol)?;
+                            let row = Row::from_shared(columns, values);
                             push_existing_row(&mut current, row, &nullability, &mut row_columns)?;
                         }
                     }
@@ -1789,6 +1866,10 @@ impl NzConnection {
             let ct = Duration::from_secs(self.config.connection_timeout.max(1));
             s.set_read_timeout(Some(ct)).ok();
         }
+        // Drop high-water read capacity so repeated large queries report
+        // stable per-query allocations instead of pinning ~16 MB on the
+        // connection after the first burst.
+        self.buffer.shrink_if_large();
 
         match outcome {
             Err(e) => {
@@ -1902,56 +1983,6 @@ impl NzConnection {
         let r = buf.read_bytes(&mut guard, len);
         self.stream_restore(guard, buf);
         r
-    }
-
-    /// Read one complete DBOS row payload after the shared frame header has
-    /// already been consumed. Keeping the wire framing separate from value
-    /// decoding lets buffered rows retain their original bytes and defer
-    /// conversion until `Row::try_get` is called.
-    fn read_dbos_payload(&mut self, has_tupdesc: bool) -> NzResult<Vec<u8>> {
-        if !has_tupdesc {
-            return Err(NzError::Protocol(
-                "Invalid RowStandard sequence: row description is missing; reconnect is required."
-                    .into(),
-            ));
-        }
-        let mut guard = self.stream_take()?;
-        let mut buf = self.buffer.take();
-        let result = (|| {
-            buf.skip(&mut guard, 4)?;
-            let row_len = buf.read_i32(&mut guard)?;
-            let row_len = validate_protocol_length(row_len, "rowStandardPayload", false)? as usize;
-            buf.read_bytes(&mut guard, row_len)
-        })();
-        self.stream_restore(guard, buf);
-        result
-    }
-
-    /// Return the next complete DBOS row already buffered after the first row
-    /// of a response. An incomplete frame is left untouched for the normal
-    /// blocking protocol loop.
-    fn try_read_available_dbos_payload(&mut self, has_tupdesc: bool) -> NzResult<Option<Vec<u8>>> {
-        if !has_tupdesc {
-            return Err(NzError::Protocol(
-                "Invalid RowStandard sequence: row description is missing; reconnect is required."
-                    .into(),
-            ));
-        }
-        let available = self.buffer.slice();
-        if available.len() < 13 || available[0] != code::ROW_STANDARD {
-            return Ok(None);
-        }
-        let row_len = i32::from_be_bytes(available[9..13].try_into().unwrap());
-        let row_len = validate_protocol_length(row_len, "rowStandardPayload", false)? as usize;
-        let frame_len = 13usize
-            .checked_add(row_len)
-            .ok_or_else(|| NzError::Protocol("DBOS row frame length overflow".into()))?;
-        if available.len() < frame_len {
-            return Ok(None);
-        }
-        let payload = available[13..frame_len].to_vec();
-        self.buffer.advance(frame_len);
-        Ok(Some(payload))
     }
 
     fn read_dbos_tuple_into(
@@ -2670,21 +2701,6 @@ fn finish_stream_result_set(
     false
 }
 
-fn current_columns(
-    current: &Option<ResultSet>,
-    cached: &Option<Vec<ColumnDesc>>,
-) -> NzResult<Vec<ColumnDesc>> {
-    if let Some(set) = current {
-        Ok(set.columns.clone())
-    } else if let Some(cols) = cached {
-        Ok(cols.clone())
-    } else {
-        Err(NzError::Protocol(
-            "Invalid DataRow sequence: row description is missing; reconnect is required.".into(),
-        ))
-    }
-}
-
 fn current_columns_ref<'a>(
     current: &'a Option<ResultSet>,
     cached: &'a Option<Vec<ColumnDesc>>,
@@ -2697,6 +2713,38 @@ fn current_columns_ref<'a>(
         Err(NzError::Protocol(
             "Invalid DataRow sequence: row description is missing; reconnect is required.".into(),
         ))
+    }
+}
+
+/// Borrow wire-identical bytes for an eagerly decoded cell.
+///
+/// Buffered `query()` rows drop the original frame, so only byte-preserving
+/// variants can answer `RawValue::as_bytes()`. Binary variable-length text is
+/// appended verbatim by the DBOS decoder and opaque binary fields are stored
+/// as their raw payload; text-path `Text` keeps the exact field bytes. CHAR /
+/// NCHAR trim padding and every numeric/temporal type re-encodes, so those
+/// return `None` rather than wrong bytes.
+fn eager_cell_bytes<'a>(
+    value: &'a NzValue,
+    dbos: Option<&DbosTupleDesc>,
+    column: &ColumnDesc,
+    position: usize,
+) -> Option<&'a [u8]> {
+    match value {
+        NzValue::Text(text) => match dbos {
+            Some(descriptor) => matches!(
+                descriptor.field_type.get(position).copied(),
+                Some(nz_type::NZ_TYPE_VARCHAR)
+                    | Some(nz_type::NZ_TYPE_VAR_FIXED_CHAR)
+                    | Some(nz_type::NZ_TYPE_JSON)
+                    | Some(nz_type::NZ_TYPE_JSONPATH)
+            )
+            .then(|| text.as_bytes()),
+            None if column.format == 0 => Some(text.as_bytes()),
+            None => None,
+        },
+        NzValue::Bytea(bytes) if dbos.is_some() => Some(bytes.as_slice()),
+        _ => None,
     }
 }
 
@@ -3019,6 +3067,52 @@ mod tests {
     }
 
     #[test]
+    fn eager_rows_borrow_only_wire_identical_bytes() {
+        let columns: Arc<[ColumnDesc]> = Arc::from(vec![
+            ColumnDesc {
+                name: "V".into(),
+                type_oid: 1043,
+                type_len: -1,
+                type_mod: -1,
+                format: 1,
+            },
+            ColumnDesc {
+                name: "N".into(),
+                type_oid: 1700,
+                type_len: -1,
+                type_mod: -1,
+                format: 1,
+            },
+        ]);
+        let desc = Arc::new(DbosTupleDesc {
+            num_fields: 2,
+            field_type: vec![
+                crate::messages::nz_type::NZ_TYPE_VARCHAR,
+                crate::messages::nz_type::NZ_TYPE_NUMERIC,
+            ],
+            field_size: vec![10, (7 << 8) | 2],
+            field_true_size: vec![10, 4],
+            ..Default::default()
+        });
+        let row = Row::from_shared_dbos(
+            columns,
+            vec![NzValue::Text("abc".into()), NzValue::Float8(12.34)],
+            desc,
+        );
+        // VARCHAR bytes are preserved verbatim; NUMERIC was re-encoded.
+        assert_eq!(
+            row.try_get_raw_value(0).unwrap().as_bytes(),
+            Some(b"abc" as &[u8])
+        );
+        assert_eq!(row.try_get_raw_value(1).unwrap().as_bytes(), None);
+        // The decoded value still drives typed extraction.
+        assert_eq!(
+            row.try_get::<_, crate::NzNumeric>(1).unwrap().to_string(),
+            "12.34"
+        );
+    }
+
+    #[test]
     fn transaction_state_tracks_batches() {
         let (open, _) = transaction_state_of("BEGIN");
         assert_eq!(open, Some(true));
@@ -3110,5 +3204,31 @@ mod tests {
         assert!(row.try_get::<_, Option<String>>(1).is_err());
         assert!(row.try_values().is_err());
         assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
+    }
+
+    #[test]
+    fn null_binary_scalars_do_not_decode_as_zero_or_false() {
+        // Bitmap byte 0 with both null bits set; payload bytes are zero.
+        let desc = Arc::new(DbosTupleDesc {
+            num_fields: 2,
+            num_fixed_fields: 2,
+            fixed_fields_size: 6,
+            nulls_allowed: 1,
+            field_type: vec![12, 3],
+            field_size: vec![1, 4],
+            field_true_size: vec![1, 4],
+            field_offset: vec![1, 2],
+            field_fixed_size: vec![1, 4],
+            field_null_byte_offset: vec![0, 0],
+            field_null_bit_mask: vec![1, 2],
+            ..Default::default()
+        });
+        let bytes = vec![0b11, 0, 0, 0, 0, 0];
+        let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), bytes, desc).unwrap();
+        assert!(row.try_get::<_, bool>(0).is_err());
+        assert!(row.try_get::<_, i32>(1).is_err());
+        assert!(row.try_get::<_, f64>(1).is_err());
+        assert_eq!(row.try_get::<_, Option<bool>>(0).unwrap(), None);
+        assert_eq!(row.try_get::<_, Option<i32>>(1).unwrap(), None);
     }
 }

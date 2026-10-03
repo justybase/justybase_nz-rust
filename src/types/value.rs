@@ -139,11 +139,8 @@ impl NzValue {
             | NzValue::Interval(s) => s.clone(),
             NzValue::Decimal(value) => value.to_string(),
             NzValue::Bytea(b) => {
-                let mut out = String::with_capacity(2 + b.len() * 2);
-                out.push_str("0x");
-                for byte in b {
-                    out.push_str(&format!("{byte:02x}"));
-                }
+                let mut out = String::from("0x");
+                push_hex(&mut out, b);
                 out
             }
         }
@@ -186,10 +183,12 @@ impl NzValue {
             }
             NzValue::Time(s) => s.clone(),
             NzValue::Timetz(s) => s.clone(),
-            NzValue::Bytea(b) => format!(
-                "E'\\\\x{}'",
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-            ),
+            NzValue::Bytea(b) => {
+                let mut out = String::from("E'\\\\x");
+                push_hex(&mut out, b);
+                out.push('\'');
+                out
+            }
         }
     }
 
@@ -209,12 +208,30 @@ fn fmt_f64(v: f64) -> String {
     }
 }
 
+/// Hex lookup table: `format!("{byte:02x}")` per byte costs a formatting
+/// machinery call per byte; a table push is a few instructions (C# port
+/// renders hex the same way in its hot text paths).
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+pub(crate) fn push_hex(out: &mut String, bytes: &[u8]) {
+    out.reserve(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xF) as usize] as char);
+    }
+}
+
 /// A borrowed value from a result row.
 ///
 /// The payload is kept in the row's owned frame buffer.  The optional decoded
 /// value is used by compatibility rows constructed from an already materialized
 /// [`NzValue`].  User implementations can inspect `as_bytes()` and the wire
 /// metadata without forcing conversion to the compatibility enum.
+///
+/// Eagerly decoded rows (buffered `query()` and `Row::new`) expose `as_bytes()`
+/// only for cells whose decoded value preserves the wire bytes exactly
+/// (untrimmed text and binary payloads); other types return `None` and must be
+/// read through the typed interface.
 #[derive(Debug, Clone, Copy)]
 pub struct RawValue<'a> {
     bytes: Option<&'a [u8]>,
@@ -226,6 +243,7 @@ pub struct RawValue<'a> {
 }
 
 impl<'a> RawValue<'a> {
+    #[cfg(test)]
     pub(crate) fn from_decoded(
         value: &'a NzValue,
         type_oid: i32,
@@ -269,6 +287,13 @@ impl<'a> RawValue<'a> {
 
     pub fn as_bytes(&self) -> Option<&'a [u8]> {
         self.bytes
+    }
+
+    /// Borrow the already-decoded compatibility value, if the row was decoded
+    /// eagerly (buffered `query()` rows and `Row::new` rows). Lazy rows return
+    /// `None` and expose wire state (`as_bytes()` / `dbos`) instead.
+    pub(crate) fn decoded(&self) -> Option<&'a NzValue> {
+        self.decoded
     }
 
     pub fn type_oid(&self) -> i32 {
@@ -356,6 +381,79 @@ impl FromSql for bool {
             other => Err(unexpected(other, "BOOL")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        if let Some(result) = decode_bool_dbos(&value) {
+            return result;
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
+}
+
+/// Direct binary BOOL decode for lazy DBOS rows (no intermediate `NzValue`).
+fn decode_bool_dbos(value: &RawValue<'_>) -> Option<NzResult<bool>> {
+    if value.is_null() {
+        return None;
+    }
+    let (descriptor, row, offset, index) = value.dbos?;
+    if descriptor.field_type.get(index).copied()? != crate::messages::nz_type::NZ_TYPE_BOOL {
+        return None;
+    }
+    let byte = *row.get(offset)?;
+    Some(match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(NzError::Protocol("invalid binary BOOLEAN".into())),
+    })
+}
+
+/// Direct binary integer decode for lazy DBOS rows. Returns `None` when the
+/// field is not a fixed-width integer family member (caller falls back to
+/// the `NzValue` path, preserving NUMERIC/text coercions).
+fn decode_int_dbos(value: &RawValue<'_>) -> Option<NzResult<i128>> {
+    if value.is_null() {
+        return None;
+    }
+    let (descriptor, row, offset, index) = value.dbos?;
+    let field_type = descriptor.field_type.get(index).copied()?;
+    use crate::messages::nz_type as t;
+    let raw: i128 = match field_type {
+        t::NZ_TYPE_INT8 => {
+            i64::from_le_bytes(row.get(offset..offset + 8)?.try_into().ok()?) as i128
+        }
+        t::NZ_TYPE_INT => i32::from_le_bytes(row.get(offset..offset + 4)?.try_into().ok()?) as i128,
+        t::NZ_TYPE_INT2 => {
+            i16::from_le_bytes(row.get(offset..offset + 2)?.try_into().ok()?) as i128
+        }
+        t::NZ_TYPE_INT1 => *row.get(offset)? as i8 as i128,
+        _ => return None,
+    };
+    Some(Ok(raw))
+}
+
+/// Direct binary float decode for lazy DBOS rows. Integers coerce like the
+/// `NzValue` path; other types return `None` for fallback.
+fn decode_float_dbos(value: &RawValue<'_>) -> Option<NzResult<f64>> {
+    if value.is_null() {
+        return None;
+    }
+    let (descriptor, row, offset, index) = value.dbos?;
+    let field_type = descriptor.field_type.get(index).copied()?;
+    use crate::messages::nz_type as t;
+    let number: f64 = match field_type {
+        t::NZ_TYPE_DOUBLE => f64::from_le_bytes(row.get(offset..offset + 8)?.try_into().ok()?),
+        t::NZ_TYPE_FLOAT => {
+            f32::from_le_bytes(row.get(offset..offset + 4)?.try_into().ok()?) as f64
+        }
+        t::NZ_TYPE_INT8 => i64::from_le_bytes(row.get(offset..offset + 8)?.try_into().ok()?) as f64,
+        t::NZ_TYPE_INT => i32::from_le_bytes(row.get(offset..offset + 4)?.try_into().ok()?) as f64,
+        t::NZ_TYPE_INT2 => i16::from_le_bytes(row.get(offset..offset + 2)?.try_into().ok()?) as f64,
+        t::NZ_TYPE_INT1 => *row.get(offset)? as i8 as f64,
+        _ => return None,
+    };
+    Some(Ok(number))
 }
 
 fn decode_int<T>(value: &NzValue, name: &str) -> NzResult<T>
@@ -393,6 +491,18 @@ macro_rules! from_sql_int {
                 fn from_sql(value: &NzValue) -> NzResult<Self> {
                     decode_int(value, stringify!($t))
                 }
+                fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+                    if let Some(decoded) = value.decoded {
+                        return decode_int(decoded, stringify!($t));
+                    }
+                    if let Some(raw) = decode_int_dbos(&value) {
+                        let number = raw?;
+                        return <$t>::try_from(number).map_err(|_| {
+                            NzError::Config(format!("value {number} out of range for {}", stringify!($t)))
+                        });
+                    }
+                    decode_int(&value.to_nz_value()?, stringify!($t))
+                }
             }
         )*
     };
@@ -416,6 +526,15 @@ impl FromSql for f32 {
             other => Err(unexpected(other, "float")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        if let Some(number) = decode_float_dbos(&value) {
+            return Ok(number? as f32);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 impl FromSql for f64 {
@@ -434,6 +553,15 @@ impl FromSql for f64 {
             other => Err(unexpected(other, "float")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        if let Some(number) = decode_float_dbos(&value) {
+            return number;
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 impl FromSql for Decimal {
@@ -450,6 +578,12 @@ impl FromSql for Decimal {
             other => Err(unexpected(other, "Decimal")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 #[cfg(feature = "chrono")]
@@ -462,6 +596,12 @@ impl FromSql for NaiveDate {
             other => Err(unexpected(other, "DATE")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 #[cfg(feature = "chrono")]
@@ -471,6 +611,12 @@ impl FromSql for NaiveTime {
             NzValue::Time(text) => parse_naive_time(text).map_err(|_| unexpected(value, "TIME")),
             other => Err(unexpected(other, "TIME")),
         }
+    }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
     }
 }
 
@@ -484,6 +630,12 @@ impl FromSql for NaiveDateTime {
             other => Err(unexpected(other, "TIMESTAMP")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 #[cfg(feature = "chrono")]
@@ -494,6 +646,12 @@ fn parse_naive_time(text: &str) -> Result<NaiveTime, chrono::ParseError> {
 
 #[cfg(feature = "chrono")]
 impl FromSql for NzTimeTz {
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
     fn from_sql(value: &NzValue) -> NzResult<Self> {
         let NzValue::Timetz(text) = value else {
             return Err(unexpected(value, "TIMETZ"));
@@ -535,6 +693,13 @@ impl FromSql for NzTimeTz {
 
 impl FromSql for String {
     fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        // Eager/compatibility rows carry the decoded value: single clone,
+        // no intermediate `NzValue` allocation.
+        if value.as_bytes().is_none() {
+            if let Some(decoded) = value.decoded {
+                return Self::from_sql(decoded);
+            }
+        }
         if let Some(bytes) = value.as_bytes() {
             let textual = value
                 .dbos
@@ -572,6 +737,12 @@ impl FromSql for Vec<u8> {
             other => Err(unexpected(other, "bytea")),
         }
     }
+    fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return Self::from_sql(decoded);
+        }
+        Self::from_sql(&value.to_nz_value()?)
+    }
 }
 
 impl<T: FromSql> FromSql for Option<T> {
@@ -599,6 +770,12 @@ impl<'a> FromSqlRaw<'a> for NzValue {
 
 impl<'a> FromSqlRaw<'a> for bool {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
+        if let Some(decoded) = value.decoded {
+            return <Self as FromSql>::from_sql(decoded);
+        }
+        if let Some(result) = decode_bool_dbos(&value) {
+            return result;
+        }
         let decoded = value.to_nz_value()?;
         <Self as FromSql>::from_sql(&decoded)
     }
@@ -609,8 +786,9 @@ macro_rules! from_sql_raw_int {
         $(
             impl<'a> FromSqlRaw<'a> for $t {
                 fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-                    let decoded = value.to_nz_value()?;
-                    <Self as FromSql>::from_sql(&decoded)
+                    // Reuse the `FromSql::from_raw` fast paths (decoded
+                    // borrow + direct binary decode) instead of cloning.
+                    <Self as FromSql>::from_raw(value)
                 }
             }
         )*
@@ -621,15 +799,13 @@ from_sql_raw_int!(i16, i32, i64, u8, u16, u32);
 
 impl<'a> FromSqlRaw<'a> for f32 {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-        let decoded = value.to_nz_value()?;
-        <Self as FromSql>::from_sql(&decoded)
+        <Self as FromSql>::from_raw(value)
     }
 }
 
 impl<'a> FromSqlRaw<'a> for f64 {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-        let decoded = value.to_nz_value()?;
-        <Self as FromSql>::from_sql(&decoded)
+        <Self as FromSql>::from_raw(value)
     }
 }
 
@@ -638,8 +814,7 @@ macro_rules! from_sql_raw_decoded {
         $(
             impl<'a> FromSqlRaw<'a> for $t {
                 fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-                    let decoded = value.to_nz_value()?;
-                    <Self as FromSql>::from_sql(&decoded)
+                    <Self as FromSql>::from_raw(value)
                 }
             }
         )*
@@ -652,8 +827,7 @@ from_sql_raw_decoded!(NaiveDate, NaiveTime, NaiveDateTime, NzTimeTz);
 
 impl<'a> FromSqlRaw<'a> for String {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-        let decoded = value.to_nz_value()?;
-        <Self as FromSql>::from_sql(&decoded)
+        <Self as FromSql>::from_raw(value)
     }
 }
 
@@ -702,8 +876,7 @@ impl<'a> FromSqlRaw<'a> for &'a [u8] {
 
 impl<'a> FromSqlRaw<'a> for Vec<u8> {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
-        let decoded = value.to_nz_value()?;
-        <Self as FromSql>::from_sql(&decoded)
+        <Self as FromSql>::from_raw(value)
     }
 }
 

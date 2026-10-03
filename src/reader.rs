@@ -336,6 +336,10 @@ pub struct NzDataReader {
     /// True once the current set's `CommandComplete` was observed (no more rows).
     result_complete: bool,
     closed: bool,
+    /// Resolved column metadata for the current result set. `resolve_...`
+    /// builds 3–4 `String`s per column; readers that probe the schema per
+    /// row (Node/C# parity loops) would otherwise pay it on every call.
+    metadata_cache: std::sync::Mutex<Option<(usize, Vec<ColumnMetadata>)>>,
 }
 
 impl NzDataReader {
@@ -355,6 +359,7 @@ impl NzDataReader {
             row_idx: None,
             result_complete: false,
             closed: false,
+            metadata_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -420,6 +425,10 @@ impl NzDataReader {
         self.set_idx += 1;
         self.row_idx = None;
         self.result_complete = false;
+        *self
+            .metadata_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         Ok(true)
     }
 
@@ -493,8 +502,37 @@ impl NzDataReader {
 
     /// Fully resolved metadata for one column (Node `getColumnMetadata`).
     pub fn get_column_metadata(&self, i: usize) -> NzResult<ColumnMetadata> {
+        // Fast path: whole-set cache filled on first miss.
+        if let Some(cached) = self
+            .metadata_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if cached.0 == self.set_idx {
+                if let Some(meta) = cached.1.get(i) {
+                    return Ok(meta.clone());
+                }
+            }
+        }
         let col = self.column(i)?;
-        Ok(resolve_column_metadata(col, i))
+        let first = resolve_column_metadata(col, i);
+        // Fill the set cache so the remaining columns (and later per-row
+        // schema probes) are clones instead of fresh `String` builds.
+        let count = self.columns().len();
+        let mut built = Vec::with_capacity(count);
+        for (index, column) in self.columns().iter().enumerate() {
+            if index == i {
+                built.push(first.clone());
+            } else {
+                built.push(resolve_column_metadata(column, index));
+            }
+        }
+        *self
+            .metadata_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((self.set_idx, built));
+        Ok(first)
     }
 
     /// ADO.NET-style schema table over the current result set's columns
@@ -628,10 +666,12 @@ impl NzDataReader {
             NzValue::Int8(n) => Ok(Some(n.to_string())),
             NzValue::Float4(n) => Ok(Some(n.to_string())),
             NzValue::Float8(n) => Ok(Some(n.to_string())),
-            NzValue::Bytea(b) => Ok(Some(format!(
-                "E'\\\\x{}'",
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-            ))),
+            NzValue::Bytea(b) => {
+                let mut out = String::from("E'\\\\x");
+                crate::types::value::push_hex(&mut out, b);
+                out.push('\'');
+                Ok(Some(out))
+            }
         }
     }
 
