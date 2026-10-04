@@ -65,7 +65,8 @@ fn reset_counters() {
 }
 
 /// Samples resident memory during one measurement. `/proc/self/status` is
-/// read into a stack buffer so the sampler does not add per-sample allocations.
+/// read into a reused buffer so the sampler does not add per-sample
+/// allocations once the buffer has grown to the file size.
 struct RssSampler {
     stop: Option<Arc<AtomicBool>>,
     peak_kib: Option<Arc<AtomicU64>>,
@@ -73,10 +74,11 @@ struct RssSampler {
     worker: Option<thread::JoinHandle<()>>,
 }
 
-fn read_rss_kib(status: &mut std::fs::File, buffer: &mut [u8; 4096]) -> Option<u64> {
+fn read_rss_kib(status: &mut std::fs::File, buffer: &mut Vec<u8>) -> Option<u64> {
     status.seek(SeekFrom::Start(0)).ok()?;
-    let length = status.read(buffer).ok()?;
-    for line in buffer[..length].split(|byte| *byte == b'\n') {
+    buffer.clear();
+    status.read_to_end(buffer).ok()?;
+    for line in buffer.split(|byte| *byte == b'\n') {
         let Some(value) = line.strip_prefix(b"VmRSS:") else {
             continue;
         };
@@ -108,14 +110,14 @@ impl RssSampler {
                 worker: None,
             };
         };
-        let mut buffer = [0; 4096];
+        let mut buffer = Vec::new();
         let initial_peak = read_rss_kib(&mut status, &mut buffer).unwrap_or_default();
         let stop = Arc::new(AtomicBool::new(false));
         let peak_kib = Arc::new(AtomicU64::new(initial_peak));
         let worker_stop = Arc::clone(&stop);
         let worker_peak = Arc::clone(&peak_kib);
         let worker = thread::spawn(move || {
-            let mut buffer = [0; 4096];
+            let mut buffer = Vec::new();
             while !worker_stop.load(Ordering::Relaxed) {
                 if let Some(rss_kib) = read_rss_kib(&mut status, &mut buffer) {
                     worker_peak.fetch_max(rss_kib, Ordering::Relaxed);

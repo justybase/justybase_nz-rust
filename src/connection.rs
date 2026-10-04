@@ -518,6 +518,13 @@ impl RawRowData {
                     .collect()
             }
             RawRowKind::Dbos { descriptor } => {
+                if columns.len() > descriptor.num_fields {
+                    return Err(NzError::Config(format!(
+                        "row has {} columns but its descriptor declares {} fields",
+                        columns.len(),
+                        descriptor.num_fields
+                    )));
+                }
                 let varying_count = descriptor.num_varying_fields.max(0) as usize;
                 let mut progress = self
                     .layout_progress
