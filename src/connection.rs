@@ -42,14 +42,14 @@ use crate::messages::{
 };
 use crate::params::{substitute_bound_parameters, substitute_parameters, NzParameter};
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
-use crate::types::text::{build_simple_query_packet, parse_text_data_row_into, text_row_layout};
+use crate::types::text::{build_simple_query_packet, parse_text_data_row_into};
 use crate::types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -138,8 +138,69 @@ pub(crate) fn take_import_source(id: &str) -> Option<ImportSource> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Row {
-    columns: Arc<[ColumnDesc]>,
+    metadata: Arc<RowMetadata>,
     storage: RowStorage,
+}
+
+#[derive(Debug)]
+pub(crate) struct RowMetadata {
+    columns: Arc<[ColumnDesc]>,
+    name_index: OnceLock<hashbrown::HashMap<AsciiColumnName, usize>>,
+}
+
+#[derive(Debug)]
+struct AsciiColumnName(Box<str>);
+
+struct ColumnNameLookup<'a>(&'a str);
+
+impl PartialEq for AsciiColumnName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+impl Eq for AsciiColumnName {}
+impl Hash for AsciiColumnName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for byte in self.0.bytes() {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
+    }
+}
+impl Hash for ColumnNameLookup<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for byte in self.0.bytes() {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
+    }
+}
+impl hashbrown::Equivalent<AsciiColumnName> for ColumnNameLookup<'_> {
+    fn equivalent(&self, key: &AsciiColumnName) -> bool {
+        self.0.eq_ignore_ascii_case(&key.0)
+    }
+}
+
+impl RowMetadata {
+    pub(crate) fn new(columns: Arc<[ColumnDesc]>) -> Self {
+        Self {
+            columns,
+            name_index: OnceLock::new(),
+        }
+    }
+
+    fn position(&self, name: &str) -> Option<usize> {
+        self.name_index
+            .get_or_init(|| {
+                let mut index = hashbrown::HashMap::with_capacity(self.columns.len());
+                for (position, column) in self.columns.iter().enumerate() {
+                    index
+                        .entry(AsciiColumnName(column.name.clone().into_boxed_str()))
+                        .or_insert(position);
+                }
+                index
+            })
+            .get(&ColumnNameLookup(name))
+            .copied()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,17 +221,47 @@ struct RawRowData {
     kind: RawRowKind,
     decoded: OnceLock<Vec<NzValue>>,
     cells: OnceLock<Box<[OnceLock<NzValue>]>>,
+    layout_progress: Mutex<RowLayoutProgress>,
 }
 
 #[derive(Debug)]
 enum RawRowKind {
-    Text {
-        fields: Vec<Option<Range<usize>>>,
-    },
-    Dbos {
-        descriptor: Arc<DbosTupleDesc>,
-        fields: Vec<crate::tuple_desc::DbosFieldLayout>,
-    },
+    Text,
+    Dbos { descriptor: Arc<DbosTupleDesc> },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowFieldSpan {
+    /// For text rows this is the value start. For DBOS varying fields it is
+    /// the length-prefix start, as required by `parse_field_into`.
+    start: usize,
+    /// End of the encoded value, excluding DBOS alignment padding.
+    end: usize,
+    is_null: bool,
+}
+
+fn pack_row_span(start: usize, end: usize) -> NzResult<u64> {
+    let start = u32::try_from(start)
+        .map_err(|_| NzError::Protocol("row field offset is out of range".into()))?;
+    let end = u32::try_from(end)
+        .map_err(|_| NzError::Protocol("row field end is out of range".into()))?;
+    Ok(((start as u64) << 32) | end as u64)
+}
+
+fn unpack_row_span(packed: u64, is_null: bool) -> RowFieldSpan {
+    RowFieldSpan {
+        start: (packed >> 32) as u32 as usize,
+        end: packed as u32 as usize,
+        is_null,
+    }
+}
+
+#[derive(Debug, Default)]
+struct RowLayoutProgress {
+    cursor: usize,
+    // Each checked start/end pair is packed into 64 bits. DBOS spans are
+    // discovered during structural validation; text spans remain progressive.
+    spans: Vec<u64>,
 }
 
 impl RawRowData {
@@ -197,13 +288,187 @@ impl RawRowData {
         }
         Ok(cell.get().expect("cell initialized above"))
     }
+
+    fn text_span(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<RowFieldSpan> {
+        if index >= columns.len() {
+            return Err(NzError::Config("row index out of range".into()));
+        }
+        let mut progress = self
+            .layout_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_text_spans(&mut progress, index + 1)?;
+        let byte = *self
+            .payload
+            .get(index / 8)
+            .ok_or_else(|| NzError::Protocol("DataRow null bitmap is truncated".into()))?;
+        let bit = 7 - (index % 8);
+        Ok(unpack_row_span(
+            progress.spans[index],
+            byte & (1 << bit) == 0,
+        ))
+    }
+
+    fn ensure_text_spans(&self, progress: &mut RowLayoutProgress, count: usize) -> NzResult<()> {
+        while progress.spans.len() < count {
+            let field_index = progress.spans.len();
+            let byte = self.payload[field_index / 8];
+            let bit = 7 - (field_index % 8);
+            let (value_start, value_end) = if byte & (1 << bit) == 0 {
+                (progress.cursor, progress.cursor)
+            } else {
+                let prefix_end = progress
+                    .cursor
+                    .checked_add(4)
+                    .ok_or_else(|| NzError::Protocol("DataRow field prefix overflow".into()))?;
+                let encoded = i32::from_be_bytes(
+                    self.payload
+                        .get(progress.cursor..prefix_end)
+                        .ok_or_else(|| {
+                            NzError::Protocol(format!(
+                                "DataRow column {field_index} length is truncated"
+                            ))
+                        })?
+                        .try_into()
+                        .unwrap(),
+                );
+                let value_len = usize::try_from(encoded - 4).map_err(|_| {
+                    NzError::Protocol(format!("DataRow column {field_index} length is invalid"))
+                })?;
+                let value_start = prefix_end;
+                let end = value_start.checked_add(value_len).ok_or_else(|| {
+                    NzError::Protocol(format!(
+                        "DataRow column {field_index} value length overflow"
+                    ))
+                })?;
+                if end > self.payload.len() {
+                    return Err(NzError::Protocol(format!(
+                        "DataRow column {field_index} value length is invalid"
+                    )));
+                }
+                progress.cursor = end;
+                (value_start, end)
+            };
+            progress.spans.push(pack_row_span(value_start, value_end)?);
+        }
+        Ok(())
+    }
+
+    fn dbos_span(&self, index: usize, descriptor: &DbosTupleDesc) -> NzResult<RowFieldSpan> {
+        if index >= descriptor.num_fields {
+            return Err(NzError::Config(format!(
+                "row field index {index} is out of range"
+            )));
+        }
+        if descriptor.is_field_null(&self.payload, index) {
+            return Ok(RowFieldSpan {
+                start: 0,
+                end: 0,
+                is_null: true,
+            });
+        }
+        if descriptor.field_fixed_size[index] != 0 {
+            let start = usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+                NzError::Protocol(format!("DBOS fixed field {index} has an invalid offset"))
+            })?;
+            let end = start
+                .checked_add(descriptor.fixed_width(index)?)
+                .ok_or_else(|| NzError::Protocol("DBOS field offset overflow".into()))?;
+            return Ok(RowFieldSpan {
+                start,
+                end,
+                is_null: false,
+            });
+        }
+        // Older descriptors can describe a non-null field with no varying
+        // fields in the row. The established DBOS parser locates that field
+        // at the start of the fixed-field area in this case.
+        if descriptor.num_varying_fields == 0 {
+            let start = usize::try_from(descriptor.fixed_fields_size)
+                .map_err(|_| NzError::Protocol("DBOS fixed-field area offset is invalid".into()))?;
+            if start > self.payload.len() {
+                return Err(NzError::Protocol(format!(
+                    "DBOS field {index} starts outside the row"
+                )));
+            }
+            return Ok(RowFieldSpan {
+                start,
+                end: self.payload.len(),
+                is_null: false,
+            });
+        }
+        let varying_index = usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+            NzError::Protocol(format!("DBOS varying field {index} has an invalid index"))
+        })?;
+        let mut progress = self
+            .layout_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_dbos_spans(&mut progress, varying_index + 1, descriptor)?;
+        let packed = progress
+            .spans
+            .get(varying_index)
+            .copied()
+            .ok_or_else(|| NzError::Protocol("DBOS row layout was not discovered".into()))?;
+        Ok(unpack_row_span(packed, false))
+    }
+
+    fn ensure_dbos_spans(
+        &self,
+        progress: &mut RowLayoutProgress,
+        count: usize,
+        descriptor: &DbosTupleDesc,
+    ) -> NzResult<()> {
+        while progress.spans.len() < count {
+            let field = progress.spans.len();
+            if field >= descriptor.num_varying_fields.max(0) as usize {
+                return Err(NzError::Protocol(format!(
+                    "DBOS varying field {field} index is invalid"
+                )));
+            }
+            let prefix_end = progress
+                .cursor
+                .checked_add(2)
+                .ok_or_else(|| NzError::Protocol("DBOS varying field prefix overflow".into()))?;
+            let prefix = self
+                .payload
+                .get(progress.cursor..prefix_end)
+                .ok_or_else(|| {
+                    NzError::Protocol(format!(
+                        "DBOS varying field {field} length prefix is truncated"
+                    ))
+                })?;
+            let encoded = u16::from_le_bytes(prefix.try_into().unwrap()) as usize;
+            let value_end = progress
+                .cursor
+                .checked_add(encoded)
+                .ok_or_else(|| NzError::Protocol("DBOS varying field length overflow".into()))?;
+            if encoded < 2 || value_end > self.payload.len() {
+                return Err(NzError::Protocol(format!(
+                    "DBOS varying field {field} length is invalid"
+                )));
+            }
+            let next_cursor = value_end + usize::from(!encoded.is_multiple_of(2));
+            if next_cursor > self.payload.len() {
+                return Err(NzError::Protocol(format!(
+                    "DBOS varying field {field} padding is truncated"
+                )));
+            }
+            let packed = pack_row_span(progress.cursor, value_end)?;
+            progress.cursor = next_cursor;
+            progress.spans.push(packed);
+        }
+        Ok(())
+    }
+
     fn decode_value(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<NzValue> {
         match &self.kind {
-            RawRowKind::Text { fields } => {
-                let Some(range) = fields.get(index).and_then(|range| range.as_ref()) else {
+            RawRowKind::Text => {
+                let span = self.text_span(index, columns)?;
+                if span.is_null {
                     return Ok(NzValue::Null);
-                };
-                let bytes = &self.payload[range.clone()];
+                }
+                let bytes = &self.payload[span.start..span.end];
                 let text = std::str::from_utf8(bytes)
                     .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
                 let column = columns.get(index).ok_or_else(|| {
@@ -211,10 +476,8 @@ impl RawRowData {
                 })?;
                 crate::types::text::try_parse_text_value(text, column.type_oid, column.type_mod)
             }
-            RawRowKind::Dbos { descriptor, fields } => {
-                let field = fields.get(index).ok_or_else(|| {
-                    NzError::Config(format!("row field index {index} is out of range"))
-                })?;
+            RawRowKind::Dbos { descriptor } => {
+                let field = self.dbos_span(index, descriptor)?;
                 if field.is_null {
                     return Ok(NzValue::Null);
                 }
@@ -227,56 +490,130 @@ impl RawRowData {
 
     fn decode_all(&self, columns: &[ColumnDesc]) -> NzResult<Vec<NzValue>> {
         match &self.kind {
-            RawRowKind::Text { fields } => fields
-                .iter()
-                .enumerate()
-                .map(|(index, range)| match range {
-                    None => Ok(NzValue::Null),
-                    Some(range) => {
-                        let bytes = &self.payload[range.clone()];
+            RawRowKind::Text => {
+                let mut progress = self
+                    .layout_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.ensure_text_spans(&mut progress, columns.len())?;
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        let byte = self.payload[index / 8];
+                        let bit = 7 - (index % 8);
+                        let span = unpack_row_span(progress.spans[index], byte & (1 << bit) == 0);
+                        if span.is_null {
+                            return Ok(NzValue::Null);
+                        }
+                        let bytes = &self.payload[span.start..span.end];
                         let text = std::str::from_utf8(bytes)
                             .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
-                        let column = columns.get(index).ok_or_else(|| {
-                            NzError::Protocol(
-                                "text row has more fields than its description".into(),
-                            )
-                        })?;
                         crate::types::text::try_parse_text_value(
                             text,
                             column.type_oid,
                             column.type_mod,
                         )
-                    }
-                })
-                .collect(),
-            RawRowKind::Dbos { .. } => (0..columns.len())
-                .map(|index| self.decode_value(index, columns))
-                .collect(),
+                    })
+                    .collect()
+            }
+            RawRowKind::Dbos { descriptor } => {
+                let varying_count = descriptor.num_varying_fields.max(0) as usize;
+                let mut progress = self
+                    .layout_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.ensure_dbos_spans(&mut progress, varying_count, descriptor)?;
+                (0..columns.len())
+                    .map(|index| {
+                        if descriptor.is_field_null(&self.payload, index) {
+                            return Ok(NzValue::Null);
+                        }
+                        let start = if descriptor.field_fixed_size[index] != 0 {
+                            usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+                                NzError::Protocol(format!(
+                                    "DBOS fixed field {index} has an invalid offset"
+                                ))
+                            })?
+                        } else if varying_count == 0 {
+                            usize::try_from(descriptor.fixed_fields_size).map_err(|_| {
+                                NzError::Protocol("DBOS fixed-field area offset is invalid".into())
+                            })?
+                        } else {
+                            let varying_index = usize::try_from(descriptor.field_offset[index])
+                                .map_err(|_| {
+                                    NzError::Protocol(format!(
+                                        "DBOS varying field {index} has an invalid index"
+                                    ))
+                                })?;
+                            progress
+                                .spans
+                                .get(varying_index)
+                                .map(|span| (span >> 32) as u32 as usize)
+                                .ok_or_else(|| {
+                                    NzError::Protocol("DBOS row layout was not discovered".into())
+                                })?
+                        };
+                        let mut value = NzValue::Null;
+                        descriptor.parse_field_into(&self.payload, start, index, &mut value)?;
+                        Ok(value)
+                    })
+                    .collect()
+            }
         }
     }
 
-    fn field_bytes(&self, index: usize) -> Option<&[u8]> {
+    fn field_bytes(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<Option<&[u8]>> {
         match &self.kind {
-            RawRowKind::Text { fields } => fields
-                .get(index)
-                .and_then(|range| range.as_ref())
-                .map(|range| &self.payload[range.clone()]),
-            RawRowKind::Dbos { descriptor, fields } => {
-                let field = fields.get(index)?;
-                if field.is_null {
-                    None
-                } else if descriptor.field_fixed_size.get(index).copied().unwrap_or(0) != 0 {
-                    let size = descriptor.fixed_width(index).ok()?;
-                    let end = field.start.checked_add(size)?;
-                    self.payload.get(field.start..end)
+            RawRowKind::Text => {
+                let span = self.text_span(index, columns)?;
+                if span.is_null {
+                    Ok(None)
                 } else {
-                    let prefix_end = field.start.checked_add(2)?;
+                    self.payload
+                        .get(span.start..span.end)
+                        .map(Some)
+                        .ok_or_else(|| NzError::Protocol("text row field is out of bounds".into()))
+                }
+            }
+            RawRowKind::Dbos { descriptor } => {
+                let field = self.dbos_span(index, descriptor)?;
+                if field.is_null {
+                    Ok(None)
+                } else if descriptor.field_fixed_size.get(index).copied().unwrap_or(0) != 0 {
+                    self.payload
+                        .get(field.start..field.end)
+                        .map(Some)
+                        .ok_or_else(|| {
+                            NzError::Protocol("DBOS fixed field is out of bounds".into())
+                        })
+                } else if descriptor.num_varying_fields == 0 {
+                    self.payload
+                        .get(field.start..field.end)
+                        .map(Some)
+                        .ok_or_else(|| NzError::Protocol("DBOS field is out of bounds".into()))
+                } else {
+                    let prefix_end = field
+                        .start
+                        .checked_add(2)
+                        .ok_or_else(|| NzError::Protocol("DBOS field prefix overflow".into()))?;
                     let encoded = u16::from_le_bytes(
-                        self.payload.get(field.start..prefix_end)?.try_into().ok()?,
+                        self.payload
+                            .get(field.start..prefix_end)
+                            .ok_or_else(|| {
+                                NzError::Protocol("DBOS field prefix is truncated".into())
+                            })?
+                            .try_into()
+                            .unwrap(),
                     ) as usize;
                     let value_start = prefix_end;
-                    let end = field.start.checked_add(encoded)?;
-                    self.payload.get(value_start..end)
+                    let end = field
+                        .start
+                        .checked_add(encoded)
+                        .ok_or_else(|| NzError::Protocol("DBOS field length overflow".into()))?;
+                    self.payload.get(value_start..end).map(Some).ok_or_else(|| {
+                        NzError::Protocol("DBOS varying field is out of bounds".into())
+                    })
                 }
             }
         }
@@ -296,7 +633,7 @@ impl Row {
         let position = index
             .position(self)
             .ok_or_else(|| NzError::Config("column index out of range".into()))?;
-        let column = &self.columns[position];
+        let column = &self.columns()[position];
         let dbos_type = match &self.storage {
             RowStorage::Values { dbos, .. } => dbos.as_ref().map(|desc| desc.field_type[position]),
             RowStorage::Raw(raw) => match &raw.kind {
@@ -317,7 +654,7 @@ impl Row {
 
     pub fn new(columns: Vec<ColumnDesc>, values: Vec<NzValue>) -> Self {
         Row {
-            columns: Arc::from(columns),
+            metadata: Arc::new(RowMetadata::new(Arc::from(columns))),
             storage: RowStorage::Values { values, dbos: None },
         }
     }
@@ -327,7 +664,14 @@ impl Row {
     /// which decodes a full row into `object[]` on `Read()`.
     pub(crate) fn from_shared(columns: Arc<[ColumnDesc]>, values: Vec<NzValue>) -> Self {
         Row {
-            columns,
+            metadata: Arc::new(RowMetadata::new(columns)),
+            storage: RowStorage::Values { values, dbos: None },
+        }
+    }
+
+    pub(crate) fn from_shared_metadata(metadata: Arc<RowMetadata>, values: Vec<NzValue>) -> Self {
+        Row {
+            metadata,
             storage: RowStorage::Values { values, dbos: None },
         }
     }
@@ -340,7 +684,21 @@ impl Row {
         descriptor: Arc<DbosTupleDesc>,
     ) -> Self {
         Row {
-            columns,
+            metadata: Arc::new(RowMetadata::new(columns)),
+            storage: RowStorage::Values {
+                values,
+                dbos: Some(descriptor),
+            },
+        }
+    }
+
+    pub(crate) fn from_shared_dbos_metadata(
+        metadata: Arc<RowMetadata>,
+        values: Vec<NzValue>,
+        descriptor: Arc<DbosTupleDesc>,
+    ) -> Self {
+        Row {
+            metadata,
             storage: RowStorage::Values {
                 values,
                 dbos: Some(descriptor),
@@ -352,15 +710,28 @@ impl Row {
         columns: Arc<[ColumnDesc]>,
         payload: impl Into<Bytes>,
     ) -> NzResult<Self> {
+        Self::from_text_raw_with_metadata(Arc::new(RowMetadata::new(columns)), payload)
+    }
+
+    pub(crate) fn from_text_raw_with_metadata(
+        metadata: Arc<RowMetadata>,
+        payload: impl Into<Bytes>,
+    ) -> NzResult<Self> {
         let payload = payload.into();
-        let fields = text_row_layout(&payload, &columns).map_err(NzError::Protocol)?;
+        crate::types::text::validate_text_row(&payload, &metadata.columns)
+            .map_err(NzError::Protocol)?;
+        let cursor = metadata.columns.len().div_ceil(8);
         Ok(Self {
-            columns,
+            metadata,
             storage: RowStorage::Raw(Arc::new(RawRowData {
                 payload,
-                kind: RawRowKind::Text { fields },
+                kind: RawRowKind::Text,
                 decoded: OnceLock::new(),
                 cells: OnceLock::new(),
+                layout_progress: Mutex::new(RowLayoutProgress {
+                    cursor,
+                    spans: Vec::new(),
+                }),
             })),
         })
     }
@@ -370,22 +741,51 @@ impl Row {
         payload: impl Into<Bytes>,
         descriptor: Arc<DbosTupleDesc>,
     ) -> NzResult<Self> {
+        Self::from_dbos_raw_with_metadata(Arc::new(RowMetadata::new(columns)), payload, descriptor)
+    }
+
+    pub(crate) fn from_dbos_raw_with_metadata(
+        metadata: Arc<RowMetadata>,
+        payload: impl Into<Bytes>,
+        descriptor: Arc<DbosTupleDesc>,
+    ) -> NzResult<Self> {
         let payload = payload.into();
-        let fields = descriptor.row_layout(&payload)?;
+        let varying_starts = descriptor.validate_row_layout(&payload)?;
+        let cursor = usize::try_from(descriptor.fixed_fields_size.max(0)).unwrap_or(0);
         Ok(Self {
-            columns,
+            metadata,
             storage: RowStorage::Raw(Arc::new(RawRowData {
                 payload,
-                kind: RawRowKind::Dbos { descriptor, fields },
+                kind: RawRowKind::Dbos {
+                    descriptor: descriptor.clone(),
+                },
                 decoded: OnceLock::new(),
                 cells: OnceLock::new(),
+                layout_progress: Mutex::new(RowLayoutProgress {
+                    cursor,
+                    spans: varying_starts,
+                }),
             })),
         })
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
         match &self.storage {
-            RowStorage::Raw(raw) => raw.payload.len().saturating_add(self.len() * std::mem::size_of::<Option<Range<usize>>>()).saturating_add(std::mem::size_of::<RawRowData>() + std::mem::size_of::<Row>()),
+            RowStorage::Raw(raw) => {
+                // DBOS varying starts are prepared by structural validation;
+                // text offsets and decoded cells remain progressive.
+                let layout_bytes = match &raw.kind {
+                    RawRowKind::Text => 0,
+                    RawRowKind::Dbos { descriptor } => descriptor
+                        .num_varying_fields
+                        .max(0) as usize
+                        * std::mem::size_of::<u64>(),
+                };
+                raw.payload
+                    .len()
+                    .saturating_add(std::mem::size_of::<RawRowData>() + std::mem::size_of::<Row>())
+                    .saturating_add(layout_bytes)
+            }
             RowStorage::Values { values, .. } => values.iter().map(|value| match value {
                 NzValue::Text(s) | NzValue::Numeric(s) | NzValue::Date(s) | NzValue::Time(s) | NzValue::Timestamp(s) | NzValue::Timetz(s) | NzValue::Interval(s) => s.len(),
                 NzValue::Bytea(bytes) => bytes.len(), _ => 0,
@@ -394,15 +794,15 @@ impl Row {
     }
 
     pub fn columns(&self) -> &[ColumnDesc] {
-        &self.columns
+        &self.metadata.columns
     }
 
     pub fn len(&self) -> usize {
-        self.columns.len()
+        self.metadata.columns.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.columns().is_empty()
     }
 
     pub fn values(&self) -> &[NzValue] {
@@ -416,7 +816,7 @@ impl Row {
             RowStorage::Values { values, .. } => Ok(values),
             RowStorage::Raw(raw) => {
                 if raw.decoded.get().is_none() {
-                    let values = raw.decode_all(&self.columns)?;
+                    let values = raw.decode_all(self.columns())?;
                     let _ = raw.decoded.set(values);
                 }
                 Ok(raw.decoded.get().expect("row initialized above"))
@@ -442,7 +842,7 @@ impl Row {
                 RowStorage::Values { values, .. } => values
                     .get(p)
                     .ok_or_else(|| NzError::Config("row values do not match columns".into())),
-                RowStorage::Raw(raw) => raw.value(p, &self.columns),
+                RowStorage::Raw(raw) => raw.value(p, self.columns()),
             },
             None => Err(NzError::Config(format!(
                 "row index out of range: {}",
@@ -466,7 +866,7 @@ impl Row {
         let position = idx.position(self).ok_or_else(|| {
             NzError::Config(format!("row index out of range: {}", idx.describe()))
         })?;
-        let column = self.columns.get(position).ok_or_else(|| {
+        let column = self.columns().get(position).ok_or_else(|| {
             NzError::Config(format!("row index out of range: ordinal {position}"))
         })?;
         match &self.storage {
@@ -485,20 +885,18 @@ impl Row {
             }
             RowStorage::Raw(raw) => {
                 let value = RawValue::from_parts(
-                    raw.field_bytes(position),
+                    raw.field_bytes(position, self.columns())?,
                     None,
                     column.type_oid,
                     column.type_mod,
                     column.format,
                 );
                 match &raw.kind {
-                    RawRowKind::Dbos { descriptor, fields } => Ok(value.with_dbos(
-                        descriptor,
-                        &raw.payload,
-                        fields[position].start,
-                        position,
-                    )),
-                    RawRowKind::Text { .. } => Ok(value),
+                    RawRowKind::Dbos { descriptor } => {
+                        let field = raw.dbos_span(position, descriptor)?;
+                        Ok(value.with_dbos(descriptor, &raw.payload, field.start, position))
+                    }
+                    RawRowKind::Text => Ok(value),
                 }
             }
         }
@@ -529,7 +927,7 @@ impl Row {
 
     /// Row as `name → value` pairs in column order.
     pub fn as_map(&self) -> Vec<(String, NzValue)> {
-        self.columns
+        self.columns()
             .iter()
             .zip(self.values().iter())
             .map(|(c, v)| (c.name.clone(), v.clone()))
@@ -545,7 +943,7 @@ pub trait RowIndex {
 
 impl RowIndex for usize {
     fn position(&self, row: &Row) -> Option<usize> {
-        if *self < row.columns.len() {
+        if *self < row.columns().len() {
             Some(*self)
         } else {
             None
@@ -558,9 +956,7 @@ impl RowIndex for usize {
 
 impl RowIndex for &str {
     fn position(&self, row: &Row) -> Option<usize> {
-        row.columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(self))
+        row.metadata.position(self)
     }
     fn describe(&self) -> String {
         format!("column '{self}'")
@@ -569,9 +965,7 @@ impl RowIndex for &str {
 
 impl RowIndex for String {
     fn position(&self, row: &Row) -> Option<usize> {
-        row.columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(self))
+        row.metadata.position(self)
     }
     fn describe(&self) -> String {
         format!("column '{self}'")
@@ -1484,6 +1878,7 @@ impl NzConnection {
         let mut stream_values: Vec<NzValue> = Vec::new();
         let mut stream_var_starts: Vec<usize> = Vec::new();
         let mut row_columns: Option<Arc<[ColumnDesc]>> = None;
+        let mut row_metadata: Option<Arc<RowMetadata>> = None;
         let mut error: Option<NzError> = None;
         let mut sink_error: Option<NzError> = None;
         let mut sink_cancel_sent = false;
@@ -1600,7 +1995,14 @@ impl NzConnection {
                                 &mut var_starts,
                             )?;
                             self.row_var_starts_scratch = var_starts;
-                            let row = Row::from_shared_dbos(columns, values, descriptor.clone());
+                            let metadata = row_metadata
+                                .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
+                                .clone();
+                            let row = Row::from_shared_dbos_metadata(
+                                metadata,
+                                values,
+                                descriptor.clone(),
+                            );
                             push_existing_row(&mut current, row, &nullability, &mut row_columns)?;
                             loop {
                                 let columns = row_columns.clone().unwrap_or_else(|| {
@@ -1618,8 +2020,16 @@ impl NzConnection {
                                 )? {
                                     break;
                                 }
-                                let row =
-                                    Row::from_shared_dbos(columns, values, descriptor.clone());
+                                let metadata = row_metadata
+                                    .get_or_insert_with(|| {
+                                        Arc::new(RowMetadata::new(columns.clone()))
+                                    })
+                                    .clone();
+                                let row = Row::from_shared_dbos_metadata(
+                                    metadata,
+                                    values,
+                                    descriptor.clone(),
+                                );
                                 push_existing_row(
                                     &mut current,
                                     row,
@@ -1660,6 +2070,7 @@ impl NzConnection {
                             cancel_if_sink_aborted!(new_sink_error);
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
+                            row_metadata = None;
                         }
                         if sink_error.is_none() {
                             if let Some(sink) = sink.as_deref_mut() {
@@ -1747,11 +2158,14 @@ impl NzConnection {
                             );
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
+                            row_metadata = None;
                         }
                         cached_columns = Some(cols.clone());
                         nullability = None; // text path reports no nullability
                         if sink.is_none() {
                             row_columns = Some(Arc::from(cols.as_slice()));
+                            row_metadata =
+                                Some(Arc::new(RowMetadata::new(Arc::from(cols.as_slice()))));
                             current = Some(ResultSet {
                                 columns: cols,
                                 rows: Vec::new(),
@@ -1806,7 +2220,10 @@ impl NzConnection {
                             let mut values = Vec::with_capacity(columns.len());
                             parse_text_data_row_into(&data, &columns, &mut values)
                                 .map_err(NzError::Protocol)?;
-                            let row = Row::from_shared(columns, values);
+                            let metadata = row_metadata
+                                .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
+                                .clone();
+                            let row = Row::from_shared_metadata(metadata, values);
                             push_existing_row(&mut current, row, &nullability, &mut row_columns)?;
                         }
                     }
@@ -1823,6 +2240,14 @@ impl NzConnection {
                         // best-effort `col1..N` names (Node parity).
                         if current.is_none() && cached_columns.is_none() {
                             cached_columns = Some(tupdesc.to_column_descs());
+                            if sink.is_none() {
+                                row_metadata = Some(Arc::new(RowMetadata::new(Arc::from(
+                                    cached_columns
+                                        .as_ref()
+                                        .expect("columns stored above")
+                                        .as_slice(),
+                                ))));
+                            }
                         }
                         if let Some(set) = current.as_mut() {
                             set.nullability = nullability.clone();
@@ -2952,6 +3377,35 @@ mod tests {
     }
 
     #[test]
+    fn column_name_index_is_lazy_case_insensitive_and_keeps_first_duplicate() {
+        let row = Row::new(
+            vec![
+                ColumnDesc {
+                    name: "ID".into(),
+                    type_oid: 23,
+                    type_len: 4,
+                    type_mod: -1,
+                    format: 0,
+                },
+                ColumnDesc {
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_len: 4,
+                    type_mod: -1,
+                    format: 0,
+                },
+            ],
+            vec![NzValue::Int4(7), NzValue::Int4(8)],
+        );
+        assert!(row.metadata.name_index.get().is_none());
+        assert_eq!(row.try_get::<_, i32>("Id").unwrap(), 7);
+        assert!(row.metadata.name_index.get().is_some());
+        let cloned = row.clone();
+        assert!(Arc::ptr_eq(&row.metadata, &cloned.metadata));
+        assert_eq!(cloned.try_get::<_, i32>("iD").unwrap(), 7);
+    }
+
+    #[test]
     fn raw_text_row_decodes_only_requested_cells() {
         let columns: Arc<[ColumnDesc]> = Arc::from(vec![
             ColumnDesc {
@@ -2985,13 +3439,47 @@ mod tests {
             b't',
         ];
         let row = Row::from_text_raw(columns, payload).unwrap();
+        let RowStorage::Raw(raw) = &row.storage else {
+            panic!("expected raw row");
+        };
+        assert!(raw.layout_progress.lock().unwrap().spans.is_empty());
         let raw = row.try_get_raw_value(0).unwrap();
         assert_eq!(raw.as_bytes(), Some(b"4" as &[u8]));
+        let RowStorage::Raw(raw_storage) = &row.storage else {
+            panic!("expected raw row");
+        };
+        assert_eq!(raw_storage.layout_progress.lock().unwrap().spans.len(), 1);
         assert_eq!(row.try_get::<_, i32>(0).unwrap(), 4);
         let name: &str = row.try_get_raw_typed(1).unwrap();
         assert_eq!(name, "net");
+        assert_eq!(raw_storage.layout_progress.lock().unwrap().spans.len(), 2);
         assert_eq!(row.values()[0], NzValue::Int4(4));
         assert_eq!(row.values()[1], NzValue::Text("net".into()));
+    }
+
+    #[test]
+    fn raw_text_row_validates_later_columns_before_exposing_first_column() {
+        let columns: Arc<[ColumnDesc]> = Arc::from(vec![
+            ColumnDesc {
+                name: "FIRST".into(),
+                type_oid: 23,
+                type_len: 4,
+                type_mod: -1,
+                format: 0,
+            },
+            ColumnDesc {
+                name: "SECOND".into(),
+                type_oid: 25,
+                type_len: -1,
+                type_mod: -1,
+                format: 0,
+            },
+        ]);
+        let mut payload = vec![0b1100_0000];
+        payload.extend_from_slice(&5i32.to_be_bytes());
+        payload.push(b'7');
+        payload.extend_from_slice(&3i32.to_be_bytes());
+        assert!(Row::from_text_raw(columns, payload).is_err());
     }
 
     #[test]
@@ -3171,15 +3659,74 @@ mod tests {
                 bytes.push(0);
             }
             let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), bytes, desc).unwrap();
-            assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
             let RowStorage::Raw(raw) = &row.storage else {
                 panic!("expected raw row");
             };
             assert!(raw.decoded.get().is_none());
             assert!(raw.cells.get().is_none());
+            assert_eq!(raw.layout_progress.lock().unwrap().spans.len(), 1);
+            assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
+            assert_eq!(raw.layout_progress.lock().unwrap().spans.len(), 1);
             assert_eq!(row.try_get::<_, String>(1).unwrap().len(), size);
+            assert_eq!(raw.layout_progress.lock().unwrap().spans.len(), 1);
             assert_eq!(row.try_values().unwrap()[0], NzValue::Int4(123));
         }
+    }
+
+    #[test]
+    fn lazy_dbos_rows_keep_no_varying_field_fallback() {
+        let descriptor = Arc::new(DbosTupleDesc {
+            num_fields: 1,
+            num_fixed_fields: 0,
+            num_varying_fields: 0,
+            fixed_fields_size: 2,
+            field_type: vec![crate::messages::nz_type::NZ_TYPE_INT],
+            field_size: vec![4],
+            field_true_size: vec![4],
+            // The legacy fallback ignores this offset when there are no
+            // varying fields and uses fixed_fields_size instead.
+            field_offset: vec![0],
+            field_fixed_size: vec![0],
+            field_null_byte_offset: vec![0],
+            field_null_bit_mask: vec![0],
+            ..Default::default()
+        });
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&42i32.to_le_bytes());
+        let row = Row::from_dbos_raw(Arc::from(descriptor.to_column_descs()), payload, descriptor)
+            .unwrap();
+
+        assert_eq!(row.try_get::<_, i32>(0).unwrap(), 42);
+        assert_eq!(
+            row.try_get_raw_value(0).unwrap().as_bytes(),
+            Some(&42i32.to_le_bytes()[..])
+        );
+        assert_eq!(row.try_values().unwrap(), &[NzValue::Int4(42)]);
+    }
+
+    #[test]
+    fn dbos_row_validation_rejects_a_malformed_later_varying_field() {
+        let descriptor = Arc::new(DbosTupleDesc {
+            num_fields: 2,
+            num_fixed_fields: 1,
+            num_varying_fields: 1,
+            fixed_fields_size: 6,
+            field_type: vec![3, 16],
+            field_size: vec![4, 8],
+            field_true_size: vec![4, 8],
+            field_offset: vec![2, 0],
+            field_fixed_size: vec![4, 0],
+            field_null_byte_offset: vec![0, 0],
+            field_null_bit_mask: vec![0, 0],
+            ..Default::default()
+        });
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&7i32.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        assert!(
+            Row::from_dbos_raw(Arc::from(descriptor.to_column_descs()), payload, descriptor,)
+                .is_err()
+        );
     }
 
     #[test]

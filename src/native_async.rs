@@ -21,15 +21,16 @@
 //! simple-query protocol.
 
 use crate::config::{NzConnectionConfig, SecurityLevel};
-use crate::connection::{QueryResult, Row};
+use crate::connection::{QueryResult, Row, RowMetadata};
 use crate::error::{parse_backend_error_fields, validate_protocol_length, NzError, NzResult};
 use crate::messages::{code, parse_command_complete_rows};
-use crate::params::substitute_parameters;
+use crate::params::SqlTemplate;
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
-use crate::types::value::{NzValue, ToSql};
+use crate::types::text::parse_text_data_row_into;
+use crate::types::value::ToSql;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,6 +67,9 @@ const AUTH_REQ_PASSWORD: i32 = 3;
 const AUTH_REQ_MD5: i32 = 5;
 const AUTH_REQ_SHA256: i32 = 6;
 const MAX_BUFFERED_FRAME: usize = 128 * 1024 * 1024;
+const SQL_TEMPLATE_CACHE_ENTRIES: usize = 128;
+const SQL_TEMPLATE_CACHE_BYTES: usize = 1024 * 1024;
+const SQL_TEMPLATE_CACHE_ENTRY_MAX: usize = 64 * 1024;
 
 enum AsyncTransport {
     Plain(TcpStream),
@@ -73,7 +77,42 @@ enum AsyncTransport {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
-type AsyncResultSet = (Arc<[ColumnDesc]>, Vec<Row>, Option<Vec<bool>>);
+type AsyncResultSet = (
+    Arc<[ColumnDesc]>,
+    Arc<RowMetadata>,
+    Vec<Row>,
+    Option<Vec<bool>>,
+);
+
+#[derive(Debug, Clone, Copy)]
+enum RowPolicy {
+    AllRows,
+    AllRowsEager,
+    FirstExact,
+    FirstOptional,
+    Discard,
+}
+
+impl RowPolicy {
+    fn retains(self, result_set_index: usize, first_set_row_count: u64) -> bool {
+        match self {
+            Self::AllRows | Self::AllRowsEager => true,
+            Self::FirstExact | Self::FirstOptional => {
+                result_set_index == 0 && first_set_row_count == 0
+            }
+            Self::Discard => false,
+        }
+    }
+
+    fn eagerly_decodes(self) -> bool {
+        matches!(self, Self::AllRowsEager)
+    }
+}
+
+struct ParsedQueryResult {
+    result: QueryResult,
+    first_set_row_count: u64,
+}
 
 impl AsyncRead for AsyncTransport {
     fn poll_read(
@@ -183,6 +222,10 @@ struct QueuedEvent {
     value: NzResult<QueryStreamEvent>,
     _permit: OwnedSemaphorePermit,
 }
+enum QueuedStreamItem {
+    Event(QueuedEvent),
+    Rows(PooledRowBatch),
+}
 struct QueuedBatch {
     rows: Vec<Row>,
     _permit: OwnedSemaphorePermit,
@@ -190,9 +233,109 @@ struct QueuedBatch {
 const STREAM_BYTES: usize = 8 * 1024 * 1024;
 const BATCH_ROWS: usize = 256;
 const BATCH_BYTES: usize = 1024 * 1024;
+const STREAM_BATCH_ROWS: usize = 256;
+const STREAM_BATCH_BYTES: usize = 1024 * 1024;
+const STREAM_EVENT_CHANNEL_BATCHES: usize = 6;
+// A single reusable block bounds retained rows to 256, including while it is
+// queued or held by the public stream adapter.
+const STREAM_BATCH_POOL_SIZE: usize = 1;
+
+struct StreamBatchPool {
+    free: Mutex<Vec<Vec<Option<Row>>>>,
+    slots: Arc<Semaphore>,
+}
+
+impl StreamBatchPool {
+    fn new() -> Self {
+        let mut free = Vec::with_capacity(STREAM_BATCH_POOL_SIZE);
+        for _ in 0..STREAM_BATCH_POOL_SIZE {
+            free.push(Vec::with_capacity(STREAM_BATCH_ROWS));
+        }
+        Self {
+            free: Mutex::new(free),
+            slots: Arc::new(Semaphore::new(STREAM_BATCH_POOL_SIZE)),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>, control: &Control) -> Result<PooledRowBatch, ()> {
+        let generation = control.active.load(Ordering::Acquire);
+        let slot = tokio::select! {
+            biased;
+            _ = control.interrupted(generation) => return Err(()),
+            permit = self.slots.clone().acquire_owned() => permit.map_err(|_| ())?,
+        };
+        let rows = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+            .expect("batch slot permits and free buffers stay in sync");
+        Ok(PooledRowBatch {
+            pool: self.clone(),
+            rows,
+            len: 0,
+            next: 0,
+            bytes: 0,
+            row_permit: None,
+            staging_permit: None,
+            _slot: slot,
+        })
+    }
+
+    fn recycle(&self, mut rows: Vec<Option<Row>>) {
+        rows.clear();
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(rows);
+    }
+}
+
+struct PooledRowBatch {
+    pool: Arc<StreamBatchPool>,
+    rows: Vec<Option<Row>>,
+    len: usize,
+    next: usize,
+    bytes: usize,
+    row_permit: Option<OwnedSemaphorePermit>,
+    staging_permit: Option<OwnedSemaphorePermit>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl PooledRowBatch {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, row: Row, bytes: usize) {
+        debug_assert!(self.len < STREAM_BATCH_ROWS);
+        self.rows.push(Some(row));
+        self.len += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn pop_row(&mut self) -> Option<Row> {
+        let row = self.rows.get_mut(self.next)?.take()?;
+        self.next += 1;
+        Some(row)
+    }
+
+    fn drained(&self) -> bool {
+        self.next >= self.len
+    }
+}
+
+impl Drop for PooledRowBatch {
+    fn drop(&mut self) {
+        let rows = std::mem::take(&mut self.rows);
+        self.pool.recycle(rows);
+    }
+}
+
 struct EventSender {
-    sender: mpsc::Sender<QueuedEvent>,
+    sender: mpsc::Sender<QueuedStreamItem>,
     budget: Arc<Semaphore>,
+    batch_pool: Arc<StreamBatchPool>,
     control: Arc<Control>,
 }
 
@@ -237,8 +380,62 @@ impl EventSender {
                     _ => 64,
                 }.clamp(1, STREAM_BYTES) as u32;
                 let permit = self.budget.clone().acquire_many_owned(size).await.map_err(|_| ())?;
-                self.sender.send(QueuedEvent { value: event, _permit: permit }).await.map_err(|_| ())
+                self.sender.send(QueuedStreamItem::Event(QueuedEvent { value: event, _permit: permit })).await.map_err(|_| ())
             } => result,
+        }
+    }
+
+    async fn push_row(&self, batch: &mut Option<PooledRowBatch>, row: Row) -> Result<(), ()> {
+        let row_bytes = row.retained_bytes().clamp(1, STREAM_BYTES);
+        if batch.as_ref().is_some_and(|batch| {
+            !batch.is_empty()
+                && (batch.len >= STREAM_BATCH_ROWS
+                    || batch.bytes.saturating_add(row_bytes) > STREAM_BATCH_BYTES)
+        }) {
+            self.flush_rows(batch).await?;
+        }
+        if batch.is_none() {
+            let mut acquired = self.batch_pool.acquire(&self.control).await?;
+            if row_bytes <= STREAM_BATCH_BYTES {
+                let generation = self.control.active.load(Ordering::Acquire);
+                let permit = tokio::select! {
+                    biased;
+                    _ = self.control.interrupted(generation) => return Err(()),
+                    permit = self.budget.clone().acquire_many_owned(STREAM_BATCH_BYTES as u32) => permit.map_err(|_| ())?,
+                };
+                acquired.staging_permit = Some(permit);
+            }
+            *batch = Some(acquired);
+        }
+        let should_flush = {
+            let current = batch.as_mut().expect("batch acquired above");
+            current.push(row, row_bytes);
+            current.len >= STREAM_BATCH_ROWS || current.bytes >= STREAM_BATCH_BYTES
+        };
+        if should_flush {
+            self.flush_rows(batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_rows(&self, batch: &mut Option<PooledRowBatch>) -> Result<(), ()> {
+        let Some(rows) = batch.take() else {
+            return Ok(());
+        };
+        let generation = self.control.active.load(Ordering::Acquire);
+        let bytes = rows.bytes.clamp(1, STREAM_BYTES) as u32;
+        let permit = tokio::select! {
+            biased;
+            _ = self.control.interrupted(generation) => return Err(()),
+            permit = self.budget.clone().acquire_many_owned(bytes) => permit.map_err(|_| ())?,
+        };
+        let mut rows = rows;
+        rows.row_permit = Some(permit);
+        rows.staging_permit.take();
+        tokio::select! {
+            biased;
+            _ = self.control.interrupted(generation) => Err(()),
+            result = self.sender.send(QueuedStreamItem::Rows(rows)) => result.map_err(|_| ()),
         }
     }
 }
@@ -246,11 +443,11 @@ impl EventSender {
 enum Request {
     Query {
         sql: String,
-        discard: bool,
+        row_policy: RowPolicy,
         options: Option<QueryOptions>,
         import_source: Option<(String, crate::connection::ImportSource)>,
         _lease: Option<tokio::sync::OwnedMutexGuard<()>>,
-        response: Response<QueryResult>,
+        response: Response<ParsedQueryResult>,
     },
     Stream {
         sql: String,
@@ -266,7 +463,8 @@ enum Request {
 /// Bounded row stream for one query. The connection task keeps draining the
 /// wire while `poll_next` applies backpressure through the bounded channel.
 pub struct RowStream {
-    receiver: mpsc::Receiver<QueuedEvent>,
+    receiver: mpsc::Receiver<QueuedStreamItem>,
+    pending_rows: Option<PooledRowBatch>,
     notices: Arc<Mutex<NoticeHistory>>,
     terminal: Option<oneshot::Receiver<NzResult<()>>>,
     first_set_only_error: bool,
@@ -294,7 +492,8 @@ pub enum QueryStreamEvent {
 
 /// Bounded stream of rows and notices in wire order.
 pub struct QueryEventStream {
-    receiver: mpsc::Receiver<QueuedEvent>,
+    receiver: mpsc::Receiver<QueuedStreamItem>,
+    pending_rows: Option<PooledRowBatch>,
     notices: Arc<Mutex<NoticeHistory>>,
     terminal: Option<oneshot::Receiver<NzResult<()>>>,
 }
@@ -322,7 +521,7 @@ impl Stream for QueryEventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match poll_event(&mut this.receiver, cx) {
+        match poll_event(&mut this.receiver, &mut this.pending_rows, cx) {
             Poll::Ready(None) => poll_terminal(&mut this.terminal, cx),
             result => result,
         }
@@ -352,15 +551,14 @@ impl Stream for RowStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let receiver = &mut this.receiver;
         loop {
-            match poll_event(receiver, cx) {
+            match poll_event(&mut this.receiver, &mut this.pending_rows, cx) {
                 Poll::Ready(Some(Ok(QueryStreamEvent::ResultSetStart { index, .. })))
                     if index > 0 =>
                 {
                     if !this.first_set_only_error {
                         this.first_set_only_error = true;
-                        receiver.close();
+                        this.receiver.close();
                         return Poll::Ready(Some(Err(NzError::Config("query_stream only exposes the first result set; use query_stream_events".into()))));
                     }
                 }
@@ -395,12 +593,30 @@ impl Stream for RowStream {
 }
 
 fn poll_event(
-    receiver: &mut mpsc::Receiver<QueuedEvent>,
+    receiver: &mut mpsc::Receiver<QueuedStreamItem>,
+    pending_rows: &mut Option<PooledRowBatch>,
     cx: &mut Context<'_>,
 ) -> Poll<Option<NzResult<QueryStreamEvent>>> {
-    receiver
-        .poll_recv(cx)
-        .map(|event| event.map(|event| event.value))
+    loop {
+        if let Some(batch) = pending_rows.as_mut() {
+            if let Some(row) = batch.pop_row() {
+                if batch.drained() {
+                    *pending_rows = None;
+                }
+                return Poll::Ready(Some(Ok(QueryStreamEvent::Row(row))));
+            }
+            *pending_rows = None;
+        }
+
+        match receiver.poll_recv(cx) {
+            Poll::Ready(Some(QueuedStreamItem::Event(event))) => {
+                return Poll::Ready(Some(event.value));
+            }
+            Poll::Ready(Some(QueuedStreamItem::Rows(batch))) => *pending_rows = Some(batch),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        }
+    }
 }
 
 /// Batches from the bounded native row stream. A single large row is returned alone.
@@ -491,7 +707,69 @@ pub struct Client {
     requests: mpsc::Sender<Request>,
     control: Arc<Control>,
     session: Arc<tokio::sync::Mutex<()>>,
+    sql_templates: Arc<Mutex<SqlTemplateCache>>,
+    stream_batch_pool: Arc<StreamBatchPool>,
     exclusive: bool,
+}
+
+#[derive(Default)]
+struct SqlTemplateCache {
+    entries: HashMap<Arc<str>, CachedSqlTemplate>,
+    retained_bytes: usize,
+    clock: u64,
+}
+
+struct CachedSqlTemplate {
+    template: Arc<SqlTemplate>,
+    retained_bytes: usize,
+    last_used: u64,
+}
+
+impl SqlTemplateCache {
+    fn get(&mut self, sql: &str) -> Option<Arc<SqlTemplate>> {
+        self.clock = self.clock.wrapping_add(1).max(1);
+        let entry = self.entries.get_mut(sql)?;
+        entry.last_used = self.clock;
+        Some(entry.template.clone())
+    }
+
+    fn insert(&mut self, template: Arc<SqlTemplate>) {
+        let retained_bytes = template.retained_bytes();
+        if retained_bytes > SQL_TEMPLATE_CACHE_ENTRY_MAX
+            || retained_bytes > SQL_TEMPLATE_CACHE_BYTES
+        {
+            return;
+        }
+        let key = template.source();
+        if self.entries.contains_key(key.as_ref()) {
+            return;
+        }
+        while self.entries.len() >= SQL_TEMPLATE_CACHE_ENTRIES
+            || self.retained_bytes.saturating_add(retained_bytes) > SQL_TEMPLATE_CACHE_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(oldest.as_ref()) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1).max(1);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.insert(
+            key,
+            CachedSqlTemplate {
+                template,
+                retained_bytes,
+                last_used: self.clock,
+            },
+        );
+    }
 }
 
 /// Background protocol driver returned by [`connect`].
@@ -529,6 +807,8 @@ pub async fn connect(config: &NzConnectionConfig) -> NzResult<(Client, Connectio
             requests: sender,
             control: control.clone(),
             session: Arc::new(tokio::sync::Mutex::new(())),
+            sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
+            stream_batch_pool: Arc::new(StreamBatchPool::new()),
             exclusive: false,
         },
         Connection {
@@ -539,6 +819,28 @@ pub async fn connect(config: &NzConnectionConfig) -> NzResult<(Client, Connectio
 }
 
 impl Client {
+    fn render_sql(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<String, String> {
+        let cached = self
+            .sql_templates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sql);
+        let template = match cached {
+            Some(template) => template,
+            None => {
+                let template = Arc::new(SqlTemplate::parse(sql)?);
+                self.sql_templates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(template.clone());
+                template
+            }
+        };
+        template.render(params.len(), |index, output| {
+            params[index].write_sql(output)
+        })
+    }
+
     async fn acquire_session(&self) -> NzResult<Option<tokio::sync::OwnedMutexGuard<()>>> {
         if self.exclusive {
             return Ok(None);
@@ -593,7 +895,11 @@ impl Client {
     /// A multi-result response is rejected after it has been drained; use
     /// [`Client::query_multi`] for Netezza scripts.
     pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
-        let result = self.query_multi(sql, params).await?;
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        let result = self
+            .send_query(sql, RowPolicy::AllRowsEager, None)
+            .await?
+            .result;
         if result.result_sets.len() > 1 {
             return Err(NzError::Config(
                 "query returned multiple result sets; use query_multi".into(),
@@ -612,9 +918,10 @@ impl Client {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> NzResult<QueryResult> {
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
-        self.send_query(sql, false, None).await
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        self.send_query(sql, RowPolicy::AllRowsEager, None)
+            .await
+            .map(|parsed| parsed.result)
     }
 
     /// Execute with an explicit deadline independent of the connection default.
@@ -624,9 +931,11 @@ impl Client {
         params: &[&(dyn ToSql + Sync)],
         options: QueryOptions,
     ) -> NzResult<Vec<Row>> {
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
-        let result = self.send_query(sql, false, Some(options)).await?;
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        let result = self
+            .send_query(sql, RowPolicy::AllRowsEager, Some(options))
+            .await?
+            .result;
         if result.result_sets.len() > 1 {
             return Err(NzError::Config(
                 "query returned multiple result sets; use query_multi".into(),
@@ -646,11 +955,10 @@ impl Client {
         if id.is_empty() || id.contains('\0') {
             return Err(NzError::Config("invalid import identifier".into()));
         }
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
         self.send_query_with_source(
             sql,
-            true,
+            RowPolicy::Discard,
             None,
             Some((
                 id.to_owned(),
@@ -658,6 +966,7 @@ impl Client {
             )),
         )
         .await
+        .map(|parsed| parsed.result)
     }
 
     /// Start a bounded row stream for the first result set.
@@ -674,6 +983,7 @@ impl Client {
         let stream = self.query_stream_events(sql, params).await?;
         Ok(RowStream {
             receiver: stream.receiver,
+            pending_rows: stream.pending_rows,
             notices: stream.notices,
             terminal: stream.terminal,
             first_set_only_error: false,
@@ -707,6 +1017,7 @@ impl Client {
         let stream = self.start_stream(sql, params, Some(options)).await?;
         Ok(RowStream {
             receiver: stream.receiver,
+            pending_rows: stream.pending_rows,
             notices: stream.notices,
             terminal: stream.terminal,
             first_set_only_error: false,
@@ -718,9 +1029,8 @@ impl Client {
         params: &[&(dyn ToSql + Sync)],
         options: Option<QueryOptions>,
     ) -> NzResult<QueryEventStream> {
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
-        let (sender, receiver) = mpsc::channel(256);
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        let (sender, receiver) = mpsc::channel(STREAM_EVENT_CHANNEL_BATCHES);
         let notices = Arc::new(Mutex::new(NoticeHistory::default()));
         let (terminal, completion) = oneshot::channel();
         self.requests
@@ -732,6 +1042,7 @@ impl Client {
                     sender,
                     control: self.control.clone(),
                     budget: Arc::new(Semaphore::new(STREAM_BYTES)),
+                    batch_pool: self.stream_batch_pool.clone(),
                 }),
                 batch: None,
                 terminal,
@@ -741,6 +1052,7 @@ impl Client {
             .map_err(|_| NzError::Closed("connection task is closed".into()))?;
         Ok(QueryEventStream {
             receiver,
+            pending_rows: None,
             notices,
             terminal: Some(completion),
         })
@@ -752,8 +1064,7 @@ impl Client {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> NzResult<RowBatchStream> {
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
         let (sender, receiver) = mpsc::channel(16);
         let notices = Arc::new(Mutex::new(NoticeHistory::default()));
         let (terminal, completion) = oneshot::channel();
@@ -781,14 +1092,25 @@ impl Client {
     }
 
     pub async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
-        let rows = self.query(sql, params).await?;
-        if rows.len() != 1 {
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        let parsed = self.send_query(sql, RowPolicy::FirstExact, None).await?;
+        if parsed.result.result_sets.len() > 1 {
+            return Err(NzError::Config(
+                "query returned multiple result sets; use query_multi".into(),
+            ));
+        }
+        if parsed.first_set_row_count != 1 {
             return Err(NzError::Config(format!(
                 "query_one: expected one row, got {}",
-                rows.len()
+                parsed.first_set_row_count
             )));
         }
-        Ok(rows.into_iter().next().expect("one row checked above"))
+        Ok(parsed
+            .result
+            .into_rows()
+            .into_iter()
+            .next()
+            .expect("one row checked above"))
     }
 
     pub async fn query_opt(
@@ -796,10 +1118,16 @@ impl Client {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> NzResult<Option<Row>> {
-        let rows = self.query(sql, params).await?;
-        match rows.len() {
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        let parsed = self.send_query(sql, RowPolicy::FirstOptional, None).await?;
+        if parsed.result.result_sets.len() > 1 {
+            return Err(NzError::Config(
+                "query returned multiple result sets; use query_multi".into(),
+            ));
+        }
+        match parsed.first_set_row_count {
             0 => Ok(None),
-            1 => Ok(rows.into_iter().next()),
+            1 => Ok(parsed.result.into_rows().into_iter().next()),
             count => Err(NzError::Config(format!(
                 "query_opt: expected at most one row, got {count}"
             ))),
@@ -807,13 +1135,16 @@ impl Client {
     }
 
     pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
-        let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
-        let sql = substitute_parameters(sql, &values).map_err(NzError::Config)?;
-        Ok(self.send_query(sql, true, None).await?.rows_affected)
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        Ok(self
+            .send_query(sql, RowPolicy::Discard, None)
+            .await?
+            .result
+            .rows_affected)
     }
 
     pub async fn batch_execute(&self, sql: &str) -> NzResult<()> {
-        self.send_query(sql.to_owned(), true, None)
+        self.send_query(sql.to_owned(), RowPolicy::Discard, None)
             .await
             .map(|_| ())
     }
@@ -855,19 +1186,19 @@ impl Client {
     async fn send_query(
         &self,
         sql: String,
-        discard: bool,
+        row_policy: RowPolicy,
         options: Option<QueryOptions>,
-    ) -> NzResult<QueryResult> {
-        self.send_query_with_source(sql, discard, options, None)
+    ) -> NzResult<ParsedQueryResult> {
+        self.send_query_with_source(sql, row_policy, options, None)
             .await
     }
     async fn send_query_with_source(
         &self,
         sql: String,
-        discard: bool,
+        row_policy: RowPolicy,
         options: Option<QueryOptions>,
         import_source: Option<(String, crate::connection::ImportSource)>,
-    ) -> NzResult<QueryResult> {
+    ) -> NzResult<ParsedQueryResult> {
         if sql.contains('\0') {
             return Err(NzError::Config("SQL contains NUL".into()));
         }
@@ -875,7 +1206,7 @@ impl Client {
         self.requests
             .send(Request::Query {
                 sql,
-                discard,
+                row_policy,
                 options,
                 import_source,
                 _lease: self.acquire_session().await?,
@@ -1062,7 +1393,7 @@ async fn run_connection(
         let reusable = match request {
             Request::Query {
                 sql,
-                discard,
+                row_policy,
                 options,
                 import_source,
                 _lease,
@@ -1074,7 +1405,7 @@ async fn run_connection(
                 }
                 session.import_source = import_source;
                 let (result, reusable) = drive_operation(
-                    session.query_inner(&sql, discard),
+                    session.query_inner(&sql, row_policy),
                     response.closed(),
                     &control,
                     generation,
@@ -1377,7 +1708,11 @@ impl AsyncSession {
         }
     }
 
-    async fn query_inner(&mut self, sql: &str, discard: bool) -> NzResult<QueryResult> {
+    async fn query_inner(
+        &mut self,
+        sql: &str,
+        row_policy: RowPolicy,
+    ) -> NzResult<ParsedQueryResult> {
         self.command_number = (self.command_number % 100_000) + 1;
         let mut packet = Vec::with_capacity(sql.len() + 6);
         packet.push(b'P');
@@ -1388,7 +1723,8 @@ impl AsyncSession {
             .write_all(&packet)
             .await
             .map_err(NzError::Io)?;
-        self.drain_response_inner(None, None, None, discard).await
+        self.drain_response_inner(None, None, None, row_policy)
+            .await
     }
 
     async fn stream_query_inner(
@@ -1416,10 +1752,11 @@ impl AsyncSession {
         events: Option<&EventSender>,
         batch: Option<&BatchSender>,
         stream_notices: Option<&Arc<Mutex<NoticeHistory>>>,
-        discard: bool,
-    ) -> NzResult<QueryResult> {
+        row_policy: RowPolicy,
+    ) -> NzResult<ParsedQueryResult> {
         let mut set_index = 0;
         let mut row_count = 0;
+        let mut first_set_row_count = 0u64;
         let mut started = false;
         let mut result_sets = Vec::new();
         let mut current: Option<AsyncResultSet> = None;
@@ -1431,6 +1768,8 @@ impl AsyncSession {
         let mut batch_extra_result_set = false;
         let mut batch_rows = Vec::with_capacity(BATCH_ROWS);
         let mut batch_bytes = 0usize;
+        let mut event_rows: Option<PooledRowBatch> = None;
+        let mut dbos_varying_scratch = Vec::new();
 
         loop {
             let msg_type = self.read_message_type().await?;
@@ -1446,24 +1785,55 @@ impl AsyncSession {
                     let descriptor = tupdesc.as_ref().ok_or_else(|| {
                         NzError::Protocol("DBOS row received before descriptor".into())
                     })?;
-                    let payload = self.read_bytes(row_len).await?;
-                    let columns = cached_columns
-                        .clone()
-                        .unwrap_or_else(|| Arc::from(descriptor.to_column_descs()));
-                    let row = Row::from_dbos_raw(columns.clone(), payload, descriptor.clone())?;
-                    let set = current.get_or_insert_with(|| (columns, Vec::new(), None));
+                    if current.is_none() {
+                        let columns = cached_columns
+                            .clone()
+                            .unwrap_or_else(|| Arc::from(descriptor.to_column_descs()));
+                        current = Some((
+                            columns.clone(),
+                            Arc::new(RowMetadata::new(columns.clone())),
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                    let retain = events.is_some()
+                        || (batch.is_some() && !batch_extra_result_set)
+                        || row_policy.retains(set_index, first_set_row_count);
                     row_count += 1;
+                    if set_index == 0 {
+                        first_set_row_count += 1;
+                    }
+                    if !retain {
+                        self.discard_exact(row_len).await?;
+                        continue;
+                    }
+                    let payload = self.read_bytes(row_len).await?;
+                    let row_metadata = current.as_ref().expect("result set initialized").1.clone();
+                    let row = if row_policy.eagerly_decodes() {
+                        let mut values = Vec::with_capacity(
+                            current.as_ref().expect("result set initialized").0.len(),
+                        );
+                        descriptor.parse_row_into_with_scratch(
+                            &payload,
+                            &mut values,
+                            &mut dbos_varying_scratch,
+                        )?;
+                        Row::from_shared_dbos_metadata(row_metadata, values, descriptor.clone())
+                    } else {
+                        Row::from_dbos_raw_with_metadata(row_metadata, payload, descriptor.clone())?
+                    };
+                    let set = current.as_mut().expect("result set initialized");
                     if let Some(events) = events {
-                        emit_result_start(events, set_index, &set.0, &set.2, &mut started).await;
-                        let _ = events.send(Ok(QueryStreamEvent::Row(row))).await;
+                        emit_result_start(events, set_index, &set.0, &set.3, &mut started).await;
+                        let _ = events.push_row(&mut event_rows, row).await;
                     } else if let Some(batch) = batch {
                         if !batch_extra_result_set {
                             let _ =
                                 push_stream_batch(batch, &mut batch_rows, &mut batch_bytes, row)
                                     .await;
                         }
-                    } else if !discard {
-                        set.1.push(row);
+                    } else {
+                        set.2.push(row);
                     }
                     continue;
                 }
@@ -1504,6 +1874,7 @@ impl AsyncSession {
                         &mut current,
                         events,
                         batch,
+                        &mut event_rows,
                         &mut batch_rows,
                         &mut batch_bytes,
                         &mut set_index,
@@ -1517,13 +1888,13 @@ impl AsyncSession {
                     let columns: Arc<[ColumnDesc]> = Arc::from(parse_row_description(&data)?);
                     cached_columns = Some(columns.clone());
                     tupdesc = None;
-                    current = Some((columns, Vec::new(), None));
+                    let metadata = Arc::new(RowMetadata::new(columns.clone()));
+                    current = Some((columns, metadata, Vec::new(), None));
                 }
                 code::DATA_ROW => {
                     let len =
                         validate_protocol_length(self.read_i32().await?, "dataRowPayload", false)?
                             as usize;
-                    let data = self.read_bytes(len).await?;
                     let columns = current
                         .as_ref()
                         .map(|set| set.0.clone())
@@ -1531,20 +1902,48 @@ impl AsyncSession {
                         .ok_or_else(|| {
                             NzError::Protocol("DataRow received before RowDescription".into())
                         })?;
-                    let row = Row::from_text_raw(columns.clone(), data)?;
-                    let set = current.get_or_insert_with(|| (columns, Vec::new(), None));
+                    if current.is_none() {
+                        current = Some((
+                            columns.clone(),
+                            Arc::new(RowMetadata::new(columns.clone())),
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                    let retain = events.is_some()
+                        || (batch.is_some() && !batch_extra_result_set)
+                        || row_policy.retains(set_index, first_set_row_count);
                     row_count += 1;
+                    if set_index == 0 {
+                        first_set_row_count += 1;
+                    }
+                    if !retain {
+                        self.discard_exact(len).await?;
+                        continue;
+                    }
+                    let data = self.read_bytes(len).await?;
+                    let row_metadata = current.as_ref().expect("result set initialized").1.clone();
+                    let row = if row_policy.eagerly_decodes() {
+                        let columns = current.as_ref().expect("result set initialized").0.as_ref();
+                        let mut values = Vec::with_capacity(columns.len());
+                        parse_text_data_row_into(&data, columns, &mut values)
+                            .map_err(NzError::Protocol)?;
+                        Row::from_shared_metadata(row_metadata, values)
+                    } else {
+                        Row::from_text_raw_with_metadata(row_metadata, data)?
+                    };
+                    let set = current.as_mut().expect("result set initialized");
                     if let Some(events) = events {
-                        emit_result_start(events, set_index, &set.0, &set.2, &mut started).await;
-                        let _ = events.send(Ok(QueryStreamEvent::Row(row))).await;
+                        emit_result_start(events, set_index, &set.0, &set.3, &mut started).await;
+                        let _ = events.push_row(&mut event_rows, row).await;
                     } else if let Some(batch) = batch {
                         if !batch_extra_result_set {
                             let _ =
                                 push_stream_batch(batch, &mut batch_rows, &mut batch_bytes, row)
                                     .await;
                         }
-                    } else if !discard {
-                        set.1.push(row);
+                    } else {
+                        set.2.push(row);
                     }
                 }
                 code::ROW_DESCRIPTION_STANDARD => {
@@ -1560,8 +1959,12 @@ impl AsyncSession {
                         .clone()
                         .unwrap_or_else(|| Arc::from(descriptor.to_column_descs()));
                     tupdesc = Some(descriptor);
-                    let set = current.get_or_insert_with(|| (columns, Vec::new(), None));
-                    set.2 = Some(
+                    let metadata = current
+                        .as_ref()
+                        .map(|set| set.1.clone())
+                        .unwrap_or_else(|| Arc::new(RowMetadata::new(columns.clone())));
+                    let set = current.get_or_insert_with(|| (columns, metadata, Vec::new(), None));
+                    set.3 = Some(
                         tupdesc
                             .as_ref()
                             .expect("descriptor stored above")
@@ -1592,9 +1995,10 @@ impl AsyncSession {
                     }
                     if let Some(events) = events {
                         if let Some(set) = &current {
-                            emit_result_start(events, set_index, &set.0, &set.2, &mut started)
+                            emit_result_start(events, set_index, &set.0, &set.3, &mut started)
                                 .await;
                         }
+                        let _ = events.flush_rows(&mut event_rows).await;
                         let _ = events
                             .send(Ok(QueryStreamEvent::CommandComplete {
                                 tag: text.trim_matches('\0').to_owned(),
@@ -1607,6 +2011,7 @@ impl AsyncSession {
                         &mut current,
                         events,
                         batch,
+                        &mut event_rows,
                         &mut batch_rows,
                         &mut batch_bytes,
                         &mut set_index,
@@ -1628,6 +2033,7 @@ impl AsyncSession {
                             }
                         }
                         if let Some(events) = events {
+                            let _ = events.flush_rows(&mut event_rows).await;
                             let _ = events.send(Ok(QueryStreamEvent::Notice(message))).await;
                         } else if batch.is_none() {
                             notices.push(message);
@@ -1654,6 +2060,7 @@ impl AsyncSession {
                         &mut current,
                         events,
                         batch,
+                        &mut event_rows,
                         &mut batch_rows,
                         &mut batch_bytes,
                         &mut set_index,
@@ -1669,10 +2076,13 @@ impl AsyncSession {
                             "query_batches only exposes the first result set; use query_stream_events for multiple result sets".into(),
                         ));
                     }
-                    return Ok(QueryResult {
-                        result_sets,
-                        rows_affected,
-                        notices,
+                    return Ok(ParsedQueryResult {
+                        result: QueryResult {
+                            result_sets,
+                            rows_affected,
+                            notices,
+                        },
+                        first_set_row_count,
                     });
                 }
                 code::CONTROL_ZERO | code::CONTROL_A => {}
@@ -1700,7 +2110,7 @@ impl AsyncSession {
         batch: Option<&BatchSender>,
         notices: &Arc<Mutex<NoticeHistory>>,
     ) -> NzResult<()> {
-        self.drain_response_inner(events, batch, Some(notices), false)
+        self.drain_response_inner(events, batch, Some(notices), RowPolicy::AllRows)
             .await
             .map(|_| ())
     }
@@ -1930,6 +2340,31 @@ impl AsyncSession {
     async fn skip_bytes(&mut self, length: usize) -> NzResult<()> {
         self.fill(length).await?;
         self.buffer.advance(length);
+        Ok(())
+    }
+
+    /// Consume a known payload without retaining it. Bytes already read ahead
+    /// are advanced in place; the remainder is drained through a fixed-size
+    /// scratch buffer so large discarded rows never grow `self.buffer`.
+    async fn discard_exact(&mut self, length: usize) -> NzResult<()> {
+        let buffered = length.min(self.buffer.len());
+        self.buffer.advance(buffered);
+        let mut remaining = length - buffered;
+        let mut scratch = [0u8; 16 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(scratch.len());
+            let read = self
+                .stream_mut()?
+                .read(&mut scratch[..take])
+                .await
+                .map_err(NzError::Io)?;
+            if read == 0 {
+                return Err(NzError::Closed(
+                    "socket closed while discarding async row".into(),
+                ));
+            }
+            remaining -= read;
+        }
         Ok(())
     }
 
@@ -2216,16 +2651,20 @@ async fn finish_response_set(
     current: &mut Option<AsyncResultSet>,
     events: Option<&EventSender>,
     batch: Option<&BatchSender>,
+    event_rows: &mut Option<PooledRowBatch>,
     batch_rows: &mut Vec<Row>,
     batch_bytes: &mut usize,
     index: &mut usize,
     rows: &mut u64,
     started: &mut bool,
 ) {
-    if let Some((columns, values, nullability)) = current.take() {
-        if let Some(batch) = batch {
-            let _ = flush_stream_batch(batch, batch_rows, batch_bytes).await;
-        }
+    if let Some(events) = events {
+        let _ = events.flush_rows(event_rows).await;
+    }
+    if let Some(batch) = batch {
+        let _ = flush_stream_batch(batch, batch_rows, batch_bytes).await;
+    }
+    if let Some((columns, _metadata, values, nullability)) = current.take() {
         if let Some(events) = events {
             emit_result_start(events, *index, &columns, &nullability, started).await;
             let _ = events
@@ -2282,6 +2721,96 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::value::NzValue;
+
+    fn test_client() -> Client {
+        let (requests, _receiver) = mpsc::channel(1);
+        Client {
+            requests,
+            control: Arc::new(Control::default()),
+            session: Arc::new(tokio::sync::Mutex::new(())),
+            sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
+            stream_batch_pool: Arc::new(StreamBatchPool::new()),
+            exclusive: false,
+        }
+    }
+
+    #[test]
+    fn sql_template_cache_is_lru_and_bounded_by_entries_and_bytes() {
+        let mut cache = SqlTemplateCache::default();
+        for index in 0..SQL_TEMPLATE_CACHE_ENTRIES {
+            cache.insert(Arc::new(
+                SqlTemplate::parse(&format!("SELECT {index}, $1")).unwrap(),
+            ));
+        }
+        assert_eq!(cache.entries.len(), SQL_TEMPLATE_CACHE_ENTRIES);
+        assert!(cache.get("SELECT 0, $1").is_some());
+        cache.insert(Arc::new(SqlTemplate::parse("SELECT 128, $1").unwrap()));
+        assert!(cache.get("SELECT 0, $1").is_some());
+        assert!(cache.get("SELECT 1, $1").is_none());
+        assert_eq!(cache.entries.len(), SQL_TEMPLATE_CACHE_ENTRIES);
+
+        let before = cache.entries.len();
+        let oversized = format!("SELECT {}", "x".repeat(SQL_TEMPLATE_CACHE_ENTRY_MAX));
+        cache.insert(Arc::new(SqlTemplate::parse(&oversized).unwrap()));
+        assert_eq!(cache.entries.len(), before);
+
+        for index in 0..20 {
+            let sql = format!("SELECT {index} {}", "y".repeat(60 * 1024));
+            cache.insert(Arc::new(SqlTemplate::parse(&sql).unwrap()));
+        }
+        assert!(cache.retained_bytes <= SQL_TEMPLATE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn native_sql_renderer_calls_to_sql_writer_and_reuses_template() {
+        #[derive(Debug)]
+        struct DirectLiteral(&'static str);
+
+        impl ToSql for DirectLiteral {
+            fn to_nz_value(&self) -> NzValue {
+                panic!("native renderer should call write_sql directly")
+            }
+
+            fn write_sql(&self, output: &mut String) -> Result<(), String> {
+                output.push_str(self.0);
+                Ok(())
+            }
+        }
+
+        let client = test_client();
+        let first = DirectLiteral("41");
+        let second = DirectLiteral("42");
+        assert_eq!(
+            client
+                .render_sql("SELECT $1", &[&first as &(dyn ToSql + Sync)])
+                .unwrap(),
+            "SELECT 41"
+        );
+        assert_eq!(
+            client
+                .render_sql("SELECT $1", &[&second as &(dyn ToSql + Sync)])
+                .unwrap(),
+            "SELECT 42"
+        );
+        assert_eq!(client.sql_templates.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn first_row_policies_keep_one_row_and_discard_every_tail_row() {
+        assert!(RowPolicy::AllRows.retains(0, 0));
+        assert!(RowPolicy::AllRows.retains(4, 10));
+        assert!(!RowPolicy::AllRows.eagerly_decodes());
+        assert!(RowPolicy::AllRowsEager.retains(0, 0));
+        assert!(RowPolicy::AllRowsEager.eagerly_decodes());
+        assert!(RowPolicy::FirstExact.retains(0, 0));
+        assert!(!RowPolicy::FirstExact.retains(0, 1));
+        assert!(!RowPolicy::FirstExact.retains(1, 0));
+        assert!(RowPolicy::FirstOptional.retains(0, 0));
+        assert!(!RowPolicy::FirstOptional.retains(0, 1));
+        assert!(!RowPolicy::Discard.retains(0, 0));
+    }
+
     #[test]
     fn notice_history_caps_bytes_count_and_records_evictions() {
         let mut history = NoticeHistory::default();
@@ -2306,6 +2835,7 @@ mod tests {
             sender,
             control,
             budget: Arc::new(Semaphore::new(1024)),
+            batch_pool: Arc::new(StreamBatchPool::new()),
         });
         events
             .send(Ok(QueryStreamEvent::Notice("x".repeat(700))))
@@ -2326,6 +2856,121 @@ mod tests {
             .unwrap();
         drop(receiver.recv().await.unwrap());
         assert_eq!(events.budget.available_permits(), 1024);
+    }
+
+    #[tokio::test]
+    async fn native_event_stream_batches_rows_and_flattens_them_in_order() {
+        let control = Arc::new(Control::default());
+        control.active.store(1, Ordering::Release);
+        let budget = Arc::new(Semaphore::new(16 * 1024 * 1024));
+        let initial_permits = budget.available_permits();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let batch_pool = Arc::new(StreamBatchPool::new());
+        let events = EventSender {
+            sender,
+            control,
+            budget: budget.clone(),
+            batch_pool: batch_pool.clone(),
+        };
+
+        events
+            .send(Ok(QueryStreamEvent::Notice("before".into())))
+            .await
+            .unwrap();
+        let mut producer_batch = None;
+        for value in 0..STREAM_BATCH_ROWS {
+            events
+                .push_row(
+                    &mut producer_batch,
+                    Row::new(
+                        vec![ColumnDesc {
+                            name: "ONE".into(),
+                            type_oid: 23,
+                            type_len: 4,
+                            type_mod: -1,
+                            format: 0,
+                        }],
+                        vec![NzValue::Int4(value as i32)],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(producer_batch.is_none());
+        assert_eq!(batch_pool.slots.available_permits(), 0);
+        assert_eq!(receiver.len(), 2, "one notice and one row batch are queued");
+        events
+            .send(Ok(QueryStreamEvent::Notice("after".into())))
+            .await
+            .unwrap();
+
+        let mut pending_rows = None;
+        let mut delivered = Vec::new();
+        while let Some(event) =
+            std::future::poll_fn(|cx| poll_event(&mut receiver, &mut pending_rows, cx)).await
+        {
+            match event.unwrap() {
+                QueryStreamEvent::Notice(message) => delivered.push(message),
+                QueryStreamEvent::Row(row) => {
+                    delivered.push(row.try_get::<_, i32>(0).unwrap().to_string());
+                    if !pending_rows.as_ref().is_some_and(PooledRowBatch::drained) {
+                        assert!(budget.available_permits() < initial_permits);
+                    }
+                }
+                _ => panic!("unexpected event in row batching test"),
+            }
+            if delivered.len() == STREAM_BATCH_ROWS + 2 {
+                break;
+            }
+        }
+
+        let mut expected = vec!["before".to_owned()];
+        expected.extend((0..STREAM_BATCH_ROWS).map(|value| value.to_string()));
+        expected.push("after".to_owned());
+        assert_eq!(delivered, expected);
+        assert_eq!(budget.available_permits(), initial_permits);
+        assert_eq!(batch_pool.slots.available_permits(), STREAM_BATCH_POOL_SIZE);
+        assert_eq!(
+            batch_pool.free.lock().unwrap().len(),
+            STREAM_BATCH_POOL_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn native_event_stream_sends_oversized_row_as_a_singleton() {
+        let control = Arc::new(Control::default());
+        control.active.store(1, Ordering::Release);
+        let budget = Arc::new(Semaphore::new(STREAM_BYTES));
+        let batch_pool = Arc::new(StreamBatchPool::new());
+        let (sender, mut receiver) = mpsc::channel(2);
+        let events = EventSender {
+            sender,
+            control,
+            budget: budget.clone(),
+            batch_pool: batch_pool.clone(),
+        };
+        let mut pending = None;
+        let row = Row::new(
+            vec![ColumnDesc {
+                name: "TXT".into(),
+                type_oid: 1043,
+                type_len: -1,
+                type_mod: -1,
+                format: 0,
+            }],
+            vec![NzValue::Text("x".repeat(STREAM_BATCH_BYTES + 1))],
+        );
+
+        events.push_row(&mut pending, row).await.unwrap();
+        assert!(pending.is_none());
+        let Some(QueuedStreamItem::Rows(batch)) = receiver.recv().await else {
+            panic!("expected one streamed row batch");
+        };
+        assert_eq!(batch.len, 1);
+        assert!(batch.bytes > STREAM_BATCH_BYTES);
+        drop(batch);
+        assert_eq!(budget.available_permits(), STREAM_BYTES);
+        assert_eq!(batch_pool.slots.available_permits(), STREAM_BATCH_POOL_SIZE);
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ ssl = [
 
 [dependencies]
 bytes = "1.12"
+hashbrown = "0.17.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 futures-core = "0.3.34"
 md5 = "0.8"
@@ -73,6 +74,10 @@ path = "tests/mock_server.rs"
 required-features = ["compat"]
 
 [[test]]
+name = "native_async"
+path = "tests/native_async.rs"
+
+[[test]]
 name = "nzpy_extended_performance"
 path = "tests/nzpy_extended_performance.rs"
 required-features = ["compat"]
@@ -80,7 +85,6 @@ required-features = ["compat"]
 [[test]]
 name = "perf_fact200k"
 path = "tests/perf_fact200k.rs"
-required-features = ["compat"]
 
 [[example]]
 name = "cross_driver_compat"

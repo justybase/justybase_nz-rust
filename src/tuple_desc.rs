@@ -185,14 +185,6 @@ pub struct DbosTupleDesc {
     pub euro_dates: i32,
 }
 
-/// Validated field locations for one DBOS row. The descriptor remains shared;
-/// only varying-field offsets and the row's NULL bits are row-specific.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DbosFieldLayout {
-    pub start: usize,
-    pub is_null: bool,
-}
-
 impl DbosTupleDesc {
     fn validate_row_bitmap(&self, row: &[u8]) -> NzResult<()> {
         let vectors = [
@@ -399,106 +391,100 @@ impl DbosTupleDesc {
         (row[byte_off] & self.field_null_bit_mask[field_ix]) != 0
     }
 
-    /// Validate and locate every field without decoding its value. This is
-    /// the lazy-row counterpart of `parse_row_into_with_scratch`.
-    pub(crate) fn row_layout(&self, row: &[u8]) -> NzResult<Vec<DbosFieldLayout>> {
+    pub(crate) fn is_field_null(&self, row: &[u8], field_ix: usize) -> bool {
+        self.is_null(row, 0, field_ix)
+    }
+
+    /// Validate row structure and return compact varying-field spans for reuse.
+    pub(crate) fn validate_row_layout(&self, row: &[u8]) -> NzResult<Vec<u64>> {
         self.validate_row_bitmap(row)?;
         let num_varying = self.num_varying_fields.max(0) as usize;
-        let mut var_starts = Vec::with_capacity(num_varying);
-        if num_varying > 0 {
-            let fixed_size = self.fixed_fields_size;
-            if fixed_size < 0 {
-                return Err(NzError::Protocol(
+        let mut varying_spans = Vec::with_capacity(num_varying);
+        let mut cursor = if num_varying == 0 {
+            0
+        } else {
+            usize::try_from(self.fixed_fields_size).map_err(|_| {
+                NzError::Protocol(
                     "Invalid RowStandard payload: fixed-field area offset is invalid; reconnect is required.".into(),
-                ));
+                )
+            })?
+        };
+        for varying_index in 0..num_varying {
+            if cursor.checked_add(2).is_none_or(|end| end > row.len()) {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: varying field {varying_index} length prefix is truncated; reconnect is required."
+                )));
             }
-            let mut voff = fixed_size as usize;
-            for j in 0..num_varying {
-                if voff + 2 > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {j} length prefix is truncated; reconnect is required."
-                    )));
-                }
-                var_starts.push(voff);
-                let vlen = u16::from_le_bytes(row[voff..voff + 2].try_into().unwrap()) as usize;
-                if vlen < 2 || voff + vlen > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {j} length is invalid; reconnect is required."
-                    )));
-                }
-                voff += vlen;
-                if !vlen.is_multiple_of(2) {
-                    voff += 1;
-                }
-                if voff > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {j} padding is truncated; reconnect is required."
-                    )));
-                }
+            let encoded = u16::from_le_bytes(row[cursor..cursor + 2].try_into().unwrap()) as usize;
+            let value_end = cursor.checked_add(encoded);
+            if encoded < 2 || value_end.is_none_or(|end| end > row.len()) {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: varying field {varying_index} length is invalid; reconnect is required."
+                )));
+            }
+            let value_end = value_end.expect("validated above");
+            let start = u32::try_from(cursor).map_err(|_| {
+                NzError::Protocol(
+                    "Invalid RowStandard payload: varying field offset is out of range; reconnect is required.".into(),
+                )
+            })?;
+            let end = u32::try_from(value_end).map_err(|_| {
+                NzError::Protocol(
+                    "Invalid RowStandard payload: varying field end is out of range; reconnect is required.".into(),
+                )
+            })?;
+            varying_spans.push(((start as u64) << 32) | end as u64);
+            cursor = value_end;
+            if !encoded.is_multiple_of(2) {
+                cursor += 1;
+            }
+            if cursor > row.len() {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: varying field {varying_index} padding is truncated; reconnect is required."
+                )));
             }
         }
 
-        let mut layout = Vec::with_capacity(self.num_fields);
-        for i in 0..self.num_fields {
-            let is_null = self.is_null(row, 0, i);
-            if is_null {
-                layout.push(DbosFieldLayout { start: 0, is_null });
+        for field in 0..self.num_fields {
+            if self.is_null(row, 0, field) {
                 continue;
             }
-            let fixed_size = self.field_fixed_size[i];
-            let field_start = if fixed_size != 0 {
+            let fixed_size = self.field_fixed_size[field];
+            if fixed_size != 0 {
                 if fixed_size < 0 {
                     return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} size is invalid; reconnect is required."
+                        "Invalid RowStandard payload: fixed field {field} size is invalid; reconnect is required."
                     )));
                 }
-                let off = self.field_offset[i];
-                if off < 0 {
+                let offset = self.field_offset[field];
+                if offset < 0 {
                     return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} offset is invalid; reconnect is required."
+                        "Invalid RowStandard payload: fixed field {field} offset is invalid; reconnect is required."
                     )));
                 }
-                let off = off as usize;
-                if off
-                    .checked_add(self.fixed_width(i)?)
+                let offset = offset as usize;
+                if offset
+                    .checked_add(self.fixed_width(field)?)
                     .is_none_or(|end| end > row.len())
                 {
                     return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} extends beyond the row; reconnect is required."
+                        "Invalid RowStandard payload: fixed field {field} extends beyond the row; reconnect is required."
                     )));
                 }
-                off
-            } else if !var_starts.is_empty() {
-                let var_index = self.field_offset[i];
-                if var_index < 0 || var_index as usize >= num_varying {
+            } else if num_varying > 0 {
+                let varying_index = self.field_offset[field];
+                if varying_index < 0 || varying_index as usize >= num_varying {
                     return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {i} index is invalid; reconnect is required."
+                        "Invalid RowStandard payload: varying field {field} index is invalid; reconnect is required."
                     )));
                 }
-                let start = var_starts[var_index as usize];
-                let encoded =
-                    u16::from_le_bytes(row[start..start + 2].try_into().unwrap()) as usize;
-                if encoded < 2 || start.checked_add(encoded).is_none_or(|end| end > row.len()) {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {i} extends beyond the row; reconnect is required."
-                    )));
-                }
-                start
-            } else {
-                let fixed = self.fixed_fields_size;
-                if fixed < 0 || fixed as usize > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: field {i} starts outside the row; reconnect is required."
-                    )));
-                }
-                fixed as usize
-            };
-            layout.push(DbosFieldLayout {
-                start: field_start,
-                is_null,
-            });
+            } else if self.fixed_fields_size < 0 || self.fixed_fields_size as usize > row.len() {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: field {field} starts outside the row; reconnect is required."
+                )));
+            }
         }
-        Ok(layout)
+        Ok(varying_spans)
     }
 
     /// Parse one binary row (`Y` payload, after the 8-byte DBOS header).

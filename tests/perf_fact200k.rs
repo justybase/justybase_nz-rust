@@ -3,6 +3,8 @@
 //! Opt-in so the default suite stays appliance-independent:
 //! - replay (no database): `NZ_RUN_REPLAY_PERF=1`
 //! - live (real appliance): `NZ_RUN_PERF_TESTS=1` + `NZ_DEV_*`
+//! - disable RSS sampling to isolate timing: `NZ_PERF_SAMPLE_RSS=0`
+//! - isolate the primary native stream: `NZ_PERF_NATIVE_STREAM_ONLY=1`
 //!
 //! The replay fixture is the *shared* `.nzreplay.gz` file recorded by the C#
 //! `tools/NzReplayCapture` (`NZRP` v2 + GZip + .NET `BinaryReader` framing).
@@ -17,14 +19,20 @@
 //! while the connection is already open and the server thread is idle, so
 //! the numbers reflect the client read/decode path.
 
-use nz_rust::{NzConnection, NzConnectionConfig, NzValue, QueryStreamSink};
+use futures_core::Stream;
+use nz_rust::{Client, NzConnectionConfig};
+#[cfg(feature = "compat")]
+use nz_rust::{NzConnection, NzValue, QueryStreamSink};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
-use std::io::{Read, Write};
+use std::future::poll_fn;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // -- counting allocator ------------------------------------------------------
 
@@ -54,6 +62,88 @@ fn reset_counters() {
     ALLOC_BYTES.store(0, Ordering::SeqCst);
     ALLOC_COUNT.store(0, Ordering::SeqCst);
     DEALLOC_BYTES.store(0, Ordering::SeqCst);
+}
+
+/// Samples resident memory during one measurement. `/proc/self/status` is
+/// read into a stack buffer so the sampler does not add per-sample allocations.
+struct RssSampler {
+    stop: Option<Arc<AtomicBool>>,
+    peak_kib: Option<Arc<AtomicU64>>,
+    start_kib: u64,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+fn read_rss_kib(status: &mut std::fs::File, buffer: &mut [u8; 4096]) -> Option<u64> {
+    status.seek(SeekFrom::Start(0)).ok()?;
+    let length = status.read(buffer).ok()?;
+    for line in buffer[..length].split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"VmRSS:") else {
+            continue;
+        };
+        let start = value.iter().position(|byte| !byte.is_ascii_whitespace())?;
+        let end = value[start..]
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .map_or(value.len(), |offset| start + offset);
+        return std::str::from_utf8(&value[start..end]).ok()?.parse().ok();
+    }
+    None
+}
+
+impl RssSampler {
+    fn start() -> Self {
+        if env::var("NZ_PERF_SAMPLE_RSS").ok().as_deref() == Some("0") {
+            return Self {
+                stop: None,
+                peak_kib: None,
+                start_kib: 0,
+                worker: None,
+            };
+        }
+        let Ok(mut status) = std::fs::File::open("/proc/self/status") else {
+            return Self {
+                stop: None,
+                peak_kib: None,
+                start_kib: 0,
+                worker: None,
+            };
+        };
+        let mut buffer = [0; 4096];
+        let initial_peak = read_rss_kib(&mut status, &mut buffer).unwrap_or_default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak_kib = Arc::new(AtomicU64::new(initial_peak));
+        let worker_stop = Arc::clone(&stop);
+        let worker_peak = Arc::clone(&peak_kib);
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while !worker_stop.load(Ordering::Relaxed) {
+                if let Some(rss_kib) = read_rss_kib(&mut status, &mut buffer) {
+                    worker_peak.fetch_max(rss_kib, Ordering::Relaxed);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self {
+            stop: Some(stop),
+            peak_kib: Some(peak_kib),
+            start_kib: initial_peak,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> (u64, u64) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let peak_kib = self
+            .peak_kib
+            .take()
+            .map_or(0, |peak_kib| peak_kib.load(Ordering::Relaxed));
+        (self.start_kib, peak_kib)
+    }
 }
 
 // -- NZRP fixture parsing (.NET BinaryReader framing) -------------------------
@@ -256,9 +346,13 @@ struct Sample {
     alloc_bytes: u64,
     alloc_count: u64,
     dealloc_bytes: u64,
+    start_rss_kib: u64,
+    peak_rss_kib: u64,
 }
 
+#[cfg(feature = "compat")]
 fn run_measured_query(conn: &mut NzConnection, sql: &str) -> Sample {
+    let rss_sampler = RssSampler::start();
     reset_counters();
     let start = Instant::now();
     let result = conn.query(sql, &[]).expect("query");
@@ -267,30 +361,23 @@ fn run_measured_query(conn: &mut NzConnection, sql: &str) -> Sample {
     // process-global counters also see the replay server thread's per-query
     // packet parse (~1 small `Vec`), negligible next to ~1M row allocs.
     let cells: usize = result.rows().iter().map(|row| row.values().len()).sum();
-    let ms = start.elapsed().as_secs_f64() * 1000.0;
     let rows = result.rows().len();
     let cols = result
         .rows()
         .first()
         .map(|row| row.columns().len())
         .unwrap_or(0);
-    Sample {
-        ms,
-        rows,
-        cols,
-        cells,
-        alloc_bytes: ALLOC_BYTES.load(Ordering::SeqCst),
-        alloc_count: ALLOC_COUNT.load(Ordering::SeqCst),
-        dealloc_bytes: DEALLOC_BYTES.load(Ordering::SeqCst),
-    }
+    finish_sample(start, rows, cols, cells, rss_sampler)
 }
 
 fn print_sample(tag: &str, run: usize, s: &Sample) {
     let rows_per_s = s.rows as f64 / (s.ms / 1000.0);
     println!(
         "{tag} run={run} query_ms={ms:.1} rows={rows} cols={cols} cells={cells} \
-         rows_per_s={rps:.1} alloc_bytes={ab} alloc_count={ac} \
-         bytes_per_row={bpr:.1} bytes_per_cell={bpc:.1} net_bytes={net}",
+         rows_per_s={rps:.1} ns_per_row={npr:.1} alloc_bytes={ab} alloc_count={ac} \
+         allocs_per_row={apr:.3} bytes_per_row={bpr:.1} bytes_per_cell={bpc:.1} \
+         allocs_per_cell={apc:.3} net_bytes={net} rss_start_kib={rss_start} \
+         rss_peak_kib={rss_peak} rss_growth_kib={rss_growth}",
         tag = tag,
         run = run,
         ms = s.ms,
@@ -298,11 +385,17 @@ fn print_sample(tag: &str, run: usize, s: &Sample) {
         cols = s.cols,
         cells = s.cells,
         rps = rows_per_s,
+        npr = s.ms * 1_000_000.0 / s.rows.max(1) as f64,
         ab = s.alloc_bytes,
         ac = s.alloc_count,
+        apr = s.alloc_count as f64 / s.rows.max(1) as f64,
+        apc = s.alloc_count as f64 / s.cells.max(1) as f64,
         bpr = s.alloc_bytes as f64 / s.rows.max(1) as f64,
         bpc = s.alloc_bytes as f64 / s.cells.max(1) as f64,
         net = s.alloc_bytes as i64 - s.dealloc_bytes as i64,
+        rss_start = s.start_rss_kib,
+        rss_peak = s.peak_rss_kib,
+        rss_growth = s.peak_rss_kib.saturating_sub(s.start_rss_kib),
     );
 }
 
@@ -310,6 +403,7 @@ fn env_or(name: &str, fallback: &str) -> String {
     env::var(name).unwrap_or_else(|_| fallback.to_string())
 }
 
+#[cfg(feature = "compat")]
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -318,11 +412,13 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// Streaming sink mirroring the C# bench loop (`while Read(): GetValue(i)`
 /// on every cell) without retaining rows — the apples-to-apples counterpart
 /// of `ReplayReaderBench.Sync_GetValue` / `LiveFact200kBench`.
+#[cfg(feature = "compat")]
 struct TouchSink {
     rows: usize,
     cells: usize,
 }
 
+#[cfg(feature = "compat")]
 impl QueryStreamSink for TouchSink {
     fn on_columns(
         &mut self,
@@ -350,26 +446,203 @@ impl QueryStreamSink for TouchSink {
     }
 }
 
+#[cfg(feature = "compat")]
 fn run_streaming_query(conn: &mut NzConnection, sql: &str) -> Sample {
     let mut sink = TouchSink { rows: 0, cells: 0 };
+    let rss_sampler = RssSampler::start();
     reset_counters();
     let start = Instant::now();
     let summary = conn
         .execute_stream(sql, &[], &mut sink)
         .expect("streaming query");
-    let ms = start.elapsed().as_secs_f64() * 1000.0;
     let rows = sink.rows;
     let cols = sink.cells.checked_div(rows.max(1)).unwrap_or(0);
     let _ = summary;
+    finish_sample(start, rows, cols, sink.cells, rss_sampler)
+}
+
+fn finish_sample(
+    start: Instant,
+    rows: usize,
+    cols: usize,
+    cells: usize,
+    rss_sampler: RssSampler,
+) -> Sample {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    let alloc_bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+    let alloc_count = ALLOC_COUNT.load(Ordering::SeqCst);
+    let dealloc_bytes = DEALLOC_BYTES.load(Ordering::SeqCst);
+    let (start_rss_kib, peak_rss_kib) = rss_sampler.finish();
     Sample {
         ms,
         rows,
         cols,
-        cells: sink.cells,
-        alloc_bytes: ALLOC_BYTES.load(Ordering::SeqCst),
-        alloc_count: ALLOC_COUNT.load(Ordering::SeqCst),
-        dealloc_bytes: DEALLOC_BYTES.load(Ordering::SeqCst),
+        cells,
+        alloc_bytes,
+        alloc_count,
+        dealloc_bytes,
+        start_rss_kib,
+        peak_rss_kib,
     }
+}
+
+async fn next_native_item<S: Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
+    poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
+}
+
+async fn measure_native_query(client: &Client, sql: &str) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let rows = client.query(sql, &[]).await.expect("native query");
+    let mut cells = 0;
+    for row in &rows {
+        let values = row.try_values().expect("decode native buffered row");
+        cells += values.len();
+        std::hint::black_box(values);
+    }
+    finish_sample(
+        start,
+        rows.len(),
+        rows.first().map_or(0, |row| row.columns().len()),
+        cells,
+        rss_sampler,
+    )
+}
+
+async fn measure_native_query_multi(client: &Client, sql: &str) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let result = client
+        .query_multi(sql, &[])
+        .await
+        .expect("native query_multi");
+    let rows = result.rows();
+    let mut cells = 0;
+    for row in rows {
+        let values = row.try_values().expect("decode native buffered row");
+        cells += values.len();
+        std::hint::black_box(values);
+    }
+    finish_sample(
+        start,
+        rows.len(),
+        rows.first().map_or(0, |row| row.columns().len()),
+        cells,
+        rss_sampler,
+    )
+}
+
+async fn measure_native_stream(client: &Client, sql: &str) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let mut stream = client.query_stream(sql, &[]).await.expect("native stream");
+    let mut rows = 0;
+    let mut cols = 0;
+    let mut cells = 0;
+    while let Some(item) = next_native_item(&mut stream).await {
+        let row = item.expect("native streamed row");
+        let values = row.try_values().expect("decode native streamed row");
+        rows += 1;
+        cols = row.columns().len();
+        cells += values.len();
+        std::hint::black_box(values);
+    }
+    finish_sample(start, rows, cols, cells, rss_sampler)
+}
+
+async fn measure_native_batches(client: &Client, sql: &str) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let mut stream = client
+        .query_batches(sql, &[])
+        .await
+        .expect("native batches");
+    let mut rows = 0;
+    let mut cols = 0;
+    let mut cells = 0;
+    while let Some(batch) = next_native_item(&mut stream).await {
+        for row in batch.expect("native row batch") {
+            let values = row.try_values().expect("decode native batched row");
+            rows += 1;
+            cols = row.columns().len();
+            cells += values.len();
+            std::hint::black_box(values);
+        }
+    }
+    finish_sample(start, rows, cols, cells, rss_sampler)
+}
+
+async fn measure_native_query_one(
+    client: &Client,
+    sql: &str,
+    expected_rows: usize,
+    expected_columns: usize,
+) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let error = client
+        .query_one(sql, &[])
+        .await
+        .expect_err("fact200k query_one must reject multiple rows");
+    assert!(error.to_string().contains(&expected_rows.to_string()));
+    finish_sample(
+        start,
+        expected_rows,
+        expected_columns,
+        expected_rows * expected_columns,
+        rss_sampler,
+    )
+}
+
+async fn measure_native_query_opt(
+    client: &Client,
+    sql: &str,
+    expected_rows: usize,
+    expected_columns: usize,
+) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let error = client
+        .query_opt(sql, &[])
+        .await
+        .expect_err("fact200k query_opt must reject multiple rows");
+    assert!(error.to_string().contains(&expected_rows.to_string()));
+    finish_sample(
+        start,
+        expected_rows,
+        expected_columns,
+        expected_rows * expected_columns,
+        rss_sampler,
+    )
+}
+
+async fn measure_native_execute(
+    client: &Client,
+    sql: &str,
+    expected_rows: usize,
+    expected_columns: usize,
+) -> Sample {
+    let rss_sampler = RssSampler::start();
+    reset_counters();
+    let start = Instant::now();
+    let rows_affected = client.execute(sql, &[]).await.expect("native execute");
+    // SELECT command tags may report `-1` for affected rows even though all
+    // result rows were consumed. The expected wire row count supplies the
+    // denominator for throughput and per-cell allocation metrics.
+    std::hint::black_box(rows_affected);
+    finish_sample(
+        start,
+        expected_rows,
+        expected_columns,
+        expected_rows * expected_columns,
+        rss_sampler,
+    )
 }
 
 #[test]
@@ -400,42 +673,129 @@ fn replay_fact200k_time_and_allocations() {
         password: "replay".into(),
         ..Default::default()
     };
-    let mut conn = NzConnection::connect(&config).expect("replay connect");
+    #[cfg(feature = "compat")]
+    if env::var("NZ_PERF_NATIVE_STREAM_ONLY").ok().as_deref() != Some("1") {
+        let mut conn = NzConnection::connect(&config).expect("compat replay connect");
+        let mut ms = Vec::with_capacity(repeats);
+        let mut bp_row = Vec::with_capacity(repeats);
+        for run in 1..=repeats {
+            let sample = run_measured_query(&mut conn, &fixture.query);
+            assert_eq!(sample.rows, fixture.expected_rows, "compat row count");
+            assert_eq!(sample.cols, fixture.expected_columns, "compat column count");
+            ms.push(sample.ms);
+            bp_row.push(sample.alloc_bytes as f64 / sample.rows.max(1) as f64);
+            print_sample("compat_replay_fact200k", run, &sample);
+        }
+        println!(
+            "compat_replay_fact200k median ms={:.1} median_bytes_per_row={:.1}",
+            median(ms),
+            median(bp_row)
+        );
 
-    let mut ms = Vec::with_capacity(repeats);
-    let mut bp_row = Vec::with_capacity(repeats);
-    for run in 1..=repeats {
-        let s = run_measured_query(&mut conn, &fixture.query);
-        assert_eq!(s.rows, fixture.expected_rows, "row count");
-        assert_eq!(s.cols, fixture.expected_columns, "column count");
-        ms.push(s.ms);
-        bp_row.push(s.alloc_bytes as f64 / s.rows as f64);
-        print_sample("replay_fact200k", run, &s);
+        let mut sms = Vec::with_capacity(repeats);
+        let mut sbp = Vec::with_capacity(repeats);
+        for run in 1..=repeats {
+            let sample = run_streaming_query(&mut conn, &fixture.query);
+            assert_eq!(
+                sample.rows, fixture.expected_rows,
+                "compat stream row count"
+            );
+            assert_eq!(
+                sample.cols, fixture.expected_columns,
+                "compat stream column count"
+            );
+            sms.push(sample.ms);
+            sbp.push(sample.alloc_bytes as f64 / sample.rows.max(1) as f64);
+            print_sample("compat_replay_fact200k_stream", run, &sample);
+        }
+        println!(
+            "compat_replay_fact200k_stream median ms={:.1} median_bytes_per_row={:.1}",
+            median(sms),
+            median(sbp)
+        );
+        drop(conn);
     }
-    println!(
-        "replay_fact200k median ms={:.1} median_bytes_per_row={:.1}",
-        median(ms),
-        median(bp_row)
-    );
 
-    let mut sms = Vec::with_capacity(repeats);
-    let mut sbp = Vec::with_capacity(repeats);
-    for run in 1..=repeats {
-        let s = run_streaming_query(&mut conn, &fixture.query);
-        assert_eq!(s.rows, fixture.expected_rows, "stream row count");
-        assert_eq!(s.cols, fixture.expected_columns, "stream column count");
-        sms.push(s.ms);
-        sbp.push(s.alloc_bytes as f64 / s.rows.max(1) as f64);
-        print_sample("replay_fact200k_stream", run, &s);
-    }
-    println!(
-        "replay_fact200k_stream median ms={:.1} median_bytes_per_row={:.1}",
-        median(sms),
-        median(sbp)
-    );
+    // Exercise the public native Tokio API on the same captured wire response.
+    // Both buffered modes and producer-streamed workloads touch every value.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Tokio runtime");
+    runtime.block_on(async {
+        let client = Client::connect(&config)
+            .await
+            .expect("native replay connect");
+        if env::var("NZ_PERF_NATIVE_STREAM_ONLY").ok().as_deref() == Some("1") {
+            for run in 1..=repeats {
+                let sample = measure_native_stream(&client, &fixture.query).await;
+                assert_eq!(sample.rows, fixture.expected_rows);
+                assert_eq!(sample.cols, fixture.expected_columns);
+                print_sample("native_query_stream_touch", run, &sample);
+            }
+            client.close().await.expect("native replay close");
+            return;
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_query_one(
+                &client,
+                &fixture.query,
+                fixture.expected_rows,
+                fixture.expected_columns,
+            )
+            .await;
+            print_sample("native_query_one_discard_tail", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_query_opt(
+                &client,
+                &fixture.query,
+                fixture.expected_rows,
+                fixture.expected_columns,
+            )
+            .await;
+            print_sample("native_query_opt_discard_tail", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_execute(
+                &client,
+                &fixture.query,
+                fixture.expected_rows,
+                fixture.expected_columns,
+            )
+            .await;
+            print_sample("native_execute_discard", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_batches(&client, &fixture.query).await;
+            assert_eq!(sample.rows, fixture.expected_rows);
+            assert_eq!(sample.cols, fixture.expected_columns);
+            print_sample("native_query_batches_touch", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_stream(&client, &fixture.query).await;
+            assert_eq!(sample.rows, fixture.expected_rows);
+            assert_eq!(sample.cols, fixture.expected_columns);
+            print_sample("native_query_stream_touch", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_query_multi(&client, &fixture.query).await;
+            assert_eq!(sample.rows, fixture.expected_rows);
+            assert_eq!(sample.cols, fixture.expected_columns);
+            print_sample("native_query_multi_touch", run, &sample);
+        }
+        for run in 1..=repeats {
+            let sample = measure_native_query(&client, &fixture.query).await;
+            assert_eq!(sample.rows, fixture.expected_rows);
+            assert_eq!(sample.cols, fixture.expected_columns);
+            print_sample("native_query_touch", run, &sample);
+        }
+        client.close().await.expect("native replay close");
+    });
 }
 
 #[test]
+#[cfg(feature = "compat")]
 fn live_fact200k_time_and_allocations() {
     if env::var("NZ_RUN_PERF_TESTS").ok().as_deref() != Some("1") {
         eprintln!("skipping: set NZ_RUN_PERF_TESTS=1 to run the live performance harness");

@@ -37,7 +37,6 @@
 use crate::types::datetime::normalize_time_text;
 use crate::types::numeric::{parse_numeric_text, NumericDecoded};
 use crate::types::value::NzValue;
-use std::ops::Range;
 
 /// Build a Netezza simple-query (`P`) packet: `'P' + cmdNum(BE) + sql + NUL`.
 ///
@@ -181,48 +180,43 @@ pub fn parse_text_data_row(
     Ok(row)
 }
 
-/// Locate text fields without converting them to `NzValue`. `None` marks a
-/// SQL NULL; an empty range is a present empty string.
-pub(crate) fn text_row_layout(
+/// Validate text-row framing without retaining one range per column.
+pub(crate) fn validate_text_row(
     data: &[u8],
     columns: &[crate::tuple_desc::ColumnDesc],
-) -> Result<Vec<Option<Range<usize>>>, String> {
-    let n = columns.len();
-    let bitmap_len = n.div_ceil(8);
+) -> Result<(), String> {
+    let bitmap_len = columns.len().div_ceil(8);
     if data.len() < bitmap_len {
         return Err("Invalid DataRow payload: null bitmap is truncated".into());
     }
-    let mut layout = Vec::with_capacity(n);
-    let mut idx = bitmap_len;
-    for col_no in 0..n {
+    let mut index = bitmap_len;
+    for col_no in 0..columns.len() {
         let byte = data[col_no / 8];
         let bit = 7 - (col_no % 8);
         if byte & (1 << bit) == 0 {
-            layout.push(None);
             continue;
         }
-        if idx + 4 > data.len() {
+        if index.checked_add(4).is_none_or(|end| end > data.len()) {
             return Err(format!(
                 "Invalid DataRow payload: column {col_no} length is truncated"
             ));
         }
-        let vlen = i32::from_be_bytes(data[idx..idx + 4].try_into().unwrap());
-        idx += 4;
-        if vlen < 4 {
+        let encoded = i32::from_be_bytes(data[index..index + 4].try_into().unwrap());
+        index += 4;
+        if encoded < 4 {
             return Err(format!(
                 "Invalid DataRow payload: column {col_no} length is smaller than its prefix"
             ));
         }
-        let actual = (vlen - 4) as usize;
-        if idx.checked_add(actual).is_none_or(|end| end > data.len()) {
-            return Err(format!(
-                "Invalid DataRow payload: column {col_no} value length is invalid"
-            ));
-        }
-        layout.push(Some(idx..idx + actual));
-        idx += actual;
+        let value_len = (encoded - 4) as usize;
+        index = index
+            .checked_add(value_len)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| {
+                format!("Invalid DataRow payload: column {col_no} value length is invalid")
+            })?;
     }
-    Ok(layout)
+    Ok(())
 }
 
 /// Parse a text DataRow into a reusable value vector.

@@ -19,6 +19,8 @@
 //! text before send. Port of the Node driver `protocol/sqlParameters.ts`.
 
 use crate::types::value::NzValue;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// A named or positional client-side parameter.
 ///
@@ -53,60 +55,87 @@ impl NzParameter {
 
 /// Escape a value as a SQL literal.
 pub fn escape_literal(value: &NzValue) -> Result<String, String> {
-    Ok(match value {
-        NzValue::Null => "NULL".into(),
-        NzValue::Bool(b) => {
-            if *b {
-                "'t'".into()
-            } else {
-                "'f'".into()
+    let mut result = String::new();
+    write_nz_value_sql(value, &mut result)?;
+    Ok(result)
+}
+
+/// Append one Netezza SQL literal without allocating a temporary string.
+pub(crate) fn write_nz_value_sql(value: &NzValue, output: &mut String) -> Result<(), String> {
+    use std::fmt::Write as _;
+
+    match value {
+        NzValue::Null => output.push_str("NULL"),
+        NzValue::Bool(value) => output.push_str(if *value { "'t'" } else { "'f'" }),
+        NzValue::Int2(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        NzValue::Int4(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        NzValue::Int8(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        NzValue::Float4(value) => {
+            let number = *value as f64;
+            if !number.is_finite() {
+                return Err(format!("Cannot bind non-finite number: {number}"));
             }
+            write!(output, "{number}").expect("writing to String cannot fail");
         }
-        NzValue::Int2(v) => v.to_string(),
-        NzValue::Int4(v) => v.to_string(),
-        NzValue::Int8(v) => v.to_string(),
-        NzValue::Float4(_) | NzValue::Float8(_) => {
-            let s = value.to_display_string();
-            let n: f64 = s
-                .parse()
-                .map_err(|_| format!("Cannot bind non-finite number: {s}"))?;
-            if !n.is_finite() {
-                return Err(format!("Cannot bind non-finite number: {n}"));
+        NzValue::Float8(number) => {
+            if !number.is_finite() {
+                return Err(format!("Cannot bind non-finite number: {number}"));
             }
-            s
+            write!(output, "{number}").expect("writing to String cannot fail");
         }
-        NzValue::Numeric(s) => {
-            if !valid_numeric_literal(s) {
+        NzValue::Numeric(value) => {
+            if !valid_numeric_literal(value) {
                 return Err("Invalid numeric parameter".into());
             }
-            s.clone()
+            output.push_str(value);
         }
-        NzValue::Decimal(value) => value.to_string(),
-        NzValue::Text(s)
-        | NzValue::Date(s)
-        | NzValue::Time(s)
-        | NzValue::Timetz(s)
-        | NzValue::Timestamp(s)
-        | NzValue::Interval(s) => {
-            if s.contains('\0') {
-                return Err("SQL parameters cannot contain NUL".into());
-            }
-            if s.contains('\\') {
-                let parts = s
-                    .split('\\')
-                    .map(|part| format!("'{}'", part.replace('\'', "''")))
-                    .collect::<Vec<_>>();
-                format!("({})", parts.join(" || chr(92) || "))
-            } else {
-                format!("'{}'", s.replace('\'', "''"))
-            }
+        NzValue::Decimal(value) => {
+            write!(output, "{value}").expect("writing to String cannot fail")
         }
+        NzValue::Text(value)
+        | NzValue::Date(value)
+        | NzValue::Time(value)
+        | NzValue::Timetz(value)
+        | NzValue::Timestamp(value)
+        | NzValue::Interval(value) => write_text_literal(value, output)?,
         NzValue::Bytea(_) => {
             return Err(
                 "Binary SQL parameters are unsupported; use an external-table reader".into(),
             )
         }
-    })
+    }
+    Ok(())
+}
+
+pub(crate) fn write_text_literal(value: &str, output: &mut String) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err("SQL parameters cannot contain NUL".into());
+    }
+    if value.contains('\\') {
+        output.push('(');
+        let mut parts = value.split('\\').peekable();
+        while let Some(part) = parts.next() {
+            append_quoted_text(part, output);
+            if parts.peek().is_some() {
+                output.push_str(" || chr(92) || ");
+            }
+        }
+        output.push(')');
+    } else {
+        append_quoted_text(value, output);
+    }
+    Ok(())
+}
+
+fn append_quoted_text(value: &str, output: &mut String) {
+    output.push('\'');
+    for ch in value.chars() {
+        output.push(ch);
+        if ch == '\'' {
+            output.push('\'');
+        }
+    }
+    output.push('\'');
 }
 
 fn valid_numeric_literal(s: &str) -> bool {
@@ -171,130 +200,128 @@ fn block_comment_end(bytes: &[u8], start: usize) -> usize {
 /// The scan is a lexer: string literals, quoted identifiers, dollar-quoted
 /// bodies and comments are preserved byte-for-byte.
 pub fn substitute_parameters(sql: &str, params: &[NzValue]) -> Result<String, String> {
-    if sql.contains('\0') {
-        return Err("SQL cannot contain NUL".into());
-    }
-    if params.is_empty() {
-        // Fast path for the common parameter-less query: avoid the full
-        // lexer when the text cannot contain a placeholder.
-        if !sql.contains('$') && !sql.contains('?') && !sql.contains(':') && !sql.contains('@') {
-            return Ok(sql.to_string());
+    SqlTemplate::parse(sql)?.render(params.len(), |index, output| {
+        write_nz_value_sql(&params[index], output)
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct SqlTemplate {
+    source: Arc<str>,
+    placeholders: Box<[SqlPlaceholder]>,
+}
+
+#[derive(Debug, Clone)]
+struct SqlPlaceholder {
+    range: Range<usize>,
+    index: usize,
+}
+
+impl SqlTemplate {
+    pub(crate) fn parse(sql: &str) -> Result<Self, String> {
+        if sql.contains('\0') {
+            return Err("SQL cannot contain NUL".into());
         }
-    }
-    let mut used = vec![false; params.len()];
-    let bytes = sql.as_bytes();
-    let mut result = String::with_capacity(sql.len() + 16);
-    let mut i = 0usize;
-    let mut dollar_quote: Option<String> = None;
-
-    while i < bytes.len() {
-        if let Some(tag) = &dollar_quote {
-            if sql[i..].starts_with(tag.as_str()) {
-                result.push_str(tag);
-                i += tag.len();
-                dollar_quote = None;
-            } else {
-                let ch_len = sql[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                result.push_str(&sql[i..i + ch_len]);
-                i += ch_len;
-            }
-            continue;
-        }
-
-        let ch = bytes[i] as char;
-
-        // SQL line comments do not contain parameters.
-        if ch == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            match sql[i..].find('\n') {
-                Some(line_end) => {
-                    result.push_str(&sql[i..=i + line_end]);
-                    i += line_end + 1;
-                }
-                None => {
-                    result.push_str(&sql[i..]);
-                    break;
-                }
-            }
-            continue;
-        }
-
-        // SQL block comments may contain arbitrary '$1'-like text.
-        if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            let end = block_comment_end(bytes, i);
-            result.push_str(&sql[i..end]);
-            i = end;
-            continue;
-        }
-
-        if ch == '\'' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] != b'\'' {
-                    i += 1;
-                    continue;
-                }
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                break;
-            }
-            result.push_str(&sql[start..i.min(sql.len())]);
-            continue;
-        }
-
-        if ch == '"' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            result.push_str(&sql[start..i.min(sql.len())]);
-            continue;
-        }
-
-        // Preserve dollar-quoted bodies; a numeric suffix is a parameter, not a tag.
-        if ch == '$' {
-            let rest = &sql[i..];
-            if let Some(tag) = dollar_tag_str(rest) {
-                dollar_quote = Some(tag.clone());
-                result.push_str(&tag);
-                i += tag.len();
-                continue;
-            }
-            if let Some(num_len) = dollar_number(rest) {
-                let match_str = &rest[..1 + num_len];
-                let idx: usize = match_str[1..].parse().unwrap_or(0);
-                if idx >= 1 && idx <= params.len() {
-                    used[idx - 1] = true;
-                    result.push_str(&escape_literal(&params[idx - 1])?);
+        let bytes = sql.as_bytes();
+        let mut placeholders = Vec::new();
+        let mut i = 0usize;
+        let mut dollar_quote: Option<String> = None;
+        while i < bytes.len() {
+            if let Some(tag) = &dollar_quote {
+                if sql[i..].starts_with(tag.as_str()) {
+                    i += tag.len();
+                    dollar_quote = None;
                 } else {
-                    return Err(format!("Missing value for SQL parameter '{match_str}'"));
+                    i += sql[i..].chars().next().map(char::len_utf8).unwrap_or(1);
                 }
-                i += match_str.len();
                 continue;
             }
+            match bytes[i] {
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    i = sql[i..].find('\n').map_or(sql.len(), |end| i + end + 1);
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i = block_comment_end(bytes, i);
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == quote {
+                            if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'$' => {
+                    let rest = &sql[i..];
+                    if let Some(tag) = dollar_tag_str(rest) {
+                        i += tag.len();
+                        dollar_quote = Some(tag);
+                    } else if let Some(number_len) = dollar_number(rest) {
+                        let end = i + 1 + number_len;
+                        let index = sql[i + 1..end].parse().unwrap_or(0);
+                        placeholders.push(SqlPlaceholder {
+                            range: i..end,
+                            index,
+                        });
+                        i = end;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += sql[i..].chars().next().map(char::len_utf8).unwrap_or(1),
+            }
         }
-
-        let ch_len = sql[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        result.push_str(&sql[i..i + ch_len]);
-        i += ch_len;
+        Ok(Self {
+            source: Arc::from(sql),
+            placeholders: placeholders.into_boxed_slice(),
+        })
     }
 
-    if used.iter().any(|used| !used) {
-        return Err("Unused SQL parameter value".into());
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.source.len().saturating_add(
+            self.placeholders
+                .len()
+                .saturating_mul(std::mem::size_of::<SqlPlaceholder>()),
+        )
     }
-    Ok(result)
+
+    pub(crate) fn source(&self) -> Arc<str> {
+        self.source.clone()
+    }
+
+    pub(crate) fn render(
+        &self,
+        parameter_count: usize,
+        mut write_parameter: impl FnMut(usize, &mut String) -> Result<(), String>,
+    ) -> Result<String, String> {
+        let mut result = String::with_capacity(self.source.len() + 16);
+        let mut used_parameters = vec![false; parameter_count];
+        let mut previous = 0;
+        for placeholder in self.placeholders.iter() {
+            result.push_str(&self.source[previous..placeholder.range.start]);
+            if placeholder.index == 0 || placeholder.index > parameter_count {
+                let token = &self.source[placeholder.range.clone()];
+                return Err(format!("Missing value for SQL parameter '{token}'"));
+            }
+            let parameter_index = placeholder.index - 1;
+            used_parameters[parameter_index] = true;
+            write_parameter(parameter_index, &mut result)?;
+            previous = placeholder.range.end;
+        }
+        result.push_str(&self.source[previous..]);
+        if used_parameters.iter().any(|used| !used) {
+            return Err("Unused SQL parameter value".into());
+        }
+        Ok(result)
+    }
 }
 
 /// Substitute C#/ADO.NET-style named (`:name`, `@name`) or question-mark
@@ -608,6 +635,28 @@ mod tests {
         assert!(substitute_parameters("SELECT $0", &[NzValue::Int4(1)]).is_err());
         assert!(substitute_parameters("SELECT 1\0", &[]).is_err());
     }
+
+    #[test]
+    fn validates_unused_large_parameter_sets_without_rescanning_placeholders() {
+        use std::fmt::Write as _;
+
+        const PARAMETER_COUNT: usize = 2_048;
+        let mut sql = String::new();
+        for index in 1..PARAMETER_COUNT {
+            if index > 1 {
+                sql.push(',');
+            }
+            write!(sql, "${index}").unwrap();
+        }
+        let template = SqlTemplate::parse(&sql).unwrap();
+
+        let rendered = template.render(PARAMETER_COUNT, |_, output| {
+            output.push('1');
+            Ok(())
+        });
+        assert_eq!(rendered.unwrap_err(), "Unused SQL parameter value");
+    }
+
     #[test]
     fn rejects_numeric_injection_and_escapes_temporal_values() {
         for value in ["0); SELECT 42; --", "NaN", "Infinity", "1e", "", "1 2"] {

@@ -906,49 +906,163 @@ fn unexpected(value: &NzValue, expected: &str) -> NzError {
 // has no server-side bind — see `crate::params`).
 pub trait ToSql: std::fmt::Debug + Sync {
     fn to_nz_value(&self) -> NzValue;
+
+    /// Append this value as a Netezza SQL literal.
+    ///
+    /// The default preserves compatibility for downstream implementations.
+    /// Built-in primitive and string types override it to append directly,
+    /// avoiding an intermediate [`NzValue`].
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        crate::params::write_nz_value_sql(&self.to_nz_value(), output)
+    }
 }
 
 impl ToSql for NzValue {
     fn to_nz_value(&self) -> NzValue {
         self.clone()
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        crate::params::write_nz_value_sql(self, output)
+    }
 }
 
-macro_rules! to_sql_direct {
+macro_rules! to_sql_integer {
     ($($t:ty),*) => {
         $(
-            impl ToSql for $t
-            where
-                $t: Into<NzValue> + Clone + std::fmt::Debug,
-            {
+            impl ToSql for $t {
                 fn to_nz_value(&self) -> NzValue {
                     self.clone().into()
+                }
+
+                fn write_sql(&self, output: &mut String) -> Result<(), String> {
+                    use std::fmt::Write as _;
+                    write!(output, "{self}").expect("writing to String cannot fail");
+                    Ok(())
                 }
             }
         )*
     };
 }
 
-to_sql_direct!(bool, i16, i32, i64, f32, f64, Decimal, String, Vec<u8>);
+to_sql_integer!(i16, i32, i64);
+
+impl ToSql for bool {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Bool(*self)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        output.push_str(if *self { "'t'" } else { "'f'" });
+        Ok(())
+    }
+}
+
+impl ToSql for f32 {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Float4(*self)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        let value = *self as f64;
+        if !value.is_finite() {
+            return Err(format!("Cannot bind non-finite number: {value}"));
+        }
+        use std::fmt::Write as _;
+        write!(output, "{value}").expect("writing to String cannot fail");
+        Ok(())
+    }
+}
+
+impl ToSql for f64 {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Float8(*self)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        if !self.is_finite() {
+            return Err(format!("Cannot bind non-finite number: {self}"));
+        }
+        use std::fmt::Write as _;
+        write!(output, "{self}").expect("writing to String cannot fail");
+        Ok(())
+    }
+}
+
+impl ToSql for Decimal {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Decimal(*self)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        use std::fmt::Write as _;
+        write!(output, "{self}").expect("writing to String cannot fail");
+        Ok(())
+    }
+}
+
+impl ToSql for Vec<u8> {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Bytea(self.clone())
+    }
+
+    fn write_sql(&self, _output: &mut String) -> Result<(), String> {
+        Err("Binary SQL parameters are unsupported; use an external-table reader".into())
+    }
+}
+
+impl ToSql for String {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Text(self.clone())
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        crate::params::write_text_literal(self, output)
+    }
+}
 
 impl ToSql for i8 {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Int2(*self as i16)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        use std::fmt::Write as _;
+        write!(output, "{self}").expect("writing to String cannot fail");
+        Ok(())
     }
 }
 impl ToSql for u8 {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Int2(*self as i16)
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        use std::fmt::Write as _;
+        write!(output, "{}", *self as i16).expect("writing to String cannot fail");
+        Ok(())
+    }
 }
 impl ToSql for u16 {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Int4(*self as i32)
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        use std::fmt::Write as _;
+        write!(output, "{}", *self as i32).expect("writing to String cannot fail");
+        Ok(())
+    }
 }
 impl ToSql for u32 {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Int8(*self as i64)
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        use std::fmt::Write as _;
+        write!(output, "{}", *self as i64).expect("writing to String cannot fail");
+        Ok(())
     }
 }
 
@@ -956,15 +1070,27 @@ impl ToSql for &str {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Text((*self).into())
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        crate::params::write_text_literal(self, output)
+    }
 }
 impl ToSql for str {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Text(self.into())
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        crate::params::write_text_literal(self, output)
+    }
 }
 impl ToSql for &[u8] {
     fn to_nz_value(&self) -> NzValue {
         NzValue::Bytea(self.to_vec())
+    }
+
+    fn write_sql(&self, _output: &mut String) -> Result<(), String> {
+        Err("Binary SQL parameters are unsupported; use an external-table reader".into())
     }
 }
 impl<T: ToSql> ToSql for Option<T> {
@@ -974,10 +1100,24 @@ impl<T: ToSql> ToSql for Option<T> {
             None => NzValue::Null,
         }
     }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        match self {
+            Some(value) => value.write_sql(output),
+            None => {
+                output.push_str("NULL");
+                Ok(())
+            }
+        }
+    }
 }
 impl<T: ToSql> ToSql for &T {
     fn to_nz_value(&self) -> NzValue {
         (*self).to_nz_value()
+    }
+
+    fn write_sql(&self, output: &mut String) -> Result<(), String> {
+        (*self).write_sql(output)
     }
 }
 
@@ -1217,5 +1357,31 @@ mod tests {
         assert_eq!(NzValue::from(Some(5i32)), NzValue::Int4(5));
         assert_eq!(NzValue::from(Option::<i32>::None), NzValue::Null);
         assert_eq!(NzValue::from(true), NzValue::Bool(true));
+    }
+
+    #[test]
+    fn to_sql_writes_numeric_literals_without_changing_formatting() {
+        let mut output = String::new();
+        42i32.write_sql(&mut output).unwrap();
+        assert_eq!(output, "42");
+
+        output.clear();
+        let single = 0.1f32;
+        single.write_sql(&mut output).unwrap();
+        assert_eq!(output, NzValue::Float4(single).to_display_string());
+
+        output.clear();
+        let double = 1.25f64;
+        double.write_sql(&mut output).unwrap();
+        assert_eq!(output, NzValue::Float8(double).to_display_string());
+        assert!(f64::INFINITY.write_sql(&mut output).is_err());
+
+        output.clear();
+        let decimal = "123.4500".parse::<Decimal>().unwrap();
+        decimal.write_sql(&mut output).unwrap();
+        assert_eq!(output, "123.4500");
+
+        let bytes = vec![1, 2, 3];
+        assert!(bytes.write_sql(&mut output).is_err());
     }
 }
