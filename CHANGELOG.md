@@ -2,6 +2,23 @@
 
 All notable changes to `nz_rust` will be documented here.
 
+## [0.3.3] - 2026-10-05
+
+### Changed
+
+- Default `NzConnectionConfig::client_type` is now JDBC
+  (`ClientTypeId::SQL_JDBC = 3`) instead of Node (`15`), so sessions report
+  as JDBC to the appliance for auditing and server-side feature gating.
+  Override with `config.client_type`, `ConfigBuilder::client_type()` or the
+  `?clientType=` / `?client_type=` connection-string parameter.
+
+### Added
+
+- `ConfigBuilder::client_type()` and the `clientType` / `client_type`
+  connection-string parameter (numeric or named: `jdbc`, `odbc`, `node`,
+  `dotnet`, `golang`, `python`, `oledb`, `sql`).
+- Unit tests covering the JDBC default and the builder/URI override.
+
 ## [0.2.1] - 2026-09-27
 
 ### Fixed

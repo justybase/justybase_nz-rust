@@ -72,7 +72,7 @@ pub struct NzConnectionConfig {
     pub os_user: String,
     /// Client hostname reported to Netezza.
     pub client_host_name: String,
-    /// Numeric Netezza client type (default: Node = 15).
+    /// Numeric Netezza client type (default: JDBC = 3).
     pub client_type: i16,
 }
 
@@ -115,7 +115,7 @@ impl Default for NzConnectionConfig {
             app_name: String::from("netezza-rust"),
             os_user: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
             client_host_name: hostname_or_unknown(),
-            client_type: crate::ClientTypeId::NODE,
+            client_type: crate::ClientTypeId::SQL_JDBC,
         }
     }
 }
@@ -182,6 +182,22 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+fn parse_client_type(s: &str) -> NzResult<i16> {
+    match s.to_ascii_lowercase().as_str() {
+        "jdbc" | "sql_jdbc" | "sql-jdbc" => Ok(crate::ClientTypeId::SQL_JDBC),
+        "odbc" | "sql_odbc" | "sql-odbc" => Ok(crate::ClientTypeId::SQL_ODBC),
+        "node" => Ok(crate::ClientTypeId::NODE),
+        "dotnet" | "sql_dotnet" | "sql-dotnet" => Ok(crate::ClientTypeId::SQL_DOTNET),
+        "golang" | "go" | "sql_golang" => Ok(crate::ClientTypeId::SQL_GOLANG),
+        "python" | "sql_python" => Ok(crate::ClientTypeId::SQL_PYTHON),
+        "oledb" | "sql_oledb" => Ok(crate::ClientTypeId::SQL_OLEDB),
+        "sql" => Ok(crate::ClientTypeId::SQL),
+        _ => s
+            .parse::<i16>()
+            .map_err(|_| NzError::Config("Invalid client type".into())),
     }
 }
 
@@ -342,6 +358,7 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
                 "appname" | "application_name" => config.app_name = value,
                 "osuser" | "os_user" => config.os_user = value,
                 "clienthostname" | "client_hostname" => config.client_host_name = value,
+                "clienttype" | "client_type" => config.client_type = parse_client_type(&value)?,
                 _ => {}
             }
         }
@@ -394,6 +411,10 @@ impl ConfigBuilder {
     }
     pub fn application_name(mut self, value: impl Into<String>) -> Self {
         self.config.app_name = value.into();
+        self
+    }
+    pub fn client_type(mut self, value: i16) -> Self {
+        self.config.client_type = value;
         self
     }
     pub fn build(self) -> NzResult<NzConnectionConfig> {
@@ -558,5 +579,44 @@ mod tests {
         ] {
             assert!(parse_connection_string(uri).is_err());
         }
+    }
+
+    #[test]
+    fn default_client_type_is_jdbc() {
+        assert_eq!(
+            NzConnectionConfig::default().client_type,
+            crate::ClientTypeId::SQL_JDBC
+        );
+        assert_eq!(
+            NzConnectionConfig::new("h", "d", "u", "p").client_type,
+            crate::ClientTypeId::SQL_JDBC
+        );
+        assert_eq!(
+            parse_connection_string("nz://u:p@h/db")
+                .unwrap()
+                .client_type,
+            crate::ClientTypeId::SQL_JDBC
+        );
+    }
+
+    #[test]
+    fn client_type_can_be_overridden_via_builder_and_uri() {
+        let cfg = NzConnectionConfig::builder()
+            .host("h")
+            .database("d")
+            .user("u")
+            .password("p")
+            .client_type(crate::ClientTypeId::NODE)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.client_type, crate::ClientTypeId::NODE);
+
+        let cfg = parse_connection_string("nz://u:p@h/db?clientType=15").unwrap();
+        assert_eq!(cfg.client_type, 15);
+        let cfg = parse_connection_string("nz://u:p@h/db?client_type=node").unwrap();
+        assert_eq!(cfg.client_type, crate::ClientTypeId::NODE);
+        let cfg = parse_connection_string("nz://u:p@h/db?clientType=jdbc").unwrap();
+        assert_eq!(cfg.client_type, crate::ClientTypeId::SQL_JDBC);
+        assert!(parse_connection_string("nz://u:p@h/db?clientType=bad").is_err());
     }
 }
