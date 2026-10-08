@@ -60,6 +60,10 @@ fn start_pool_server() -> (MockServer, Arc<Switches>) {
                 "BEGIN" => simple_command("BEGIN"),
                 _ => select_one(),
             };
+            // The appliance pads after ReadyForQuery with NUL bytes; an idle
+            // probe must not mistake them for unsolicited protocol data.
+            let mut response = response;
+            response.extend_from_slice(&[0, 0, 0, 0]);
             if session.send(&response).is_err() {
                 break;
             }

@@ -1554,23 +1554,27 @@ impl AsyncSession {
     /// Zero-wait check that the peer has neither closed the idle socket nor
     /// sent unsolicited bytes (which would desynchronize the next response).
     async fn idle_socket_is_healthy(&mut self) -> bool {
-        if !self.buffer.is_empty() {
+        // NUL padding between messages is normal (the appliance pads after
+        // ReadyForQuery) and is skipped by the parser.
+        if self.buffer.iter().any(|&b| b != 0) {
             return false;
         }
-        let mut byte = [0u8; 1];
+        let mut pending = [0u8; 64];
         match self.stream.as_mut() {
             None => false,
             // Elapsed: nothing to read, the session is idle and open.
             Some(AsyncTransport::Plain(stream)) => {
-                tokio::time::timeout(Duration::ZERO, stream.peek(&mut byte))
-                    .await
-                    .is_err()
+                match tokio::time::timeout(Duration::ZERO, stream.peek(&mut pending)).await {
+                    Err(_elapsed) => true,
+                    Ok(Ok(n)) => n > 0 && pending[..n].iter().all(|&b| b == 0),
+                    Ok(Err(_)) => false,
+                }
             }
             // Pending TLS records (e.g. TLS 1.3 session tickets) are not
             // protocol data; only EOF or a socket error retires the session.
             #[cfg(feature = "ssl")]
             Some(AsyncTransport::Tls(stream)) => !matches!(
-                tokio::time::timeout(Duration::ZERO, stream.get_ref().0.peek(&mut byte)).await,
+                tokio::time::timeout(Duration::ZERO, stream.get_ref().0.peek(&mut pending)).await,
                 Ok(Ok(0) | Err(_))
             ),
         }

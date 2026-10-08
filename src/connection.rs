@@ -1339,14 +1339,16 @@ impl NzConnection {
         if !self.connected || self.executing {
             return false;
         }
-        if !self.buffer.is_empty() {
+        // NUL padding between messages is normal (the appliance pads after
+        // ReadyForQuery) and is skipped by the parser.
+        if self.buffer.slice().iter().any(|&b| b != 0) {
             return self.protocol_sync_required;
         }
-        let mut byte = [0u8; 1];
+        let mut pending = [0u8; 64];
         if stream.set_nonblocking(true).is_err() {
             return false;
         }
-        let peeked = stream.peek(&mut byte);
+        let peeked = stream.peek(&mut pending);
         let restored = stream.set_nonblocking(false).is_ok()
             && stream
                 .set_read_timeout(Some(Duration::from_secs(
@@ -1360,6 +1362,7 @@ impl NzConnection {
             && match peeked {
                 Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
                 Ok(0) => false,
+                Ok(n) if pending[..n].iter().all(|&b| b == 0) => true,
                 Ok(_) => !plaintext || self.protocol_sync_required,
             }
     }
