@@ -163,9 +163,10 @@ pub fn decode_bytea_text(raw: &str) -> Vec<u8> {
 /// Parse one text-protocol DataRow payload (`D`) into row values.
 ///
 /// Layout (C# `HandleDataRow`, Node `_parseDataRow`): `bitmap + per-column
-/// (len(i32 BE, includes self) + bytes)`. A cleared bitmap bit or a `vlen < 4`
-/// length means SQL NULL. A present cell with `vlen == 4` is a genuine empty
-/// string; this distinction is required for parity with the C# reader.
+/// (len(i32 BE, includes self) + bytes)`. A cleared bitmap bit means SQL NULL;
+/// a present cell whose `vlen < 4` is a protocol error. A present cell with
+/// `vlen == 4` is a genuine empty string; this distinction is required for
+/// parity with the C# reader.
 pub fn parse_text_data_row(
     data: &[u8],
     columns: &[crate::tuple_desc::ColumnDesc],
@@ -378,5 +379,58 @@ mod tests {
             parse_text_data_row(&payload, &cols).unwrap(),
             vec![NzValue::Text(String::new())]
         );
+    }
+
+    /// `validate_text_row` guards the lazy row path; it must accept exactly the
+    /// payloads the eager parser accepts, at every bitmap byte boundary and for
+    /// every truncation of the payload.
+    #[test]
+    fn validate_text_row_agrees_with_eager_parser_at_bitmap_boundaries() {
+        use crate::tuple_desc::ColumnDesc;
+        for n in [7usize, 8, 9, 15, 16, 17, 31, 32, 33] {
+            let columns: Vec<ColumnDesc> = (0..n)
+                .map(|i| ColumnDesc {
+                    name: format!("c{i}"),
+                    type_oid: 1043,
+                    type_len: -1,
+                    type_mod: -1,
+                    format: 0,
+                })
+                .collect();
+            let mut masks: Vec<Vec<bool>> = vec![vec![true; n], vec![false; n]];
+            masks.push((0..n).map(|i| i % 2 == 0).collect());
+            for i in 0..n {
+                let mut mask = vec![true; n];
+                mask[i] = false;
+                masks.push(mask);
+                let mut mask = vec![false; n];
+                mask[i] = true;
+                masks.push(mask);
+            }
+            for mask in masks {
+                let mut payload = vec![0u8; n.div_ceil(8)];
+                for (i, present) in mask.iter().enumerate() {
+                    if *present {
+                        payload[i / 8] |= 1 << (7 - i % 8);
+                    }
+                }
+                for (i, present) in mask.iter().enumerate() {
+                    if *present {
+                        let cell = "v".repeat(i % 4 + 1);
+                        payload.extend_from_slice(&((cell.len() + 4) as i32).to_be_bytes());
+                        payload.extend_from_slice(cell.as_bytes());
+                    }
+                }
+                assert!(validate_text_row(&payload, &columns).is_ok());
+                for cut in 0..payload.len() {
+                    let truncated = &payload[..cut];
+                    assert_eq!(
+                        validate_text_row(truncated, &columns).is_ok(),
+                        parse_text_data_row(truncated, &columns).is_ok(),
+                        "n={n} mask={mask:?} cut={cut}"
+                    );
+                }
+            }
+        }
     }
 }
