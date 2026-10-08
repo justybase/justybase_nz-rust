@@ -69,6 +69,11 @@ path = "tests/live_integration.rs"
 required-features = ["compat"]
 
 [[test]]
+name = "live_qualification"
+path = "tests/live_qualification.rs"
+required-features = ["compat"]
+
+[[test]]
 name = "mock_server"
 path = "tests/mock_server.rs"
 required-features = ["compat"]

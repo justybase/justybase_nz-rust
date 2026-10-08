@@ -1,14 +1,18 @@
 //! Live integration tests against a real Netezza appliance.
 //!
-//! These are skipped (reported as passing) unless `NZ_RUN_LIVE_TESTS=1` is
-//! set, so `cargo test` stays green without an appliance. Point them at a
-//! server with:
+//! Every test is `#[ignore]`d so `cargo test` never needs an appliance; run
+//! them explicitly (a missing configuration then fails instead of skipping):
 //!
 //! ```text
-//! NZ_RUN_LIVE_TESTS=1 NZ_DEV_HOST=host NZ_DEV_DATABASE=JUST_DATA \
-//!   NZ_DEV_USER=admin NZ_DEV_PASSWORD=secret \
-//!   cargo test -p nz_rust --test live_driver -- --nocapture
+//! NZ_DEV_HOST=host NZ_DEV_DATABASE=JUST_DATA NZ_DEV_USER=admin NZ_DEV_PASSWORD=... \
+//!   cargo test -p nz_rust --features compat --test live_driver -- \
+//!   --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! or use `scripts/test-live.sh`. Tests marked "with JUST_DATA sample schema"
+//! read the `JUST_DATA` demo tables; the rest create their own objects.
+
+mod live_support;
 
 use futures_core::Stream;
 use nz_rust::{
@@ -93,35 +97,18 @@ fn unique_name(prefix: &str) -> String {
     )
 }
 
-/// Returns the live config, or `None` when live tests are not opted into.
-fn config() -> Option<NzConnectionConfig> {
-    if std::env::var("NZ_RUN_LIVE_TESTS").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let host = std::env::var("NZ_DEV_HOST").ok()?;
-    Some(NzConnectionConfig {
+/// The live appliance configuration; fails the test when it is incomplete.
+fn config() -> NzConnectionConfig {
+    NzConnectionConfig {
         external_files: nz_rust::ExternalFilePolicy::Unrestricted,
-        host,
-        port: std::env::var("NZ_DEV_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5480),
-        database: std::env::var("NZ_DEV_DB")
-            .or_else(|_| std::env::var("NZ_DEV_DATABASE"))
-            .unwrap_or_else(|_| "JUST_DATA".into()),
-        user: std::env::var("NZ_DEV_USER").unwrap_or_else(|_| "admin".into()),
-        password: std::env::var("NZ_DEV_PASSWORD")
-            .expect("NZ_DEV_PASSWORD is required when NZ_DEV_HOST is set"),
-        ..Default::default()
-    })
+        ..live_support::live_config()
+    }
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn live_query_types_parameters_multi_result_and_transaction() {
-    let Some(config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let config = config();
     let mut conn = NzConnection::connect(&config).expect("connect/authentication");
     let result = conn
         .query(
@@ -163,11 +150,9 @@ fn live_query_types_parameters_multi_result_and_transaction() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn live_pool_checkout_query_and_release() {
-    let Some(config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let config = config();
     let pool = NzPool::new(NzPoolConfig::new(config)).unwrap();
     let result = pool.query("SELECT 1 AS one", &[]).unwrap();
     assert_eq!(result.rows()[0].try_get::<_, i32>(0).unwrap(), 1);
@@ -175,11 +160,9 @@ fn live_pool_checkout_query_and_release() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn live_streaming_sink_receives_rows_without_buffering_result_sets() {
-    let Some(config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let config = config();
     let mut conn = NzConnection::connect(&config).expect("connect/authentication");
     let mut probe = StreamProbe::default();
     let summary = conn
@@ -198,11 +181,9 @@ fn live_streaming_sink_receives_rows_without_buffering_result_sets() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn live_streaming_sink_abort_cancels_and_preserves_same_session() {
-    let Some(mut config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut config = config();
     config.command_timeout = 0;
     let mut conn = NzConnection::connect(&config).expect("connect/authentication");
     let table = unique_name("CANCEL_STREAM_SESSION");
@@ -239,11 +220,9 @@ fn live_streaming_sink_abort_cancels_and_preserves_same_session() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn live_streaming_sink_preserves_multiple_result_sets() {
-    let Some(config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let config = config();
     let mut conn = NzConnection::connect(&config).expect("connect/authentication");
     let mut probe = StreamProbe::default();
     let summary = conn
@@ -258,11 +237,9 @@ fn live_streaming_sink_preserves_multiple_result_sets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 async fn live_native_client_query_and_bounded_stream() {
-    let Some(config) = config() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let config = config();
     let (client, connection) = nz_rust::connect(&config).await.expect("native connect");
     let driver = tokio::spawn(connection);
     let row = client
@@ -306,8 +283,9 @@ async fn live_native_client_query_and_bounded_stream() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn live_notices_arrive_during_streaming_query() {
-    let Some(config) = config() else { return };
+    let config = config();
     let mut conn = NzConnection::connect(&config).unwrap();
     let procedure = unique_name("RUST_NOTICE");
     let sql = format!(
@@ -333,8 +311,9 @@ fn live_notices_arrive_during_streaming_query() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance"]
 async fn live_native_stream_emits_procedure_notices() {
-    let Some(config) = config() else { return };
+    let config = config();
     let mut setup = NzConnection::connect(&config).unwrap();
     let procedure = unique_name("RUST_ASYNC_NOTICE");
     setup.batch_execute(&format!(
@@ -368,8 +347,9 @@ async fn live_native_stream_emits_procedure_notices() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn live_large_external_import_and_export_round_trip() {
-    let Some(config) = config() else { return };
+    let config = config();
     let mut conn = NzConnection::connect(&config).unwrap();
     let first = unique_name("RUST_EXT_SRC");
     let second = unique_name("RUST_EXT_DST");
@@ -421,8 +401,9 @@ fn live_large_external_import_and_export_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 async fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
-    let Some(config) = config() else { return };
+    let config = config();
     let mut conn = NzConnection::connect(&config).unwrap();
     let table = unique_name("RUST_META_T");
     let view = unique_name("RUST_META_V");
@@ -561,10 +542,9 @@ async fn live_metadata_helpers_reconstruct_table_view_and_procedure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 async fn live_native_regressions_long_text_exact_numeric_parameters_and_pool_drop() {
-    let Some(config) = config() else {
-        return;
-    };
+    let config = config();
     let client = nz_rust::Client::connect(&config).await.unwrap();
     let rows = client.query("SELECT repeat('x',40000)::VARCHAR(64000) AS v, 'ABC'::CHAR(10) AS c, 99999999999999999999999999999999999999::NUMERIC(38,0) AS n, 123::INTEGER AS i FROM JUST_DATA..FACTPRODUCTINVENTORY LIMIT 1", &[]).await.unwrap();
     assert_eq!(rows[0].try_get::<_, String>(0).unwrap().len(), 40000);
@@ -610,10 +590,9 @@ async fn live_native_regressions_long_text_exact_numeric_parameters_and_pool_dro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 async fn live_native_close_completes_while_stream_consumer_is_paused() {
-    let Some(config) = config() else {
-        return;
-    };
+    let config = config();
     let client = nz_rust::Client::connect(&config).await.unwrap();
     let rows = client
         .query_stream(
@@ -632,10 +611,9 @@ async fn live_native_close_completes_while_stream_consumer_is_paused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 async fn live_native_metadata_snapshot_and_numeric_temporal_getters() {
-    let Some(config) = config() else {
-        return;
-    };
+    let config = config();
     let client = nz_rust::Client::connect(&config).await.unwrap();
     let snapshot = client.metadata().snapshot(Some("ADMIN")).await.unwrap();
     assert!(!snapshot.schemas.is_empty());
@@ -683,10 +661,9 @@ async fn live_native_metadata_snapshot_and_numeric_temporal_getters() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn live_primary_blocking_iterator_transaction_and_pool_cleanup() {
-    let Some(config) = config() else {
-        return;
-    };
+    let config = config();
     let mut client = nz_rust::blocking::Client::connect(&config).unwrap();
     let mut rows = client
         .query_iter(
