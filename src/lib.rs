@@ -71,6 +71,7 @@ mod connection;
 pub mod error;
 pub mod export;
 pub mod handshake;
+mod handshake_common;
 pub mod messages;
 #[cfg(feature = "compat")]
 #[allow(dead_code)]

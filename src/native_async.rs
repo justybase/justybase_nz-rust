@@ -23,6 +23,7 @@
 use crate::config::{NzConnectionConfig, SecurityLevel};
 use crate::connection::{QueryResult, Row, RowMetadata};
 use crate::error::{parse_backend_error_fields, validate_protocol_length, NzError, NzResult};
+use crate::handshake_common;
 use crate::messages::{code, parse_command_complete_rows};
 use crate::params::SqlTemplate;
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
@@ -46,26 +47,10 @@ const CP_VERSION_6: i16 = 6;
 const CP_VERSION_4: i16 = 4;
 const CP_VERSION_5: i16 = 5;
 const CP_VERSION_2: i16 = 2;
-const PG_PROTOCOL_3: i16 = 3;
-const PG_PROTOCOL_5: i16 = 5;
 const HSV2_CLIENT_BEGIN: i16 = 1;
 const HSV2_DB: i16 = 2;
-const HSV2_USER: i16 = 3;
-const HSV2_REMOTE_PID: i16 = 6;
-const HSV2_CLIENT_TYPE: i16 = 8;
-const HSV2_PROTOCOL: i16 = 9;
 const HSV2_SSL_NEGOTIATE: i16 = 11;
 const HSV2_SSL_CONNECT: i16 = 12;
-const HSV2_APPNAME: i16 = 13;
-const HSV2_CLIENT_OS: i16 = 14;
-const HSV2_CLIENT_HOST_NAME: i16 = 15;
-const HSV2_CLIENT_OS_USER: i16 = 16;
-const HSV2_64BIT_VARLENA_ENABLED: i16 = 17;
-const HSV2_CLIENT_DONE: i16 = 1000;
-const AUTH_REQ_OK: i32 = 0;
-const AUTH_REQ_PASSWORD: i32 = 3;
-const AUTH_REQ_MD5: i32 = 5;
-const AUTH_REQ_SHA256: i32 = 6;
 const MAX_BUFFERED_FRAME: usize = 128 * 1024 * 1024;
 const SQL_TEMPLATE_CACHE_ENTRIES: usize = 128;
 const SQL_TEMPLATE_CACHE_BYTES: usize = 1024 * 1024;
@@ -1622,43 +1607,24 @@ impl AsyncSession {
             }
         }
 
-        let client_os = std::env::consts::OS;
-        let user = self.config.user.clone();
-        self.write_cstring_frame(HSV2_USER, &user).await?;
-        self.expect_ack("user").await?;
-        if version == CP_VERSION_4 || version == CP_VERSION_6 {
-            let app_name = self.config.app_name.clone();
-            self.write_cstring_frame(HSV2_APPNAME, &app_name).await?;
-            self.expect_ack("appname").await?;
-            self.write_cstring_frame(HSV2_CLIENT_OS, client_os).await?;
-            self.expect_ack("clientOs").await?;
-            let host_name = self.config.client_host_name.clone();
-            self.write_cstring_frame(HSV2_CLIENT_HOST_NAME, &host_name)
-                .await?;
-            self.expect_ack("clientHostName").await?;
-            let os_user = self.config.os_user.clone();
-            self.write_cstring_frame(HSV2_CLIENT_OS_USER, &os_user)
-                .await?;
-            self.expect_ack("clientOsUser").await?;
+        let options = handshake_common::option_plan(
+            version,
+            handshake_common::HandshakeClientInfo {
+                user: &self.config.user,
+                app_name: &self.config.app_name,
+                client_os: std::env::consts::OS,
+                client_host_name: &self.config.client_host_name,
+                os_user: &self.config.os_user,
+                remote_pid: std::process::id() as i32,
+                client_type: self.config.client_type,
+            },
+        );
+        for option in options {
+            self.write_frame(option.opcode, &option.payload).await?;
+            if let Some(stage) = option.ack_after {
+                self.expect_ack(stage).await?;
+            }
         }
-        self.write_i16_frame(HSV2_PROTOCOL, &[PG_PROTOCOL_3, PG_PROTOCOL_5])
-            .await?;
-        self.expect_ack("remotePid").await?;
-        self.write_i32_frame(HSV2_REMOTE_PID, std::process::id() as i32)
-            .await?;
-        self.expect_ack("clientType").await?;
-        self.write_i16_frame(
-            HSV2_CLIENT_TYPE,
-            &[crate::normalize_client_type(self.config.client_type)],
-        )
-        .await?;
-        if version >= CP_VERSION_5 {
-            self.expect_ack("64bitVarlena").await?;
-            self.write_i16_frame(HSV2_64BIT_VARLENA_ENABLED, &[1])
-                .await?;
-        }
-        self.expect_ack("clientDone").await?;
-        self.write_i16_frame(HSV2_CLIENT_DONE, &[]).await?;
 
         match self.read_byte().await? {
             b'R' => {}
@@ -1669,42 +1635,13 @@ impl AsyncSession {
                 )))
             }
         }
-        let areq = self.read_i32().await?;
-        match areq {
-            AUTH_REQ_OK => {}
-            AUTH_REQ_PASSWORD => {
-                let mut payload = self.config.password.as_bytes().to_vec();
-                payload.push(0);
-                self.write_auth_response(&payload).await?;
-            }
-            AUTH_REQ_MD5 => {
-                let salt = self.read_bytes(2).await?;
-                let mut data = Vec::with_capacity(salt.len() + self.config.password.len());
-                data.extend_from_slice(&salt);
-                data.extend_from_slice(self.config.password.as_bytes());
-                let digest = md5::compute(data);
-                self.write_auth_response(
-                    format!("{}\0", base64_encode(&digest.0).trim_end_matches('=')).as_bytes(),
-                )
-                .await?;
-            }
-            AUTH_REQ_SHA256 => {
-                let salt = self.read_bytes(2).await?;
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(&salt);
-                hasher.update(self.config.password.as_bytes());
-                let digest = hasher.finalize();
-                self.write_auth_response(
-                    format!("{}\0", base64_encode(&digest).trim_end_matches('=')).as_bytes(),
-                )
-                .await?;
-            }
-            other => {
-                return Err(NzError::Protocol(format!(
-                    "unsupported authentication request {other}"
-                )))
-            }
+        let request = self.read_i32().await?;
+        let salt_len = handshake_common::auth_salt_len(request)?;
+        let salt = self.read_bytes(salt_len).await?;
+        if let Some(payload) =
+            handshake_common::auth_response(request, &self.config.password, &salt)?
+        {
+            self.write_auth_response(&payload).await?;
         }
 
         loop {
@@ -1759,13 +1696,7 @@ impl AsyncSession {
                             )))
                         }
                     };
-                    // Each downgrade must move strictly down, which also
-                    // bounds the negotiation to a handful of round trips.
-                    if proposed >= version {
-                        return Err(NzError::Protocol(format!(
-                            "handshake negotiation: server proposed version {proposed} after {version}"
-                        )));
-                    }
+                    handshake_common::validate_version_downgrade(version, proposed)?;
                     version = proposed;
                 }
                 b'E' => return Err(self.read_backend_error("handshakeNegotiationError").await),
@@ -2772,30 +2703,6 @@ fn format_host_port(config: &NzConnectionConfig) -> String {
     } else {
         format!("{}:{}", config.host, config.port)
     }
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@
 use crate::buffer::ReadBuffer;
 use crate::config::{NzConnectionConfig, SecurityLevel};
 use crate::error::{parse_backend_error_fields, validate_protocol_length, NzError, NzResult};
-use sha2::{Digest, Sha256};
+use crate::handshake_common;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -126,34 +126,14 @@ impl NzStream {
 // Handshake opcodes (HSV2_*)
 const HSV2_CLIENT_BEGIN: i16 = 1;
 const HSV2_DB: i16 = 2;
-const HSV2_USER: i16 = 3;
-const HSV2_REMOTE_PID: i16 = 6;
-const HSV2_CLIENT_TYPE: i16 = 8;
-const HSV2_PROTOCOL: i16 = 9;
 const HSV2_SSL_NEGOTIATE: i16 = 11;
 const HSV2_SSL_CONNECT: i16 = 12;
-const HSV2_APPNAME: i16 = 13;
-const HSV2_CLIENT_OS: i16 = 14;
-const HSV2_CLIENT_HOST_NAME: i16 = 15;
-const HSV2_CLIENT_OS_USER: i16 = 16;
-const HSV2_64BIT_VARLENA_ENABLED: i16 = 17;
-const HSV2_CLIENT_DONE: i16 = 1000;
 
 // Connection-protocol versions (CP_VERSION_*)
 const CP_VERSION_2: i16 = 2;
 const CP_VERSION_4: i16 = 4;
 const CP_VERSION_5: i16 = 5;
 const CP_VERSION_6: i16 = 6;
-
-// PG protocol data versions
-const PG_PROTOCOL_3: i16 = 3;
-const PG_PROTOCOL_5: i16 = 5;
-
-// Auth request codes
-const AUTH_REQ_OK: i32 = 0;
-const AUTH_REQ_PASSWORD: i32 = 3;
-const AUTH_REQ_MD5: i32 = 5;
-const AUTH_REQ_SHA256: i32 = 6;
 
 const MSG_ERROR_RESPONSE: u8 = b'E';
 const MSG_AUTH_REQUEST: u8 = b'R';
@@ -195,32 +175,8 @@ pub fn handshake(
         ));
     }
 
-    // protocol1 = 3 (PG protocol), protocol2 = 5 (data protocol)
-    let protocol1 = PG_PROTOCOL_3;
-    let protocol2 = PG_PROTOCOL_5;
-
-    let client_os = client_os_name();
-    if hs_version == CP_VERSION_6 || hs_version == CP_VERSION_4 {
-        conn_send_handshake_v4(
-            &mut stream,
-            buffer,
-            hs_version,
-            config,
-            protocol1,
-            protocol2,
-            client_os,
-        )
-    } else {
-        conn_send_handshake_v2(
-            &mut stream,
-            buffer,
-            hs_version,
-            config,
-            protocol1,
-            protocol2,
-        )
-    }
-    .map_err(|e| stage_error("options", e))?;
+    conn_send_options(&mut stream, buffer, hs_version, config)
+        .map_err(|e| stage_error("options", e))?;
 
     conn_authenticate(&mut stream, buffer, &config.password)
         .map_err(|e| stage_error("authentication", e))?;
@@ -338,10 +294,6 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-fn client_os_name() -> &'static str {
-    std::env::consts::OS
 }
 
 /// Frame writer for handshake option blocks:
@@ -514,13 +466,7 @@ fn conn_handshake_negotiate(stream: &mut dyn NzIo, buffer: &mut ReadBuffer) -> N
                         )));
                     }
                 };
-                // Each downgrade must move strictly down, which also bounds
-                // the negotiation to a handful of round trips.
-                if proposed >= version {
-                    return Err(NzError::Protocol(format!(
-                        "Handshake negotiation: server proposed version {proposed} after {version}"
-                    )));
-                }
+                handshake_common::validate_version_downgrade(version, proposed)?;
                 version = proposed;
             }
             MSG_ERROR_RESPONSE => {
@@ -537,6 +483,33 @@ fn conn_handshake_negotiate(stream: &mut dyn NzIo, buffer: &mut ReadBuffer) -> N
             }
         }
     }
+}
+
+fn conn_send_options(
+    stream: &mut dyn NzIo,
+    buffer: &mut ReadBuffer,
+    version: i16,
+    config: &NzConnectionConfig,
+) -> NzResult<()> {
+    let options = handshake_common::option_plan(
+        version,
+        handshake_common::HandshakeClientInfo {
+            user: &config.user,
+            app_name: &config.app_name,
+            client_os: std::env::consts::OS,
+            client_host_name: &config.client_host_name,
+            os_user: &config.os_user,
+            remote_pid: std::process::id() as i32,
+            client_type: config.client_type,
+        },
+    );
+    for option in options {
+        write_frame(stream, option.opcode, &option.payload)?;
+        if let Some(stage) = option.ack_after {
+            expect_n(stream, buffer, stage)?;
+        }
+    }
+    Ok(())
 }
 
 /// Step 2: database selection.
@@ -593,79 +566,6 @@ fn ssl_connect_opcode() -> i16 {
     HSV2_SSL_CONNECT
 }
 
-/// Step 4a: v4/v6 option sequence (includes Guardium audit metadata).
-fn conn_send_handshake_v4(
-    stream: &mut dyn NzIo,
-    buffer: &mut ReadBuffer,
-    hs_version: i16,
-    config: &NzConnectionConfig,
-    protocol1: i16,
-    protocol2: i16,
-    client_os: &str,
-) -> NzResult<()> {
-    write_cstring_frame(stream, HSV2_USER, &config.user)?;
-
-    expect_n(stream, buffer, "user")?;
-    write_cstring_frame(stream, HSV2_APPNAME, &config.app_name)?;
-    expect_n(stream, buffer, "appname")?;
-    write_cstring_frame(stream, HSV2_CLIENT_OS, client_os)?;
-    expect_n(stream, buffer, "clientOs")?;
-    write_cstring_frame(stream, HSV2_CLIENT_HOST_NAME, &config.client_host_name)?;
-    expect_n(stream, buffer, "clientHostName")?;
-    write_cstring_frame(stream, HSV2_CLIENT_OS_USER, &config.os_user)?;
-    expect_n(stream, buffer, "clientOsUser")?;
-    send_protocol_pid_type(stream, buffer, config, protocol1, protocol2, hs_version)
-}
-
-/// Step 4b: v2/v3/v5 option sequence.
-fn conn_send_handshake_v2(
-    stream: &mut dyn NzIo,
-    buffer: &mut ReadBuffer,
-    hs_version: i16,
-    config: &NzConnectionConfig,
-    protocol1: i16,
-    protocol2: i16,
-) -> NzResult<()> {
-    write_cstring_frame(stream, HSV2_USER, &config.user)?;
-    expect_n(stream, buffer, "user")?;
-    send_protocol_pid_type(stream, buffer, config, protocol1, protocol2, hs_version)
-}
-
-fn send_protocol_pid_type(
-    stream: &mut dyn NzIo,
-    buffer: &mut ReadBuffer,
-    config: &NzConnectionConfig,
-    protocol1: i16,
-    protocol2: i16,
-    hs_version: i16,
-) -> NzResult<()> {
-    // NOTE: the server sends exactly one `'N'` ack per client option frame, and
-    // the caller has already consumed the ack for the previous frame (USER, or
-    // OS_USER on the v4/v6 path). Reading another here would block on an ack
-    // the appliance never sends — both reference drivers read once per frame.
-    write_i16_frame(stream, HSV2_PROTOCOL, &[protocol1, protocol2])?;
-
-    expect_n(stream, buffer, "remotePid")?;
-    write_i32_frame(stream, HSV2_REMOTE_PID, std::process::id() as i32)?;
-
-    expect_n(stream, buffer, "clientType")?;
-    write_i16_frame(
-        stream,
-        HSV2_CLIENT_TYPE,
-        &[crate::normalize_client_type(config.client_type)],
-    )?;
-
-    if hs_version >= CP_VERSION_5 {
-        expect_n(stream, buffer, "64bitVarlena")?;
-        write_i16_frame(stream, HSV2_64BIT_VARLENA_ENABLED, &[1])?;
-    }
-
-    expect_n(stream, buffer, "clientDone")?;
-    // CLIENT_DONE: frame with opcode only, no payload bytes.
-    write_i16_frame(stream, HSV2_CLIENT_DONE, &[])?;
-    Ok(())
-}
-
 /// Step 5: authentication.
 fn conn_authenticate(
     stream: &mut dyn NzIo,
@@ -685,42 +585,13 @@ fn conn_authenticate(
         }
     }
 
-    let areq = buffer.read_i32(stream)?;
-    match areq {
-        AUTH_REQ_OK => Ok(()),
-        AUTH_REQ_PASSWORD => {
-            let mut payload = password.as_bytes().to_vec();
-            payload.push(0);
-            write_auth_response(stream, &payload)
-        }
-        AUTH_REQ_MD5 => {
-            let salt = buffer.read_bytes(stream, 2)?;
-            let mut combined = Vec::with_capacity(salt.len() + password.len());
-            combined.extend_from_slice(&salt);
-            combined.extend_from_slice(password.as_bytes());
-            let digest = md5::compute(combined);
-            send_hash_password(stream, &digest.0)
-        }
-        AUTH_REQ_SHA256 => {
-            let salt = buffer.read_bytes(stream, 2)?;
-            let mut hasher = Sha256::new();
-            hasher.update(&salt);
-            hasher.update(password.as_bytes());
-            let out = hasher.finalize();
-            send_hash_password(stream, &out)
-        }
-        other => Err(NzError::Protocol(format!(
-            "Unsupported authentication type requested by server: {other}"
-        ))),
+    let request = buffer.read_i32(stream)?;
+    let salt_len = handshake_common::auth_salt_len(request)?;
+    let salt = buffer.read_bytes(stream, salt_len)?;
+    if let Some(payload) = handshake_common::auth_response(request, password, &salt)? {
+        write_auth_response(stream, &payload)?;
     }
-}
-
-fn send_hash_password(stream: &mut dyn NzIo, digest: &[u8]) -> NzResult<()> {
-    let encoded = base64_encode(digest);
-    let trimmed = encoded.trim_end_matches('=');
-    let mut payload = trimmed.as_bytes().to_vec();
-    payload.push(0);
-    write_auth_response(stream, &payload)
+    Ok(())
 }
 
 /// Authentication responses are length-prefixed payloads without a message
@@ -732,31 +603,6 @@ fn write_auth_response(stream: &mut dyn NzIo, payload: &[u8]) -> NzResult<()> {
     stream.write_all(payload)?;
     stream.flush()?;
     Ok(())
-}
-
-/// Minimal standard base64 encoder (with padding) — password hashes only.
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(n >> 6) as usize & 63] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[n as usize & 63] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 /// Step 6: connection complete — read BackendKeyData / notices until 'Z'.
@@ -859,27 +705,8 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn md5_hash_trimmed() {
-        // Deterministic shape check: 24-char base64 for 16-byte digest → trim '='.
-        let digest = md5::compute(b"JTpassword");
-        let s = base64_encode(digest.0.as_slice());
-        assert_eq!(s.len(), 24);
-        assert!(s.ends_with('='));
-        assert_eq!(s.trim_end_matches('=').len(), 22);
-    }
-
-    #[test]
     fn password_authentication_writes_length_prefixed_cstring() {
-        let output = auth_exchange(AUTH_REQ_PASSWORD, &[], "secret");
+        let output = auth_exchange(3, &[], "secret");
         assert_eq!(
             output,
             [&(4 + 7i32).to_be_bytes()[..], b"secret\0",].concat()
@@ -889,34 +716,21 @@ mod tests {
     #[test]
     fn md5_authentication_writes_trimmed_base64_digest() {
         let salt = [0x12, 0x34];
-        let output = auth_exchange(AUTH_REQ_MD5, &salt, "secret");
-        let mut combined = salt.to_vec();
-        combined.extend_from_slice(b"secret");
-        let encoded = base64_encode(md5::compute(combined).0.as_slice())
-            .trim_end_matches('=')
-            .as_bytes()
-            .to_vec();
-        let mut expected = ((4 + encoded.len() + 1) as i32).to_be_bytes().to_vec();
-        expected.extend_from_slice(&encoded);
-        expected.push(0);
-        assert_eq!(output, expected);
+        let output = auth_exchange(5, &salt, "secret");
+        assert_eq!(output.len(), 4 + 22 + 1);
+        assert_eq!(&output[..4], &(27i32).to_be_bytes());
+        assert_eq!(output.last(), Some(&0));
+        assert!(!output[4..].contains(&b'='));
     }
 
     #[test]
     fn sha256_authentication_writes_trimmed_base64_digest() {
         let salt = [0x12, 0x34];
-        let output = auth_exchange(AUTH_REQ_SHA256, &salt, "secret");
-        let mut hasher = Sha256::new();
-        hasher.update(salt);
-        hasher.update(b"secret");
-        let encoded = base64_encode(hasher.finalize().as_slice())
-            .trim_end_matches('=')
-            .as_bytes()
-            .to_vec();
-        let mut expected = ((4 + encoded.len() + 1) as i32).to_be_bytes().to_vec();
-        expected.extend_from_slice(&encoded);
-        expected.push(0);
-        assert_eq!(output, expected);
+        let output = auth_exchange(6, &salt, "secret");
+        assert_eq!(output.len(), 4 + 43 + 1);
+        assert_eq!(&output[..4], &(48i32).to_be_bytes());
+        assert_eq!(output.last(), Some(&0));
+        assert!(!output[4..].contains(&b'='));
     }
 
     #[test]
