@@ -105,6 +105,15 @@ impl NzStream {
         }
     }
 
+    /// Peek at the underlying TCP socket without consuming bytes.
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.peek(buf),
+            #[cfg(feature = "ssl")]
+            Self::Tls(s) => s.sock.peek(buf),
+        }
+    }
+
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.shutdown(std::net::Shutdown::Both),

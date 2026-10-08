@@ -194,6 +194,9 @@ impl AsyncNzPool {
                 && (self.config.idle_timeout.is_zero()
                     || idle.idle_since.elapsed() < self.config.idle_timeout
                     || self.state.lock().expect("pool lock").total <= self.config.min);
+            // Probe outside the state lock: a socket the server closed while
+            // idle must not be handed out.
+            let fresh = fresh && idle.conn.probe_idle().await;
             if fresh {
                 reservation.registered = true;
                 return Ok(AsyncPooledConnection {

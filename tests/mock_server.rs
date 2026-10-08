@@ -1527,3 +1527,60 @@ async fn native_and_legacy_tls_reject_untrusted_certificate() {
     .unwrap();
     server.join().unwrap();
 }
+
+/// The pools' idle-socket probe must not retire healthy TLS sessions: pending
+/// TLS records (e.g. TLS 1.3 session tickets) are not protocol data.
+#[cfg(feature = "ssl")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_and_legacy_pools_reuse_idle_tls_sessions() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = mock_config(listener.local_addr().unwrap().port());
+    config.security_level = SecurityLevel::OnlySecuredSession;
+    config.ssl_cert_path = Some(format!(
+        "{}/tests/fixtures/tls/localhost-cert.pem",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let server = thread::spawn(move || {
+        // Exactly one physical session per pool: a retired session would
+        // need a second accept that never comes.
+        let (stream, _) = listener.accept().unwrap();
+        let mut native = serve_tls_handshake(stream);
+        for _ in 0..2 {
+            assert_eq!(read_query(&mut native), "SELECT tls");
+            send_select_response(&mut native);
+            assert_eq!(read_query(&mut native), "ROLLBACK");
+            send_message(&mut native, b'C', b"ROLLBACK\0");
+            send_ready(&mut native);
+        }
+        let (stream, _) = listener.accept().unwrap();
+        let mut legacy = serve_tls_handshake(stream);
+        for _ in 0..2 {
+            assert_eq!(read_query(&mut legacy), "SELECT tls");
+            send_select_response(&mut legacy);
+        }
+    });
+    let mut options = nz_rust::PoolConfig::new(config.clone());
+    options.max = 1;
+    let pool = nz_rust::Pool::new(options).unwrap();
+    for _ in 0..2 {
+        let lease = pool.get().await.unwrap();
+        assert_eq!(lease.query("SELECT tls", &[]).await.unwrap().len(), 1);
+        lease.release().await;
+    }
+    assert_eq!(pool.total_count().await, 1);
+    pool.close().await;
+    tokio::task::spawn_blocking(move || {
+        let mut options = nz_rust::NzPoolConfig::new(config);
+        options.max = 1;
+        let pool = nz_rust::NzPool::new(options).unwrap();
+        for _ in 0..2 {
+            let mut conn = pool.get().unwrap();
+            assert_eq!(conn.query("SELECT tls", &[]).unwrap().rows().len(), 1);
+        }
+        assert_eq!(pool.total_count(), 1);
+        pool.close();
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+}

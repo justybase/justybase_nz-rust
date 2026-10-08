@@ -441,6 +441,11 @@ impl EventSender {
 }
 
 enum Request {
+    /// Report whether the idle session's socket is still usable.
+    Probe {
+        _lease: Option<tokio::sync::OwnedMutexGuard<()>>,
+        response: oneshot::Sender<bool>,
+    },
     Query {
         sql: String,
         row_policy: RowPolicy,
@@ -1159,6 +1164,30 @@ impl Client {
         Ok(())
     }
 
+    /// Pool checkout probe: `false` when the idle session can no longer be
+    /// used (peer closed it, unsolicited data, or the driver has stopped).
+    pub(crate) async fn probe_idle(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let Ok(lease) = self.acquire_session().await else {
+            return false;
+        };
+        let (sender, receiver) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::Probe {
+                _lease: lease,
+                response: sender,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receiver.await.unwrap_or(false)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.requests.is_closed() || self.control.closed.load(Ordering::Acquire)
     }
@@ -1392,6 +1421,11 @@ async fn run_connection(
         let pid = session.backend_process_id;
         let key = session.backend_secret_key;
         let reusable = match request {
+            Request::Probe { _lease, response } => {
+                let healthy = session.idle_socket_is_healthy().await;
+                let _ = response.send(healthy);
+                healthy
+            }
             Request::Query {
                 sql,
                 row_policy,
@@ -1515,6 +1549,31 @@ impl AsyncSession {
             .await
             .map_err(|_| NzError::Timeout("handshake timeout".into()))??;
         Ok(session)
+    }
+
+    /// Zero-wait check that the peer has neither closed the idle socket nor
+    /// sent unsolicited bytes (which would desynchronize the next response).
+    async fn idle_socket_is_healthy(&mut self) -> bool {
+        if !self.buffer.is_empty() {
+            return false;
+        }
+        let mut byte = [0u8; 1];
+        match self.stream.as_mut() {
+            None => false,
+            // Elapsed: nothing to read, the session is idle and open.
+            Some(AsyncTransport::Plain(stream)) => {
+                tokio::time::timeout(Duration::ZERO, stream.peek(&mut byte))
+                    .await
+                    .is_err()
+            }
+            // Pending TLS records (e.g. TLS 1.3 session tickets) are not
+            // protocol data; only EOF or a socket error retires the session.
+            #[cfg(feature = "ssl")]
+            Some(AsyncTransport::Tls(stream)) => !matches!(
+                tokio::time::timeout(Duration::ZERO, stream.get_ref().0.peek(&mut byte)).await,
+                Ok(Ok(0) | Err(_))
+            ),
+        }
     }
 
     async fn close(&mut self) -> NzResult<()> {

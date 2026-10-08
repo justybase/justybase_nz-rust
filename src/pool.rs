@@ -262,8 +262,9 @@ impl NzPool {
                 return false;
             }
         }
-        // A dead socket must not be handed out.
-        !idle.conn.is_closed()
+        // A dead socket (or one the server wrote to while idle) must not be
+        // handed out.
+        !idle.conn.is_closed() && idle.conn.idle_socket_is_healthy()
     }
 }
 

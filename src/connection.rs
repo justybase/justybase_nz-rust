@@ -1328,6 +1328,42 @@ impl NzConnection {
         !self.connected || self.stream.is_none()
     }
 
+    /// Non-blocking check, for pools, that an idle session's socket is still
+    /// usable: the peer has not closed it and sent nothing unsolicited. Bytes
+    /// that are expected (the tail of a cancelled response awaiting resync)
+    /// do not count against it.
+    pub(crate) fn idle_socket_is_healthy(&self) -> bool {
+        let Some(stream) = self.stream.as_ref() else {
+            return false;
+        };
+        if !self.connected || self.executing {
+            return false;
+        }
+        if !self.buffer.is_empty() {
+            return self.protocol_sync_required;
+        }
+        let mut byte = [0u8; 1];
+        if stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let peeked = stream.peek(&mut byte);
+        let restored = stream.set_nonblocking(false).is_ok()
+            && stream
+                .set_read_timeout(Some(Duration::from_secs(
+                    self.config.connection_timeout.max(1),
+                )))
+                .is_ok();
+        // Pending TLS records (e.g. TLS 1.3 session tickets) are not
+        // protocol data, so only plaintext sessions reject unsolicited bytes.
+        let plaintext = matches!(stream, NzStream::Plain(_));
+        restored
+            && match peeked {
+                Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+                Ok(0) => false,
+                Ok(_) => !plaintext || self.protocol_sync_required,
+            }
+    }
+
     /// True while an explicit transaction opened with `BEGIN` is still open.
     ///
     /// Netezza `ReadyForQuery` carries no transaction-status byte, so the
