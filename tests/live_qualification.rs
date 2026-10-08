@@ -809,7 +809,7 @@ async fn live_temporal_extremes_binary_matches_server_text() {
          DISTRIBUTE ON RANDOM"
     )];
     for (id, (ty, literal)) in TEMPORAL_CASES.iter().enumerate() {
-        let mut cells = vec!["NULL"; 5];
+        let mut cells = ["NULL"; 5];
         let slot = ["DATE", "TIME", "TIMESTAMP", "INTERVAL", "TIMETZ"]
             .iter()
             .position(|t| t == ty)

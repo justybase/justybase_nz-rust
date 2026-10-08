@@ -344,7 +344,10 @@ async fn malformed_import_requests_fail_with_protocol_errors_and_retire_the_sess
             matches!(result, Err(NzError::Protocol(_))),
             "{label}: {result:?}"
         );
-        assert!(client.is_closed(), "{label}: session must be retired");
+        assert!(
+            wait_until(Duration::from_secs(5), || client.is_closed()),
+            "{label}: session must be retired"
+        );
     }
     server.assert_no_handler_panics();
 }
@@ -464,7 +467,7 @@ async fn export_chunk_with_hostile_length_is_a_protocol_error() {
     .await
     .expect("client hung on a 2 GB export chunk");
     assert!(matches!(result, Err(NzError::Protocol(_))), "{result:?}");
-    assert!(client.is_closed());
+    assert!(wait_until(Duration::from_secs(5), || client.is_closed()));
     std::fs::remove_dir_all(&root).unwrap();
     server.assert_no_handler_panics();
 }

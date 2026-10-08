@@ -218,7 +218,7 @@ async fn replay_null_matrix() {
             .collect();
         assert_eq!(
             rows(&outcomes[0], 0, label),
-            [expected.clone()],
+            std::slice::from_ref(&expected),
             "{label} text"
         );
         assert_eq!(rows(&outcomes[3], 0, label), [expected], "{label} dbos");

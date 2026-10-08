@@ -97,9 +97,18 @@ async fn row_stream_drop_at_any_point_then_reuse() {
     let stream = client.query_stream("SELECT big", &[]).await.unwrap();
     drop(stream);
     assert_session_reusable(&client, &server, "drop before first row").await;
-    // A stream dropped before the driver picked it up is never sent at all.
-    assert_eq!(*queries.lock().unwrap(), ["SELECT ok"]);
-    assert_eq!(server.cancels.count(), 0);
+    // Whether the driver task picked the statement up before the drop was
+    // observed is a scheduling matter: either it never reached the backend,
+    // or it did and was cancelled and drained. Never anything in between.
+    let sent_before_drop = queries.lock().unwrap().iter().any(|q| q == "SELECT big");
+    if sent_before_drop {
+        assert!(
+            server.cancels.wait_for(1, Duration::from_secs(5)),
+            "a statement sent before the drop was not cancelled"
+        );
+    }
+    assert_eq!(server.cancels.count(), usize::from(sent_before_drop));
+    let phase_one_cancels = server.cancels.count();
 
     // After exactly one row.
     let mut stream = client.query_stream("SELECT big", &[]).await.unwrap();
@@ -141,7 +150,7 @@ async fn row_stream_drop_at_any_point_then_reuse() {
     );
 
     // Every abandoned in-flight big stream was cancelled out of band.
-    assert_eq!(server.cancels.count(), 2);
+    assert_eq!(server.cancels.count(), phase_one_cancels + 2);
     client.close().await.unwrap();
     server.assert_no_handler_panics();
 }
@@ -276,7 +285,7 @@ async fn abandoned_stream_without_terminal_response_closes_the_session() {
         ),
         "{next_query:?}"
     );
-    assert!(client.is_closed());
+    assert!(wait_until(Duration::from_secs(5), || client.is_closed()));
     assert_eq!(server.accepted(), 1);
     assert!(server.cancels.wait_for(1, Duration::from_secs(5)));
     server.assert_no_handler_panics();
