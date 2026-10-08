@@ -217,6 +217,9 @@ pub(crate) fn validate_text_row(
                 format!("Invalid DataRow payload: column {col_no} value length is invalid")
             })?;
     }
+    if index != data.len() {
+        return Err("Invalid DataRow payload: trailing bytes after the last column".into());
+    }
     Ok(())
 }
 
@@ -226,6 +229,28 @@ pub fn parse_text_data_row_into(
     columns: &[crate::tuple_desc::ColumnDesc],
     row: &mut Vec<NzValue>,
 ) -> Result<(), String> {
+    let mut value_stage = false;
+    parse_text_data_row_classified(data, columns, row, &mut value_stage)
+}
+
+/// [`parse_text_data_row_into`] that also reports *where* it failed.
+///
+/// `value_stage` is set to `true` once the cell's framing (bitmap, length
+/// prefix, bounds) has been validated and only the conversion of that cell's
+/// bytes remains. An error with `value_stage == true` is a data problem
+/// (invalid UTF-8, malformed scalar) in an otherwise well-formed row; with
+/// `false` the row layout itself is inconsistent.
+pub(crate) fn parse_text_data_row_classified(
+    data: &[u8],
+    columns: &[crate::tuple_desc::ColumnDesc],
+    row: &mut Vec<NzValue>,
+    value_stage: &mut bool,
+) -> Result<(), String> {
+    *value_stage = false;
+    // Validate every cell boundary before decoding the first value. Otherwise
+    // an invalid scalar in an early column could hide truncated framing in a
+    // later column and incorrectly leave the connection reusable.
+    validate_text_row(data, columns)?;
     let n = columns.len();
     let bitmap_len = n.div_ceil(8);
     if data.len() < bitmap_len {
@@ -237,6 +262,7 @@ pub fn parse_text_data_row_into(
     }
     let mut idx = bitmap_len;
     for (col_no, col) in columns.iter().enumerate() {
+        *value_stage = false;
         let byte = data[col_no / 8];
         let bit = 7 - (col_no % 8);
         if byte & (1 << bit) == 0 {
@@ -261,6 +287,7 @@ pub fn parse_text_data_row_into(
                 "Invalid DataRow payload: column {col_no} value length is invalid"
             ));
         }
+        *value_stage = true;
         if actual == 0 {
             row.push(
                 try_parse_text_value("", col.type_oid, col.type_mod)
@@ -432,5 +459,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `parse_text_data_row_classified` must say whether a failure happened in
+    /// the row's framing or only in converting one well-framed cell.
+    #[test]
+    fn classified_text_parse_separates_framing_from_value_errors() {
+        use crate::tuple_desc::ColumnDesc;
+        let columns: Vec<ColumnDesc> = [23, 1043]
+            .into_iter()
+            .map(|oid| ColumnDesc {
+                name: "c".into(),
+                type_oid: oid,
+                type_len: -1,
+                type_mod: -1,
+                format: 0,
+            })
+            .collect();
+        let row = |cells: &[&[u8]]| {
+            let mut payload = vec![0b1100_0000];
+            for cell in cells {
+                payload.extend_from_slice(&((cell.len() + 4) as i32).to_be_bytes());
+                payload.extend_from_slice(cell);
+            }
+            payload
+        };
+        let mut out = Vec::new();
+        let mut value_stage = false;
+
+        // Fine.
+        assert!(parse_text_data_row_classified(
+            &row(&[b"1", b"x"]),
+            &columns,
+            &mut out,
+            &mut value_stage
+        )
+        .is_ok());
+        // Invalid UTF-8 and a malformed scalar: value-level.
+        for cells in [[&b"1"[..], &[0xf3][..]], [&b"1x"[..], &b"ok"[..]]] {
+            let result =
+                parse_text_data_row_classified(&row(&cells), &columns, &mut out, &mut value_stage);
+            assert!(result.is_err() && value_stage, "{cells:?}");
+        }
+        // Truncated bitmap, cell length below its prefix, cell beyond the
+        // payload: framing-level.
+        let mut short_prefix = vec![0b1100_0000];
+        short_prefix.extend_from_slice(&2i32.to_be_bytes());
+        let mut too_long = vec![0b1100_0000];
+        too_long.extend_from_slice(&100i32.to_be_bytes());
+        too_long.push(b'1');
+        for payload in [Vec::new(), short_prefix, too_long] {
+            let result =
+                parse_text_data_row_classified(&payload, &columns, &mut out, &mut value_stage);
+            assert!(result.is_err() && !value_stage, "{payload:?}");
+        }
+        let mut later_cell_truncated = row(&[b"1x", &[0xf3]]);
+        later_cell_truncated[7..11].copy_from_slice(&100i32.to_be_bytes());
+        let result = parse_text_data_row_classified(
+            &later_cell_truncated,
+            &columns,
+            &mut out,
+            &mut value_stage,
+        );
+        assert!(result.is_err() && !value_stage);
+
+        let mut trailing = row(&[b"1", b"x"]);
+        trailing.push(0);
+        let result =
+            parse_text_data_row_classified(&trailing, &columns, &mut out, &mut value_stage);
+        assert!(result.is_err() && !value_stage);
     }
 }

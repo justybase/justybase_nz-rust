@@ -6,6 +6,11 @@ All notable changes to `nz_rust` will be documented here.
 
 ### Fixed
 
+- Native and legacy clients now defer invalid UTF-8 and malformed scalar
+  errors from fully framed rows until the response reaches
+  `ReadyForQuery`; those statement errors no longer retire a healthy session
+  or cause a pool to replace it. Malformed row framing and layout still close
+  the connection, and server errors take precedence.
 - Native client: SHA-256 password authentication sent the base64 digest with
   `=` padding (45 bytes) instead of unpadded like the legacy engine, MD5 path
   and reference drivers.

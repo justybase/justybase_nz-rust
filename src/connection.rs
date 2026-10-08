@@ -42,7 +42,7 @@ use crate::messages::{
 };
 use crate::params::{substitute_bound_parameters, substitute_parameters, NzParameter};
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
-use crate::types::text::{build_simple_query_packet, parse_text_data_row_into};
+use crate::types::text::{build_simple_query_packet, parse_text_data_row_classified};
 use crate::types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -1236,6 +1236,23 @@ pub struct NzConnection {
     /// byte was read but not its whole body). A timeout in that state leaves
     /// the read position inside a payload, which cannot be resynchronized.
     frame_in_progress: bool,
+    /// First undecodable *value* seen in the response being drained. The row
+    /// framing was valid, so the response is read to the end and the error is
+    /// reported then, without retiring the session.
+    deferred_decode: Option<NzError>,
+    /// Set when a statement failed only with `deferred_decode`.
+    decode_error_synced: bool,
+}
+
+/// Outcome of reading one binary row.
+enum DbosRead {
+    /// A decoded row is in the caller's buffer.
+    Row,
+    /// The row's framing was valid but a field could not be decoded; the row
+    /// was consumed and the error recorded in `deferred_decode`.
+    Skipped,
+    /// No complete row is buffered (non-blocking reads only).
+    NotAvailable,
 }
 
 impl NzConnection {
@@ -1276,6 +1293,8 @@ impl NzConnection {
                         command_deadline: None,
                         protocol_sync_required: false,
                         frame_in_progress: false,
+                        deferred_decode: None,
+                        decode_error_synced: false,
                     };
                     conn.finish_connect()?;
                     return Ok(conn);
@@ -1718,6 +1737,10 @@ impl NzConnection {
     /// (other than a command timeout, which resynchronizes via cancel) closes
     /// it so `is_closed()` reports the truth and pools never reuse it.
     fn mark_faulted_after(&mut self, error: &NzError) {
+        if std::mem::take(&mut self.decode_error_synced) {
+            // Only a value failed to decode; the stream is still aligned.
+            return;
+        }
         if error.is_protocol_fault() {
             self.mark_protocol_fault();
         } else if matches!(error, NzError::Closed(_))
@@ -1941,6 +1964,8 @@ impl NzConnection {
         let mut row_columns: Option<Arc<[ColumnDesc]>> = None;
         let mut row_metadata: Option<Arc<RowMetadata>> = None;
         let mut error: Option<NzError> = None;
+        self.deferred_decode = None;
+        self.decode_error_synced = false;
         let mut sink_error: Option<NzError> = None;
         let mut sink_cancel_sent = false;
 
@@ -1986,12 +2011,17 @@ impl NzConnection {
                         // the DBOS row length governs the frame.
                         self.skip_frame_header()?;
                         if sink.is_some() {
-                            self.read_dbos_tuple_into(
-                                &tupdesc,
-                                has_tupdesc,
-                                &mut stream_values,
-                                &mut stream_var_starts,
-                            )?;
+                            if matches!(
+                                self.read_dbos_tuple_into(
+                                    &tupdesc,
+                                    has_tupdesc,
+                                    &mut stream_values,
+                                    &mut stream_var_starts,
+                                )?,
+                                DbosRead::Skipped
+                            ) {
+                                continue;
+                            }
                             let result_set_index = if let Some(index) = current_result_set_index {
                                 index
                             } else {
@@ -2016,11 +2046,16 @@ impl NzConnection {
                                 &mut sink_error,
                             );
                             cancel_if_sink_aborted!(new_sink_error);
-                            while self.try_read_available_dbos_row(
-                                &tupdesc,
-                                has_tupdesc,
-                                &mut stream_values,
-                            )? {
+                            loop {
+                                match self.try_read_available_dbos_row(
+                                    &tupdesc,
+                                    has_tupdesc,
+                                    &mut stream_values,
+                                )? {
+                                    DbosRead::NotAvailable => break,
+                                    DbosRead::Skipped => continue,
+                                    DbosRead::Row => {}
+                                }
                                 let new_sink_error = emit_stream_row(
                                     &mut sink,
                                     &mut stream_result_sets,
@@ -2051,13 +2086,16 @@ impl NzConnection {
                             let mut values =
                                 Vec::with_capacity(columns.len().max(tupdesc.num_fields));
                             let mut var_starts = std::mem::take(&mut self.row_var_starts_scratch);
-                            self.read_dbos_tuple_into(
+                            let first = self.read_dbos_tuple_into(
                                 descriptor.as_ref(),
                                 has_tupdesc,
                                 &mut values,
                                 &mut var_starts,
-                            )?;
+                            );
                             self.row_var_starts_scratch = var_starts;
+                            if matches!(first?, DbosRead::Skipped) {
+                                continue;
+                            }
                             let metadata = row_metadata
                                 .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
                                 .clone();
@@ -2076,12 +2114,14 @@ impl NzConnection {
                                 });
                                 let mut values =
                                     Vec::with_capacity(columns.len().max(tupdesc.num_fields));
-                                if !self.try_read_available_dbos_row(
+                                match self.try_read_available_dbos_row(
                                     descriptor.as_ref(),
                                     has_tupdesc,
                                     &mut values,
                                 )? {
-                                    break;
+                                    DbosRead::NotAvailable => break,
+                                    DbosRead::Skipped => continue,
+                                    DbosRead::Row => {}
                                 }
                                 let metadata = row_metadata
                                     .get_or_insert_with(|| {
@@ -2241,8 +2281,20 @@ impl NzConnection {
                         let data = self.read_payload(len, "dataRowPayload")?;
                         if sink.is_some() {
                             let cols = current_columns_ref(&current, &cached_columns)?;
-                            parse_text_data_row_into(&data, cols, &mut stream_values)
-                                .map_err(NzError::Protocol)?;
+                            let mut value_stage = false;
+                            if let Err(message) = parse_text_data_row_classified(
+                                &data,
+                                cols,
+                                &mut stream_values,
+                                &mut value_stage,
+                            ) {
+                                if value_stage {
+                                    self.deferred_decode
+                                        .get_or_insert(NzError::Protocol(message));
+                                    continue;
+                                }
+                                return Err(NzError::Protocol(message));
+                            }
                             let result_set_index = if let Some(index) = current_result_set_index {
                                 index
                             } else {
@@ -2281,8 +2333,20 @@ impl NzConnection {
                                 )
                             })?;
                             let mut values = Vec::with_capacity(columns.len());
-                            parse_text_data_row_into(&data, &columns, &mut values)
-                                .map_err(NzError::Protocol)?;
+                            let mut value_stage = false;
+                            if let Err(message) = parse_text_data_row_classified(
+                                &data,
+                                &columns,
+                                &mut values,
+                                &mut value_stage,
+                            ) {
+                                if value_stage {
+                                    self.deferred_decode
+                                        .get_or_insert(NzError::Protocol(message));
+                                    continue;
+                                }
+                                return Err(NzError::Protocol(message));
+                            }
                             let metadata = row_metadata
                                 .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
                                 .clone();
@@ -2404,6 +2468,9 @@ impl NzConnection {
                     ))
                 } else if let Some(e) = error {
                     Err(e)
+                } else if let Some(e) = self.deferred_decode.take() {
+                    self.decode_error_synced = true;
+                    Err(e)
                 } else {
                     Ok((
                         QueryResult {
@@ -2487,13 +2554,14 @@ impl NzConnection {
         has_tupdesc: bool,
         values: &mut Vec<NzValue>,
         var_starts: &mut Vec<usize>,
-    ) -> NzResult<()> {
+    ) -> NzResult<DbosRead> {
         if !has_tupdesc {
             return Err(NzError::Protocol(
                 "Invalid RowStandard sequence: row description is missing; reconnect is required."
                     .into(),
             ));
         }
+        let mut deferred = None;
         let mut guard = self.stream_take()?;
         let mut buf = self.buffer.take();
         let r = (|| {
@@ -2504,13 +2572,25 @@ impl NzConnection {
             let row_len = buf.read_i32(&mut guard)?;
             let row_len = validate_protocol_length(row_len, "rowStandardPayload", false)?;
             let payload = buf.peek_bytes(&mut guard, row_len as usize)?;
-            let result = tupdesc.parse_row_into_with_scratch(payload, values, var_starts);
-            if result.is_ok() {
-                buf.advance(row_len as usize);
+            let mut field_stage = false;
+            match tupdesc.parse_row_classified(payload, values, var_starts, &mut field_stage) {
+                Ok(()) => {
+                    buf.advance(row_len as usize);
+                    Ok(DbosRead::Row)
+                }
+                // Valid framing, undecodable field: consume the row.
+                Err(error) if field_stage => {
+                    buf.advance(row_len as usize);
+                    deferred = Some(error);
+                    Ok(DbosRead::Skipped)
+                }
+                Err(error) => Err(error),
             }
-            result
         })();
         self.stream_restore(guard, buf);
+        if let Some(error) = deferred {
+            self.deferred_decode.get_or_insert(error);
+        }
         r
     }
 
@@ -2523,7 +2603,7 @@ impl NzConnection {
         tupdesc: &DbosTupleDesc,
         has_tupdesc: bool,
         values: &mut Vec<NzValue>,
-    ) -> NzResult<bool> {
+    ) -> NzResult<DbosRead> {
         if !has_tupdesc {
             return Err(NzError::Protocol(
                 "Invalid RowStandard sequence: row description is missing; reconnect is required."
@@ -2533,7 +2613,7 @@ impl NzConnection {
 
         let available = self.buffer.slice();
         if available.len() < 13 || available[0] != code::ROW_STANDARD {
-            return Ok(false);
+            return Ok(DbosRead::NotAvailable);
         }
 
         // Frame layout: type byte, shared 4-byte header, DBOS reserved word,
@@ -2544,16 +2624,30 @@ impl NzConnection {
             .checked_add(row_len)
             .ok_or_else(|| NzError::Protocol("DBOS row frame length overflow".into()))?;
         if available.len() < frame_len {
-            return Ok(false);
+            return Ok(DbosRead::NotAvailable);
         }
 
         let mut var_starts = std::mem::take(&mut self.row_var_starts_scratch);
-        let result =
-            tupdesc.parse_row_into_with_scratch(&available[13..frame_len], values, &mut var_starts);
+        let mut field_stage = false;
+        let result = tupdesc.parse_row_classified(
+            &available[13..frame_len],
+            values,
+            &mut var_starts,
+            &mut field_stage,
+        );
         self.row_var_starts_scratch = var_starts;
-        result?;
-        self.buffer.advance(frame_len);
-        Ok(true)
+        match result {
+            Ok(()) => {
+                self.buffer.advance(frame_len);
+                Ok(DbosRead::Row)
+            }
+            Err(error) if field_stage => {
+                self.buffer.advance(frame_len);
+                self.deferred_decode.get_or_insert(error);
+                Ok(DbosRead::Skipped)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     // -- protocol sync (orphaned-response drain) --------------------------------
@@ -3604,6 +3698,8 @@ mod tests {
             command_deadline: None,
             protocol_sync_required: false,
             frame_in_progress: false,
+            deferred_decode: None,
+            decode_error_synced: false,
         };
         connection
             .buffer
@@ -3611,18 +3707,21 @@ mod tests {
             .unwrap();
 
         let mut values = Vec::new();
-        assert!(connection
-            .try_read_available_dbos_row(&tupdesc, true, &mut values)
-            .unwrap());
+        assert!(matches!(
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            Ok(DbosRead::Row)
+        ));
         assert_eq!(values, vec![NzValue::Int4(7)]);
         values.clear();
-        assert!(connection
-            .try_read_available_dbos_row(&tupdesc, true, &mut values)
-            .unwrap());
+        assert!(matches!(
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            Ok(DbosRead::Row)
+        ));
         assert_eq!(values, vec![NzValue::Int4(8)]);
-        assert!(!connection
-            .try_read_available_dbos_row(&tupdesc, true, &mut values)
-            .unwrap());
+        assert!(matches!(
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            Ok(DbosRead::NotAvailable)
+        ));
         assert_eq!(connection.buffer.slice()[0], code::COMMAND_COMPLETE);
     }
 

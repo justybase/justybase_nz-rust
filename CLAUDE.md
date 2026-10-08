@@ -39,6 +39,13 @@ Shared pieces: `tuple_desc.rs` (text `T` RowDescription, binary `X` DBOS descrip
 
 Wire facts worth knowing: backend frames are `[type][4 skipped bytes][i32 BE length][payload]` (`Z` has no length; DBOS `Y` has an extra reserved word); the appliance pads with NULs after `Z` and sends a `P…"blank"` pseudo-message before `T`; text NULL bitmap is MSB-first with set = present, DBOS bitmap is LSB-first from byte 2 indexed by physical field with set = NULL. A framing/length fault must retire the connection (a pool must never reuse it); an `ErrorResponse` followed by `Z` is a normal `NzError::Database` and keeps the session.
 
+Eager row decoding reports malformed field values (such as invalid UTF-8 or a
+bad scalar) as `NzError::Protocol` after draining the complete response through
+`ReadyForQuery`, so the session remains reusable. Validate the whole row
+layout before classifying a decode error: malformed lengths, truncation, or
+DBOS offsets still retire the connection. Lazy row access keeps reporting
+invalid UTF-8 when the affected field is read.
+
 ## Testing infrastructure
 
 Offline protocol tests use `tests/support/mod.rs`: byte-exact frame encoders (text, DBOS), `Chunking` fragmentation plans (whole/1/2/3/4/7 bytes/seeded), and `MockServer` (scripted handshake versions and auth, per-connection handler `Session`, `accepted` counter and `cancels` board to prove physical-connection identity and cancel packets). Prefer it for new tests; use `wait_until` only for flags the driver publishes asynchronously (e.g. `Client::is_closed()` right after an error). `tests/allocation_bounds.rs` installs a per-thread tracking global allocator. `fuzz/fuzz_targets/*` have mirrored bodies in `tests/fuzz_regressions.rs` — keep them in sync. Soak new concurrency tests on one core (`taskset -c 0 cargo test …`) to expose scheduling assumptions, and do it **per feature set** (`--no-default-features --features ""` and `compat`), not only `--all-features`: extra connections in the `compat` build hide races (a handshake-log race once passed locally and failed CI only in the `""` job). Read backend-side state such as `server.logs` through `MockServer::wait_for_logs`, never directly after `connect()`. `cargo test --all-targets` skips doctests, so CI runs `cargo test --doc` per feature set separately.

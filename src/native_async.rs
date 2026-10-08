@@ -27,7 +27,6 @@ use crate::handshake_common;
 use crate::messages::{code, parse_command_complete_rows};
 use crate::params::SqlTemplate;
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
-use crate::types::text::parse_text_data_row_into;
 use crate::types::value::ToSql;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
@@ -1424,7 +1423,8 @@ async fn run_connection(
                     continue;
                 }
                 session.import_source = import_source;
-                let (result, reusable) = drive_operation(
+                session.decode_error_synced = false;
+                let (result, mut reusable) = drive_operation(
                     session.query_inner(&sql, row_policy),
                     response.closed(),
                     &control,
@@ -1437,6 +1437,11 @@ async fn run_connection(
                 control
                     .transaction
                     .store(session.transaction, Ordering::Release);
+                // A decode error found after the whole response was read
+                // leaves the stream aligned, unlike a framing error.
+                if !reusable && std::mem::take(&mut session.decode_error_synced) {
+                    reusable = true;
+                }
                 let _ = response.send(result);
                 reusable
             }
@@ -1504,6 +1509,9 @@ struct AsyncSession {
     export_file: Option<File>,
     import_source: Option<(String, crate::connection::ImportSource)>,
     transaction: bool,
+    /// Set when the last statement failed only because a value could not be
+    /// decoded: the response was fully consumed, so the session is reusable.
+    decode_error_synced: bool,
 }
 
 impl AsyncSession {
@@ -1529,6 +1537,7 @@ impl AsyncSession {
             export_file: None,
             import_source: None,
             transaction: false,
+            decode_error_synced: false,
         };
         tokio::time::timeout_at(deadline, session.handshake())
             .await
@@ -1776,6 +1785,10 @@ impl AsyncSession {
         let mut rows_affected = -1i64;
         let mut notices = Vec::new();
         let mut error: Option<NzError> = None;
+        // A value that could not be decoded (invalid UTF-8, malformed
+        // scalar) inside a correctly framed row. The message was consumed, so
+        // the stream stays aligned: finish the response and report it then.
+        let mut decode_error: Option<NzError> = None;
         let mut batch_extra_result_set = false;
         let mut batch_rows = Vec::with_capacity(BATCH_ROWS);
         let mut batch_bytes = 0usize;
@@ -1824,12 +1837,24 @@ impl AsyncSession {
                         let mut values = Vec::with_capacity(
                             current.as_ref().expect("result set initialized").0.len(),
                         );
-                        descriptor.parse_row_into_with_scratch(
+                        let mut field_stage = false;
+                        match descriptor.parse_row_classified(
                             &payload,
                             &mut values,
                             &mut dbos_varying_scratch,
-                        )?;
-                        Row::from_shared_dbos_metadata(row_metadata, values, descriptor.clone())
+                            &mut field_stage,
+                        ) {
+                            Ok(()) => Row::from_shared_dbos_metadata(
+                                row_metadata,
+                                values,
+                                descriptor.clone(),
+                            ),
+                            Err(error) if field_stage => {
+                                decode_error.get_or_insert(error);
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         Row::from_dbos_raw_with_metadata(row_metadata, payload, descriptor.clone())?
                     };
@@ -1937,9 +1962,20 @@ impl AsyncSession {
                     let row = if row_policy.eagerly_decodes() {
                         let columns = current.as_ref().expect("result set initialized").0.as_ref();
                         let mut values = Vec::with_capacity(columns.len());
-                        parse_text_data_row_into(&data, columns, &mut values)
-                            .map_err(NzError::Protocol)?;
-                        Row::from_shared_metadata(row_metadata, values)
+                        let mut value_stage = false;
+                        match crate::types::text::parse_text_data_row_classified(
+                            &data,
+                            columns,
+                            &mut values,
+                            &mut value_stage,
+                        ) {
+                            Ok(()) => Row::from_shared_metadata(row_metadata, values),
+                            Err(message) if value_stage => {
+                                decode_error.get_or_insert(NzError::Protocol(message));
+                                continue;
+                            }
+                            Err(message) => return Err(NzError::Protocol(message)),
+                        }
                     } else {
                         Row::from_text_raw_with_metadata(row_metadata, data)?
                     };
@@ -2080,6 +2116,10 @@ impl AsyncSession {
                     )
                     .await;
                     if let Some(error) = error {
+                        return Err(error);
+                    }
+                    if let Some(error) = decode_error {
+                        self.decode_error_synced = true;
                         return Err(error);
                     }
                     if batch_extra_result_set {

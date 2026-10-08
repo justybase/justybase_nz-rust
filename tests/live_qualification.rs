@@ -17,7 +17,9 @@ mod live_support;
 
 use futures_core::Stream;
 use live_support::{live_config, unique_name};
-use nz_rust::{Client, Decimal, NzConnection, NzError, NzNumeric, NzValue, QueryOptions};
+use nz_rust::{
+    Client, Decimal, NzConnection, NzError, NzNumeric, NzValue, QueryOptions, QueryResult,
+};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -341,6 +343,209 @@ async fn live_varchar_length_boundaries_text_and_binary_paths() {
         assert_eq!(borrowed.len() as i64, length);
     }
     client.close().await.unwrap();
+}
+
+fn assert_latin_varchar_decode(result: Result<QueryResult, NzError>, label: &str) {
+    match result {
+        Ok(result) => {
+            let set = &result.result_sets[0];
+            assert!(set.nullability.is_some(), "{label}: expected DBOS rows");
+            assert_eq!(set.rows[0].try_get::<_, String>(0).unwrap(), "ó", "{label}");
+        }
+        Err(NzError::Protocol(message)) if message.contains("UTF-8") => {}
+        other => panic!("{label}: expected success or an UTF-8 Protocol error, got {other:?}"),
+    }
+}
+
+fn assert_unicode_nvarchar_rows(result: QueryResult, label: &str) {
+    let set = &result.result_sets[0];
+    assert!(set.nullability.is_some(), "{label}: expected DBOS rows");
+    assert_eq!(
+        set.rows[0].try_get::<_, String>(0).unwrap(),
+        "Zażółć gęślą jaźń…",
+        "{label}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live Netezza appliance"]
+async fn live_latin_varchar_decode_errors_keep_native_pool_and_legacy_sessions() {
+    const UNICODE: &str = "Zażółć gęślą jaźń…";
+
+    // The appliance database uses a Latin encoding for VARCHAR. A single ó
+    // creates a non-UTF-8 byte on the DBOS path while remaining representable
+    // in that encoding; Unicode text belongs in NVARCHAR.
+    let client = connect().await;
+    let table = unique_name("RUST_LATIN");
+    client
+        .batch_execute(&format!(
+            "CREATE TEMP TABLE {table} (V VARCHAR(64), N NVARCHAR(64)) DISTRIBUTE ON RANDOM"
+        ))
+        .await
+        .unwrap();
+    client
+        .batch_execute(&format!("INSERT INTO {table} VALUES ('ó', '{UNICODE}')"))
+        .await
+        .unwrap();
+    let sid = session_id(&client).await;
+    assert_latin_varchar_decode(
+        client
+            .query_multi(&format!("SELECT V FROM {table}"), &[])
+            .await,
+        "native",
+    );
+    assert_eq!(
+        session_id(&client).await,
+        sid,
+        "native session changed after decode"
+    );
+    assert_eq!(
+        client.query("SELECT 1", &[]).await.unwrap()[0]
+            .try_get::<_, i32>(0)
+            .unwrap(),
+        1
+    );
+    let text = client
+        .query_multi("SELECT CAST('plain' AS VARCHAR(64)) AS V", &[])
+        .await
+        .unwrap();
+    assert!(text.result_sets[0].nullability.is_none());
+    assert_eq!(
+        text.result_sets[0].rows[0].try_get::<_, String>(0).unwrap(),
+        "plain"
+    );
+    let unicode_text = client
+        .query_multi(
+            &format!("SELECT CAST('{UNICODE}' AS NVARCHAR(64)) AS N"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unicode_text.result_sets[0].rows[0]
+            .try_get::<_, String>(0)
+            .unwrap(),
+        UNICODE
+    );
+    assert_unicode_nvarchar_rows(
+        client
+            .query_multi(&format!("SELECT N FROM {table}"), &[])
+            .await
+            .unwrap(),
+        "native NVARCHAR",
+    );
+    client.close().await.unwrap();
+
+    let mut config = nz_rust::PoolConfig::new(live_config());
+    config.max = 1;
+    let pool = nz_rust::Pool::new(config).unwrap();
+    let lease = pool.get().await.unwrap();
+    let table = unique_name("RUST_LATIN_POOL");
+    lease
+        .batch_execute(&format!(
+            "CREATE TEMP TABLE {table} (V VARCHAR(64), N NVARCHAR(64)) DISTRIBUTE ON RANDOM"
+        ))
+        .await
+        .unwrap();
+    lease
+        .batch_execute(&format!("INSERT INTO {table} VALUES ('ó', '{UNICODE}')"))
+        .await
+        .unwrap();
+    let sid = lease.query("SELECT CURRENT_SID", &[]).await.unwrap()[0]
+        .try_values()
+        .unwrap()[0]
+        .to_display_string();
+    assert_latin_varchar_decode(
+        lease
+            .query_multi(&format!("SELECT V FROM {table}"), &[])
+            .await,
+        "pool lease",
+    );
+    let active_sid = lease.query("SELECT CURRENT_SID", &[]).await.unwrap()[0]
+        .try_values()
+        .unwrap()[0]
+        .to_display_string();
+    assert_eq!(
+        active_sid, sid,
+        "pool session changed while the lease was active"
+    );
+    assert_eq!(
+        lease.query("SELECT 1", &[]).await.unwrap()[0]
+            .try_get::<_, i32>(0)
+            .unwrap(),
+        1
+    );
+    let text = lease
+        .query_multi("SELECT CAST('plain' AS VARCHAR(64)) AS V", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        text.result_sets[0].rows[0].try_get::<_, String>(0).unwrap(),
+        "plain"
+    );
+    assert_unicode_nvarchar_rows(
+        lease
+            .query_multi(&format!("SELECT N FROM {table}"), &[])
+            .await
+            .unwrap(),
+        "pool NVARCHAR",
+    );
+    lease.release().await;
+    let lease = pool.get().await.unwrap();
+    let reused_sid = lease.query("SELECT CURRENT_SID", &[]).await.unwrap()[0]
+        .try_values()
+        .unwrap()[0]
+        .to_display_string();
+    assert_eq!(reused_sid, sid, "pool did not reuse the healthy session");
+    lease.release().await;
+    pool.close().await;
+
+    let mut conn = legacy();
+    let table = unique_name("RUST_LATIN_LEGACY");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE {table} (V VARCHAR(64), N NVARCHAR(64)) DISTRIBUTE ON RANDOM"
+    ))
+    .unwrap();
+    conn.batch_execute(&format!("INSERT INTO {table} VALUES ('ó', '{UNICODE}')"))
+        .unwrap();
+    let sid = legacy_session_id(&mut conn);
+    assert_latin_varchar_decode(conn.query(&format!("SELECT V FROM {table}"), &[]), "legacy");
+    assert_eq!(
+        legacy_session_id(&mut conn),
+        sid,
+        "legacy session changed after decode"
+    );
+    assert_eq!(
+        conn.query("SELECT 1", &[]).unwrap().result_sets[0].rows[0]
+            .try_get::<_, i32>(0)
+            .unwrap(),
+        1
+    );
+    let text = conn
+        .query("SELECT CAST('plain' AS VARCHAR(64)) AS V", &[])
+        .unwrap();
+    assert!(text.result_sets[0].nullability.is_none());
+    assert_eq!(
+        text.result_sets[0].rows[0].try_get::<_, String>(0).unwrap(),
+        "plain"
+    );
+    let unicode_text = conn
+        .query(
+            &format!("SELECT CAST('{UNICODE}' AS NVARCHAR(64)) AS N"),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        unicode_text.result_sets[0].rows[0]
+            .try_get::<_, String>(0)
+            .unwrap(),
+        UNICODE
+    );
+    assert_unicode_nvarchar_rows(
+        conn.query(&format!("SELECT N FROM {table}"), &[]).unwrap(),
+        "legacy NVARCHAR",
+    );
+    conn.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

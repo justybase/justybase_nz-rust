@@ -383,6 +383,116 @@ impl DbosTupleDesc {
         usize::try_from(width).map_err(|_| NzError::Protocol("invalid fixed field width".into()))
     }
 
+    fn row_field_start(
+        &self,
+        row: &[u8],
+        index: usize,
+        varying_starts: &[usize],
+    ) -> NzResult<usize> {
+        let fixed_size = self.field_fixed_size[index];
+        if fixed_size != 0 {
+            if fixed_size < 0 {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: fixed field {index} size is invalid; reconnect is required."
+                )));
+            }
+            let offset = self.field_offset[index];
+            if offset < 0 {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: fixed field {index} offset is invalid; reconnect is required."
+                )));
+            }
+            let start = offset as usize;
+            if start
+                .checked_add(self.fixed_width(index)?)
+                .is_none_or(|end| end > row.len())
+            {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: fixed field {index} extends beyond the row; reconnect is required."
+                )));
+            }
+            return Ok(start);
+        }
+
+        if !varying_starts.is_empty() {
+            let varying_index = self.field_offset[index];
+            if varying_index < 0 || varying_index as usize >= varying_starts.len() {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: varying field {index} index is invalid; reconnect is required."
+                )));
+            }
+            let start = varying_starts[varying_index as usize];
+            let encoded = u16::from_le_bytes(row[start..start + 2].try_into().unwrap()) as usize;
+            if encoded < 2 || start.checked_add(encoded).is_none_or(|end| end > row.len()) {
+                return Err(NzError::Protocol(format!(
+                    "Invalid RowStandard payload: varying field {index} extends beyond the row; reconnect is required."
+                )));
+            }
+            return Ok(start);
+        }
+
+        let start = usize::try_from(self.fixed_fields_size).map_err(|_| {
+            NzError::Protocol(
+                "Invalid RowStandard payload: fixed-field area offset is invalid; reconnect is required.".into(),
+            )
+        })?;
+        if start > row.len() {
+            return Err(NzError::Protocol(format!(
+                "Invalid RowStandard payload: field {index} starts outside the row; reconnect is required."
+            )));
+        }
+        Ok(start)
+    }
+
+    fn validate_row_field_storage(&self, row: &[u8], index: usize, start: usize) -> NzResult<()> {
+        let fixed_end = if self.field_fixed_size[index] != 0 {
+            Some(
+                start
+                    .checked_add(self.fixed_width(index)?)
+                    .ok_or_else(|| protocol_trunc(index))?,
+            )
+        } else {
+            None
+        };
+        let invalid = || protocol_trunc(index);
+        match self.field_type[index] {
+            nz_type::NZ_TYPE_CHAR => {
+                let length = usize::try_from(self.field_size[index]).map_err(|_| invalid())?;
+                let end = start.checked_add(length).ok_or_else(invalid)?;
+                if end > row.len() || fixed_end.is_some_and(|bound| end > bound) {
+                    return Err(invalid());
+                }
+            }
+            nz_type::NZ_TYPE_NCHAR
+            | nz_type::NZ_TYPE_NVARCHAR
+            | nz_type::NZ_TYPE_VARCHAR
+            | nz_type::NZ_TYPE_VAR_FIXED_CHAR
+            | nz_type::NZ_TYPE_JSON
+            | nz_type::NZ_TYPE_JSONPATH => {
+                if start.checked_add(2).is_none_or(|end| end > row.len())
+                    || fixed_end.is_some_and(|bound| start + 2 > bound)
+                {
+                    return Err(invalid());
+                }
+                let encoded =
+                    u16::from_le_bytes(row[start..start + 2].try_into().unwrap()) as usize;
+                let end = start.checked_add(encoded).ok_or_else(invalid)?;
+                if encoded < 2 || end > row.len() || fixed_end.is_some_and(|bound| end > bound) {
+                    return Err(invalid());
+                }
+            }
+            nz_type::NZ_TYPE_TIME_TZ => {
+                let length = usize::try_from(self.field_size[index]).map_err(|_| invalid())?;
+                let end = start.checked_add(length).ok_or_else(invalid)?;
+                if length < 12 || end > row.len() || fixed_end.is_some_and(|bound| end > bound) {
+                    return Err(invalid());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn is_null(&self, row: &[u8], base: usize, field_ix: usize) -> bool {
         if self.nulls_allowed == 0 {
             return false;
@@ -520,6 +630,23 @@ impl DbosTupleDesc {
         out: &mut Vec<NzValue>,
         var_starts: &mut Vec<usize>,
     ) -> NzResult<()> {
+        let mut field_stage = false;
+        self.parse_row_classified(row, out, var_starts, &mut field_stage)
+    }
+
+    /// [`Self::parse_row_into_with_scratch`] that also reports *where* it
+    /// failed. `field_stage` is `true` when the row layout (bitmap, varying
+    /// lengths, field offsets) validated and only the conversion of one
+    /// field's bytes failed (e.g. invalid UTF-8): a data problem in an
+    /// otherwise well-formed row. `false` means the layout itself is invalid.
+    pub(crate) fn parse_row_classified(
+        &self,
+        row: &[u8],
+        out: &mut Vec<NzValue>,
+        var_starts: &mut Vec<usize>,
+        field_stage: &mut bool,
+    ) -> NzResult<()> {
+        *field_stage = false;
         self.validate_row_bitmap(row)?;
         let num_fields = self.num_fields;
         if out.capacity() < num_fields {
@@ -571,66 +698,25 @@ impl DbosTupleDesc {
             }
         }
 
+        // Check every field's row storage before converting any value. This
+        // keeps an invalid value in an earlier column from hiding a malformed
+        // offset or length in a later column.
+        for i in 0..num_fields {
+            if self.is_null(row, 0, i) {
+                continue;
+            }
+            let start = self.row_field_start(row, i, var_starts)?;
+            self.validate_row_field_storage(row, i, start)?;
+        }
+
         for (i, out_value) in out.iter_mut().enumerate().take(num_fields) {
             if self.is_null(row, 0, i) {
                 *out_value = NzValue::Null;
                 continue;
             }
 
-            let field_start: usize;
-            let fixed_size = self.field_fixed_size[i];
-            if fixed_size != 0 {
-                if fixed_size < 0 {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} size is invalid; reconnect is required."
-                    )));
-                }
-                let off = self.field_offset[i];
-                if off < 0 {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} offset is invalid; reconnect is required."
-                    )));
-                }
-                field_start = off as usize;
-                if field_start
-                    .checked_add(self.fixed_width(i)?)
-                    .is_none_or(|end| end > row.len())
-                {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: fixed field {i} extends beyond the row; reconnect is required."
-                    )));
-                }
-            } else if !var_starts.is_empty() {
-                let var_index = self.field_offset[i];
-                if var_index < 0 || var_index as usize >= num_varying {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {i} index is invalid; reconnect is required."
-                    )));
-                }
-                let start = var_starts[var_index as usize];
-                let encoded =
-                    u16::from_le_bytes(row[start..start + 2].try_into().unwrap()) as usize;
-                if encoded < 2 || start + encoded > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: varying field {i} extends beyond the row; reconnect is required."
-                    )));
-                }
-                field_start = start;
-            } else {
-                let fixed = self.fixed_fields_size;
-                if fixed < 0 {
-                    return Err(NzError::Protocol(
-                        "Invalid RowStandard payload: fixed-field area offset is invalid; reconnect is required.".into(),
-                    ));
-                }
-                field_start = fixed as usize;
-                if field_start > row.len() {
-                    return Err(NzError::Protocol(format!(
-                        "Invalid RowStandard payload: field {i} starts outside the row; reconnect is required."
-                    )));
-                }
-            }
-
+            let field_start = self.row_field_start(row, i, var_starts)?;
+            *field_stage = true;
             self.parse_field_into(row, field_start, i, out_value)?;
         }
 
@@ -1061,5 +1147,77 @@ mod tests {
         row.extend_from_slice(&5i32.to_le_bytes());
         let vals = desc.parse_row(&row).unwrap();
         assert_eq!(vals[0], NzValue::Int4(5));
+    }
+
+    /// `parse_row_classified` reports `field_stage` only when the row layout
+    /// validated and a single field's bytes failed to convert.
+    #[test]
+    fn classified_dbos_parse_separates_layout_from_field_errors() {
+        // Descriptor: INT (fixed, offset 3) and VARCHAR (varying), both
+        // nullable, physical fields 0 and 1.
+        let mut payload = Vec::new();
+        for value in [1i32, 1, 4, 4, 1, 1, 7, 7, 2] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        for (ty, size, offset, phys, fixed) in [(3i32, 4i32, 3i32, 0i32, 4i32), (16, 16, 0, 1, 0)] {
+            for value in [ty, size, size, offset, phys, phys, 1, fixed, 0] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        payload.extend_from_slice(&[0; 8]);
+        let descriptor = DbosTupleDesc::parse(&payload, None).unwrap();
+        let build = |text: &[u8]| {
+            let mut row = vec![0, 0, 0];
+            row.extend_from_slice(&5i32.to_le_bytes());
+            row.truncate(7);
+            row.extend_from_slice(&((text.len() + 2) as u16).to_le_bytes());
+            row.extend_from_slice(text);
+            if (text.len() + 2) % 2 == 1 {
+                row.push(0);
+            }
+            row
+        };
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        let mut field_stage = false;
+
+        assert!(descriptor
+            .parse_row_classified(&build(b"ok"), &mut out, &mut scratch, &mut field_stage)
+            .is_ok());
+        // Invalid UTF-8 in a well-formed row: field-level.
+        let bad = build(&[0xf3, 0xff]);
+        assert!(descriptor
+            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage)
+            .is_err());
+        assert!(field_stage);
+
+        // A malformed later fixed-field offset must win over an undecodable
+        // earlier varying value. Value classification is safe only after the
+        // entire row layout has passed validation.
+        let mut descriptor_with_bad_later_field = descriptor.clone();
+        descriptor_with_bad_later_field.field_type[0] = nz_type::NZ_TYPE_VARCHAR;
+        descriptor_with_bad_later_field.field_size[0] = 16;
+        descriptor_with_bad_later_field.field_true_size[0] = 16;
+        descriptor_with_bad_later_field.field_offset[0] = 0;
+        descriptor_with_bad_later_field.field_fixed_size[0] = 0;
+        descriptor_with_bad_later_field.field_offset[1] = 100;
+        assert!(descriptor_with_bad_later_field
+            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage)
+            .is_err());
+        assert!(!field_stage);
+
+        // Varying length running past the row: layout-level.
+        let mut broken = build(b"ok");
+        let at = 7;
+        broken[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(descriptor
+            .parse_row_classified(&broken, &mut out, &mut scratch, &mut field_stage)
+            .is_err());
+        assert!(!field_stage);
+        // Row too short for the null bitmap: layout-level.
+        assert!(descriptor
+            .parse_row_classified(&[0], &mut out, &mut scratch, &mut field_stage)
+            .is_err());
+        assert!(!field_stage);
     }
 }
