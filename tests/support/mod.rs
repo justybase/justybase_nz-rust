@@ -72,7 +72,10 @@ pub fn notice(message: &str) -> Vec<u8> {
 }
 
 pub fn error(sqlstate: &str, message: &str) -> Vec<u8> {
-    frame(b'E', format!("SERROR\0C{sqlstate}\0M{message}\0\0").as_bytes())
+    frame(
+        b'E',
+        format!("SERROR\0C{sqlstate}\0M{message}\0\0").as_bytes(),
+    )
 }
 
 /// Text column: `(name, type oid, type length)`.
@@ -433,9 +436,7 @@ impl Read for ChunkedReader {
             return Ok(0);
         }
         let planned = self.sizes.get(self.chunk).copied().unwrap_or(usize::MAX);
-        let n = planned
-            .min(buf.len())
-            .min(self.data.len() - self.position);
+        let n = planned.min(buf.len()).min(self.data.len() - self.position);
         buf[..n].copy_from_slice(&self.data[self.position..self.position + n]);
         self.position += n;
         if n == planned {
@@ -822,9 +823,10 @@ impl MockServer {
                             cancels,
                             log,
                         };
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || handler(&mut session),
-                        ));
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handler(&mut session)
+                            }));
                         if let Err(panic) = outcome {
                             let message = panic
                                 .downcast_ref::<String>()

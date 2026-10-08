@@ -54,7 +54,11 @@ fn respond(sql: &str) -> Vec<u8> {
                     Some(DbosCell::Int4(-1)),
                 ],
                 [None, Some(DbosCell::Text("even".into())), None],
-                [Some(DbosCell::Int4(i32::MAX)), None, Some(DbosCell::Int4(0))],
+                [
+                    Some(DbosCell::Int4(i32::MAX)),
+                    None,
+                    Some(DbosCell::Int4(0)),
+                ],
             ] {
                 wire.extend(dbos_row_frame(&layout.row_payload(&cells)));
             }
@@ -203,8 +207,7 @@ async fn native_stream_and_batches_decode_identically_under_fragmentation() {
         let client = nz_rust::Client::connect(&server.config()).await.unwrap();
         let mut stream = client.query_stream(SQL_DBOS, &[]).await.unwrap();
         let mut streamed = Vec::new();
-        while let Some(row) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
-        {
+        while let Some(row) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await {
             streamed.push(row.unwrap().try_values().unwrap().to_vec());
         }
         assert_eq!(streamed, expected().dbos, "chunking {chunking:?}");
@@ -292,7 +295,9 @@ fn read_frames(reader: &mut ChunkedReader) -> Result<Vec<(u8, Vec<u8>)>, NzError
 
 #[test]
 fn read_buffer_reassembles_frames_at_every_single_split_point() {
-    for sql in [SQL_TEXT, SQL_DBOS, SQL_NOTICE, SQL_ERROR, SQL_MULTI, SQL_INSERT] {
+    for sql in [
+        SQL_TEXT, SQL_DBOS, SQL_NOTICE, SQL_ERROR, SQL_MULTI, SQL_INSERT,
+    ] {
         let wire = respond(sql);
         let baseline = read_frames(&mut ChunkedReader::new(wire.clone(), Chunking::Whole)).unwrap();
         assert_eq!(baseline.last().map(|f| f.0), Some(b'Z'));
