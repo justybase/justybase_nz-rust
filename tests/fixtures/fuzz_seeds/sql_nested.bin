@@ -1,0 +1,2 @@
+SELECT 'a''b'; 696477 ; 696477 -- c
+ /* nested /* c */ */ SELECT $1, $2

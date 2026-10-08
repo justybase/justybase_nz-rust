@@ -501,17 +501,40 @@ cargo clippy -p nz_rust --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features --offline
 ```
 
-Live tests use `NZ_DEV_HOST`, `NZ_DEV_PORT`, `NZ_DEV_USER` and
-`NZ_DEV_PASSWORD`:
+Live tests need a real appliance and are `#[ignore]`d, so `cargo test` never
+runs (or silently "passes") them. Configure `NZ_DEV_HOST`, `NZ_DEV_USER`,
+`NZ_DEV_PASSWORD`, `NZ_DEV_DB` (or `NZ_DEV_DATABASE`) and optionally
+`NZ_DEV_PORT`, then run them explicitly; a missing variable fails the run
+instead of skipping:
 
 ```bash
-NZ_RUN_LIVE_TESTS=1 \
-  cargo test -p nz_rust --features compat --test live_driver --test live_integration -- \
-  --nocapture --test-threads=1
+scripts/test-live.sh                    # live_qualification + live_driver + live_integration
+scripts/test-live.sh --qualification    # self-contained TEMP-table matrix only
+scripts/test-live.sh --stress           # pool stress / connection cycling (slow)
+scripts/test-live.sh --capture          # refresh tests/fixtures/wire from the appliance
+# PowerShell: scripts/test-live.ps1 [-Qualification] [-Stress] [-Capture] [-All]
 ```
 
-The live suites are opt-in because they require access to a Netezza appliance.
-The mock-server and unit suites are the default appliance-independent checks.
+or by hand:
+`cargo test --features compat --test live_qualification -- --ignored --nocapture --test-threads=1`.
+
+Test categories:
+
+| Category | Needs appliance | Where it runs |
+|---|---|---|
+| Unit, parser, mock-server, fragmentation, malformed-input, fault/poisoning, cancel-race, pool, handshake/auth, golden-wire replay, properties, fuzz regressions | no | `cargo test`, GitHub CI |
+| Functional LIVE (`live_qualification`, `live_driver`, `live_integration`) | yes | local, serial |
+| Data-heavy LIVE (tests whose ignore reason mentions the `JUST_DATA` sample schema) | yes + sample data | local |
+| Stress LIVE (`live_stress`; `NZ_STRESS_QUERIES`, `NZ_STRESS_CYCLES`) | yes | local, opt-in |
+
+`live_qualification` creates only session TEMP tables, so it works on an empty
+test database. Persistent test objects use unique `RUST_<pid>_<time>_<n>`
+names and are removed afterwards.
+
+Golden wire fixtures (`tests/fixtures/wire`, see its README) are real appliance
+responses to synthetic statements; GitHub CI replays them offline. Fuzz targets
+live in `fuzz/` (`protocol`, `sql_lexer`, `wire_frames`); their invariants also
+run on every `cargo test` through `tests/fuzz_regressions.rs`.
 
 The `examples/nz-editor` TUI is intentionally excluded from the published
 crate. It is a separate local package and uses the published

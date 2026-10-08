@@ -116,7 +116,10 @@ pub fn parse_row_description(data: &[u8]) -> NzResult<Vec<ColumnDesc>> {
         ));
     }
     let count = u16::from_be_bytes(data[0..2].try_into().unwrap()) as usize;
-    let mut columns = Vec::with_capacity(count);
+    // Each column needs at least a NUL-terminated name and 11 metadata bytes,
+    // so never reserve more entries than the payload can actually encode.
+    const MIN_COLUMN_BYTES: usize = 1 + 11;
+    let mut columns = Vec::with_capacity(count.min((data.len() - 2) / MIN_COLUMN_BYTES));
     let mut offset = 2usize;
 
     for i in 0..count {

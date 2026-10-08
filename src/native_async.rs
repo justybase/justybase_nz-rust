@@ -236,8 +236,8 @@ const BATCH_BYTES: usize = 1024 * 1024;
 const STREAM_BATCH_ROWS: usize = 256;
 const STREAM_BATCH_BYTES: usize = 1024 * 1024;
 const STREAM_EVENT_CHANNEL_BATCHES: usize = 6;
-// A single reusable block bounds retained rows to 256, including while it is
-// queued or held by the public stream adapter.
+// A single reusable block per stream bounds retained rows to 256, including
+// while it is queued or held by the public stream adapter.
 const STREAM_BATCH_POOL_SIZE: usize = 1;
 
 struct StreamBatchPool {
@@ -441,6 +441,11 @@ impl EventSender {
 }
 
 enum Request {
+    /// Report whether the idle session's socket is still usable.
+    Probe {
+        _lease: Option<tokio::sync::OwnedMutexGuard<()>>,
+        response: oneshot::Sender<bool>,
+    },
     Query {
         sql: String,
         row_policy: RowPolicy,
@@ -708,7 +713,6 @@ pub struct Client {
     control: Arc<Control>,
     session: Arc<tokio::sync::Mutex<()>>,
     sql_templates: Arc<Mutex<SqlTemplateCache>>,
-    stream_batch_pool: Arc<StreamBatchPool>,
     exclusive: bool,
 }
 
@@ -808,7 +812,6 @@ pub async fn connect(config: &NzConnectionConfig) -> NzResult<(Client, Connectio
             control: control.clone(),
             session: Arc::new(tokio::sync::Mutex::new(())),
             sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
-            stream_batch_pool: Arc::new(StreamBatchPool::new()),
             exclusive: false,
         },
         Connection {
@@ -1042,7 +1045,10 @@ impl Client {
                     sender,
                     control: self.control.clone(),
                     budget: Arc::new(Semaphore::new(STREAM_BYTES)),
-                    batch_pool: self.stream_batch_pool.clone(),
+                    // One reusable block per stream: a partially consumed
+                    // stream that still holds its rows must not starve the
+                    // producer of a later stream on the same connection.
+                    batch_pool: Arc::new(StreamBatchPool::new()),
                 }),
                 batch: None,
                 terminal,
@@ -1156,6 +1162,30 @@ impl Client {
         }
         self.control.cancel();
         Ok(())
+    }
+
+    /// Pool checkout probe: `false` when the idle session can no longer be
+    /// used (peer closed it, unsolicited data, or the driver has stopped).
+    pub(crate) async fn probe_idle(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let Ok(lease) = self.acquire_session().await else {
+            return false;
+        };
+        let (sender, receiver) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::Probe {
+                _lease: lease,
+                response: sender,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receiver.await.unwrap_or(false)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1391,6 +1421,11 @@ async fn run_connection(
         let pid = session.backend_process_id;
         let key = session.backend_secret_key;
         let reusable = match request {
+            Request::Probe { _lease, response } => {
+                let healthy = session.idle_socket_is_healthy().await;
+                let _ = response.send(healthy);
+                healthy
+            }
             Request::Query {
                 sql,
                 row_policy,
@@ -1463,6 +1498,12 @@ async fn run_connection(
             break;
         }
     }
+    // A client may have reserved channel capacity before the loop ended and
+    // still push its request afterwards; such a request would never be
+    // answered. Close the queue and drain it until every outstanding permit
+    // is released, so each late caller observes `Closed` instead of hanging.
+    receiver.close();
+    while receiver.recv().await.is_some() {}
     tokio::time::timeout(Duration::from_secs(5), session.close())
         .await
         .map_err(|_| NzError::Timeout("connection close timeout".into()))?
@@ -1508,6 +1549,35 @@ impl AsyncSession {
             .await
             .map_err(|_| NzError::Timeout("handshake timeout".into()))??;
         Ok(session)
+    }
+
+    /// Zero-wait check that the peer has neither closed the idle socket nor
+    /// sent unsolicited bytes (which would desynchronize the next response).
+    async fn idle_socket_is_healthy(&mut self) -> bool {
+        // NUL padding between messages is normal (the appliance pads after
+        // ReadyForQuery) and is skipped by the parser.
+        if self.buffer.iter().any(|&b| b != 0) {
+            return false;
+        }
+        let mut pending = [0u8; 64];
+        match self.stream.as_mut() {
+            None => false,
+            // Elapsed: nothing to read, the session is idle and open.
+            Some(AsyncTransport::Plain(stream)) => {
+                match tokio::time::timeout(Duration::ZERO, stream.peek(&mut pending)).await {
+                    Err(_elapsed) => true,
+                    Ok(Ok(n)) => n > 0 && pending[..n].iter().all(|&b| b == 0),
+                    Ok(Err(_)) => false,
+                }
+            }
+            // Pending TLS records (e.g. TLS 1.3 session tickets) are not
+            // protocol data; only EOF or a socket error retires the session.
+            #[cfg(feature = "ssl")]
+            Some(AsyncTransport::Tls(stream)) => !matches!(
+                tokio::time::timeout(Duration::ZERO, stream.get_ref().0.peek(&mut pending)).await,
+                Ok(Ok(0) | Err(_))
+            ),
+        }
     }
 
     async fn close(&mut self) -> NzResult<()> {
@@ -1625,8 +1695,10 @@ impl AsyncSession {
                 hasher.update(&salt);
                 hasher.update(self.config.password.as_bytes());
                 let digest = hasher.finalize();
-                self.write_auth_response(format!("{}\0", base64_encode(&digest)).as_bytes())
-                    .await?;
+                self.write_auth_response(
+                    format!("{}\0", base64_encode(&digest).trim_end_matches('=')).as_bytes(),
+                )
+                .await?;
             }
             other => {
                 return Err(NzError::Protocol(format!(
@@ -1676,7 +1748,7 @@ impl AsyncSession {
             match self.read_byte().await? {
                 b'N' => return Ok(version),
                 b'M' => {
-                    version = match self.read_byte().await? {
+                    let proposed = match self.read_byte().await? {
                         b'2' => CP_VERSION_2,
                         b'4' => CP_VERSION_4,
                         b'5' => CP_VERSION_5,
@@ -1687,6 +1759,14 @@ impl AsyncSession {
                             )))
                         }
                     };
+                    // Each downgrade must move strictly down, which also
+                    // bounds the negotiation to a handful of round trips.
+                    if proposed >= version {
+                        return Err(NzError::Protocol(format!(
+                            "handshake negotiation: server proposed version {proposed} after {version}"
+                        )));
+                    }
+                    version = proposed;
                 }
                 b'E' => return Err(self.read_backend_error("handshakeNegotiationError").await),
                 other => {
@@ -2730,7 +2810,6 @@ mod tests {
             control: Arc::new(Control::default()),
             session: Arc::new(tokio::sync::Mutex::new(())),
             sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
-            stream_batch_pool: Arc::new(StreamBatchPool::new()),
             exclusive: false,
         }
     }

@@ -28,14 +28,22 @@ The example can be smoke-tested without a database:
 cargo run -p nz_rust --features compat --example dump_to_txt -- --demo --out demo.txt
 ```
 
-Live tests require `NZ_RUN_LIVE_TESTS=1`, `NZ_DEV_HOST`,
-`NZ_DEV_USER`, and `NZ_DEV_PASSWORD`; `NZ_DEV_PORT` and the database variable
-are optional. Run them serially with:
+Live tests are `#[ignore]`d and need `NZ_DEV_HOST`, `NZ_DEV_USER`,
+`NZ_DEV_PASSWORD` and `NZ_DEV_DB` (or `NZ_DEV_DATABASE`); `NZ_DEV_PORT` is
+optional. A missing variable fails the run. Run them serially with
+`scripts/test-live.sh` (`--qualification`, `--stress`, `--capture` modes;
+`scripts/test-live.ps1` on Windows), or:
 
 ```bash
-NZ_RUN_LIVE_TESTS=1 cargo test -p nz_rust \
-  --test live_driver --test live_integration -- --nocapture --test-threads=1
+cargo test -p nz_rust --features compat \
+  --test live_qualification --test live_driver --test live_integration -- \
+  --ignored --nocapture --test-threads=1
 ```
+
+`tests/support` holds the scripted mock backend (fragmentation, handshake and
+auth scripts, cancel counting); prefer it for new offline protocol tests.
+`tests/fixtures/wire` holds real appliance responses captured by
+`examples/capture_wire_fixtures.rs`.
 
 The `perf_fact200k` harness is also opt-in: set `NZ_RUN_REPLAY_PERF=1` to
 replay a recorded fixture (override its path with `NZ_REPLAY_FIXTURE`, or place

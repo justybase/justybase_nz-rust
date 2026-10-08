@@ -1,20 +1,25 @@
 //! Live integration suite — a Rust port of the Node `*.test.js` and C#
 //! `*.Tests` live-DB suites.
 //!
-//! Every test is skipped (reported as passing) unless `NZ_RUN_LIVE_TESTS=1`;
-//! it then talks to the appliance configured through the standard lab
-//! environment variables:
+//! Every test is `#[ignore]`d so `cargo test` never needs an appliance. Run
+//! them explicitly (a missing configuration then fails instead of being
+//! reported as passing):
 //!
 //! ```text
-//! NZ_RUN_LIVE_TESTS=1 \
 //! NZ_DEV_HOST=your_netezza_host NZ_DEV_PORT=5480 \
-//! NZ_DEV_DATABASE=JUST_DATA NZ_DEV_USER=admin NZ_DEV_PASSWORD=password \
-//!   cargo test -p nz_rust --test live_integration -- --nocapture --test-threads=1
+//! NZ_DEV_DATABASE=JUST_DATA NZ_DEV_USER=admin NZ_DEV_PASSWORD=... \
+//!   cargo test -p nz_rust --features compat --test live_integration -- \
+//!   --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! or use `scripts/test-live.sh`. Tests marked "with JUST_DATA sample schema"
+//! read the `JUST_DATA` demo tables; the rest create their own objects.
 //!
 //! Ported areas: type matrix (text + binary paths), NULL handling, parameters,
 //! multi-result sets / `hasRows` / `nextResult` boundaries, transactions,
 //! notices, invalid SQL, authentication failure, pooling, schema table.
+
+mod live_support;
 
 use nz_rust::types::value::NzValue;
 use nz_rust::{NzConnection, NzConnectionConfig, NzError, NzPool, NzPoolConfig};
@@ -24,41 +29,14 @@ use std::time::{Duration, Instant};
 
 const TABLE: &str = "JUST_DATA..DIMDATE";
 
-fn cfg() -> Option<NzConnectionConfig> {
-    if std::env::var("NZ_RUN_LIVE_TESTS").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let host = std::env::var("NZ_DEV_HOST").ok()?;
-    Some(NzConnectionConfig {
-        host,
-        port: std::env::var("NZ_DEV_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(5480),
-        database: std::env::var("NZ_DEV_DB")
-            .or_else(|_| std::env::var("NZ_DEV_DATABASE"))
-            .unwrap_or_else(|_| "JUST_DATA".into()),
-        user: std::env::var("NZ_DEV_USER").unwrap_or_else(|_| "admin".into()),
-        password: std::env::var("NZ_DEV_PASSWORD").expect("NZ_DEV_PASSWORD is required"),
-        ..Default::default()
-    })
+/// The live appliance configuration; fails the test when it is incomplete.
+fn cfg() -> NzConnectionConfig {
+    live_support::live_config()
 }
 
-macro_rules! live {
-    () => {
-        match cfg() {
-            Some(c) => c,
-            None => {
-                eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-                return;
-            }
-        }
-    };
-}
-
-/// Connect for a live test, or `None` when live tests are not enabled.
-fn live_conn() -> Option<NzConnection> {
-    Some(NzConnection::connect(&cfg()?).expect("connect"))
+/// Connect for a live test.
+fn live_conn() -> NzConnection {
+    NzConnection::connect(&cfg()).expect("connect")
 }
 
 fn as_f64(v: &NzValue) -> f64 {
@@ -74,22 +52,18 @@ fn unique(suffix: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn connection_open_and_close() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     assert!(!conn.is_closed());
     conn.close();
     assert!(conn.is_closed());
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn metadata_catalog_surface_matches_reference_drivers() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
 
     let schemas = conn.metadata().schemas().expect("schemas");
     assert!(!schemas.is_empty());
@@ -141,11 +115,9 @@ fn metadata_catalog_surface_matches_reference_drivers() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn integer_types_text_and_binary() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for (sql, expected) in [
         ("SELECT 1", 1i64),
         ("SELECT 15::BYTEINT", 15),
@@ -161,11 +133,9 @@ fn integer_types_text_and_binary() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn float_and_numeric_types() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for query in [
         "SELECT 3.14::FLOAT".to_string(),
         format!("SELECT 3.14::FLOAT FROM {TABLE} LIMIT 1"),
@@ -196,11 +166,9 @@ fn float_and_numeric_types() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn high_precision_numeric_is_exact() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for query in [
         "SELECT 12345678901234567890.1234567890::NUMERIC(38,10)".to_string(),
         format!("SELECT 12345678901234567890.1234567890::NUMERIC(38,10) FROM {TABLE} LIMIT 1"),
@@ -212,11 +180,9 @@ fn high_precision_numeric_is_exact() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn string_types_unicode() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for query in [
         "SELECT 'Hello World'::VARCHAR(100)".to_string(),
         format!("SELECT 'Hello World'::VARCHAR(100) FROM {TABLE} LIMIT 1"),
@@ -242,11 +208,9 @@ fn string_types_unicode() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn boolean_type() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for (sql, expected) in [
         ("SELECT true::BOOLEAN", true),
         ("SELECT false::BOOLEAN", false),
@@ -263,11 +227,9 @@ fn boolean_type() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn date_time_timestamp_interval() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
 
     for query in [
         "SELECT '2024-12-11'::DATE".to_string(),
@@ -311,11 +273,9 @@ fn date_time_timestamp_interval() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn null_handling() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for query in [
         "SELECT NULL".to_string(),
         format!("SELECT NULL FROM {TABLE} LIMIT 1"),
@@ -328,11 +288,9 @@ fn null_handling() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn mixed_null_and_non_null_strings() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let r = conn
         .query(
             "SELECT NULL::VARCHAR(10) AS c1, 'abc' AS c2, NULL::NVARCHAR(10) AS c3, \
@@ -349,11 +307,9 @@ fn mixed_null_and_non_null_strings() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn multiple_columns_and_version() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for query in [
         "SELECT 1 AS col1, 'text' AS col2, 3.14 AS col3".to_string(),
         format!("SELECT 1 AS col1, 'text' AS col2, 3.14 AS col3 FROM {TABLE} LIMIT 1"),
@@ -372,11 +328,9 @@ fn multiple_columns_and_version() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn parameterised_queries() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let params = vec![
         NzValue::Text("O'Brien".into()),
         NzValue::Int4(7),
@@ -404,11 +358,9 @@ fn parameterised_queries() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn multi_result_sets() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let r = conn
         .query(
             &format!("SELECT 1 FROM {TABLE} LIMIT 1; SELECT 2 FROM {TABLE} LIMIT 1"),
@@ -441,11 +393,9 @@ fn has_rows_list(conn: &mut NzConnection, sql: &str) -> Vec<bool> {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn has_rows_semantics() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
 
     let results = has_rows_list(&mut conn, "delete from JUST_DATA..DIMDATE where 1=2;");
     assert_eq!(results, vec![false]);
@@ -480,11 +430,9 @@ fn has_rows_semantics() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn reader_next_result_navigation() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let mut reader = conn
         .execute_reader(
             &format!("SELECT 1 AS value FROM {TABLE} ORDER BY ROWID LIMIT 3; SELECT 99 AS value"),
@@ -503,11 +451,9 @@ fn reader_next_result_navigation() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn reader_row_boundaries() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for limit in [0usize, 1, 499, 500, 501, 1000] {
         let mut reader = conn
             .execute_reader(
@@ -524,11 +470,9 @@ fn reader_row_boundaries() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn close_after_partial_read_keeps_session_aligned() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     {
         let mut reader = conn
             .execute_reader(
@@ -550,11 +494,9 @@ fn close_after_partial_read_keeps_session_aligned() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn reader_iteration_and_typed_getters() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let mut reader = conn
         .execute_reader(
             &format!("SELECT 1 as num, 'abc' as txt FROM {TABLE} LIMIT 3"),
@@ -585,11 +527,9 @@ fn reader_iteration_and_typed_getters() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn schema_table_reflects_columns() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let reader = conn
         .execute_reader(
             "SELECT CAST(42 AS INTEGER) AS INT_COL, \
@@ -621,11 +561,9 @@ fn schema_table_reflects_columns() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn transaction_rollback() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let table = unique("TX_RB");
     conn.batch_execute(&format!("DROP TABLE {table} IF EXISTS"))
         .unwrap();
@@ -651,11 +589,9 @@ fn transaction_rollback() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn transaction_commit() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let table = unique("TX_CM");
     conn.batch_execute(&format!("DROP TABLE {table} IF EXISTS"))
         .unwrap();
@@ -679,11 +615,9 @@ fn transaction_commit() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn transaction_closure_commits_and_rolls_back() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let table = unique("TX_FN");
     conn.batch_execute(&format!("DROP TABLE {table} IF EXISTS"))
         .unwrap();
@@ -714,11 +648,9 @@ fn transaction_closure_commits_and_rolls_back() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn notices_from_procedure_are_collected() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     let proc = format!("JUST_DATA.ADMIN.{}", unique("NOTICE"));
     // Clean up any leftovers first.
     let _ = conn.batch_execute(&format!("DROP PROCEDURE {proc}"));
@@ -745,11 +677,9 @@ fn notices_from_procedure_are_collected() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn invalid_sql_throws() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1 to run against a live appliance");
-        return;
-    };
+    let mut conn = live_conn();
     for sql in [
         "SELECT 1,,2;SELECT 1,2",
         "SELECT 1/0",
@@ -768,11 +698,9 @@ fn invalid_sql_throws() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn invalid_password_is_rejected() {
-    let Some(mut c) = cfg() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut c = cfg();
     c.password = "definitely-not-the-password".into();
     let err = NzConnection::connect(&c);
     assert!(err.is_err(), "connect with bad password must fail");
@@ -783,8 +711,9 @@ fn invalid_password_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn pool_basics() {
-    let pool = NzPool::new(NzPoolConfig::new(live!())).unwrap();
+    let pool = NzPool::new(NzPoolConfig::new(cfg())).unwrap();
     pool.execute("SELECT 1", &[]).unwrap();
     let r = pool.query("SELECT 12345 AS val", &[]).unwrap();
     assert_eq!(r.row_count(), 1);
@@ -795,8 +724,9 @@ fn pool_basics() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn pool_max_connections_and_release() {
-    let mut cfg = NzPoolConfig::new(live!());
+    let mut cfg = NzPoolConfig::new(cfg());
     cfg.max = 2;
     let pool = NzPool::new(cfg).unwrap();
 
@@ -811,8 +741,9 @@ fn pool_max_connections_and_release() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn pool_keeps_session_after_sql_error() {
-    let pool = NzPool::new(NzPoolConfig::new(live!())).unwrap();
+    let pool = NzPool::new(NzPoolConfig::new(cfg())).unwrap();
     {
         let mut holder = pool.get().unwrap();
         holder
@@ -830,8 +761,9 @@ fn pool_keeps_session_after_sql_error() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn pool_rolls_back_open_transaction_on_release() {
-    let mut cfg = NzPoolConfig::new(live!());
+    let mut cfg = NzPoolConfig::new(cfg());
     cfg.max = 1;
     let pool = NzPool::new(cfg).unwrap();
     let table = unique("POOL_TX");
@@ -862,8 +794,9 @@ fn pool_rolls_back_open_transaction_on_release() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn pool_tracks_transaction_state() {
-    let pool = NzPool::new(NzPoolConfig::new(live!())).unwrap();
+    let pool = NzPool::new(NzPoolConfig::new(cfg())).unwrap();
     let mut holder = pool.get().unwrap();
     holder.execute("BEGIN", &[]).unwrap();
     assert!(holder.in_transaction());
@@ -890,11 +823,9 @@ const HEAVY_SQL: &str = "\
     GROUP BY 1 LIMIT 500";
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn command_timeout_preserves_same_session_after_abort() {
-    let Some(mut c) = cfg() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut c = cfg();
     c.command_timeout = 4;
     let mut conn = NzConnection::connect(&c).unwrap();
     let table = unique("TIMEOUT_SESSION_TEST");
@@ -942,11 +873,9 @@ fn command_timeout_preserves_same_session_after_abort() {
 const DIMACCOUNT: &str = "JUST_DATA..DIMACCOUNT";
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn fetch_1000_and_2000_rows() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     for limit in [1000usize, 2000] {
         let mut reader = conn
             .execute_reader(&format!("SELECT * FROM {TABLE} LIMIT {limit}"), &[])
@@ -960,11 +889,9 @@ fn fetch_1000_and_2000_rows() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn fetch_all_rows_from_small_table() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     let mut reader = conn
         .execute_reader(&format!("SELECT * FROM {DIMACCOUNT}"), &[])
         .unwrap();
@@ -979,11 +906,9 @@ fn fetch_all_rows_from_small_table() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn subquery_union_and_cte() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     let r = conn
         .query("SELECT * FROM (SELECT 1 as x, 2 as y) sub", &[])
         .unwrap();
@@ -1010,11 +935,9 @@ fn subquery_union_and_cte() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn window_group_by_order_by_distinct() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
 
     let r = conn
         .query(
@@ -1065,11 +988,9 @@ fn window_group_by_order_by_distinct() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn numeric_negative_and_bigint_min() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
 
     let r = conn
         .query("SELECT 1234567890.123456789::NUMERIC(19,9)", &[])
@@ -1090,11 +1011,9 @@ fn numeric_negative_and_bigint_min() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn date_time_edge_cases() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
 
     for (sql, expected) in [
         ("SELECT '2024-02-29'::DATE", "2024-02-29"),
@@ -1120,22 +1039,18 @@ fn date_time_edge_cases() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn empty_string_handling() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     let r = conn.query("SELECT ''::VARCHAR(10)", &[]).unwrap();
     let v = r.rows()[0].raw(0);
     assert!(v.is_null() || v.to_display_string().is_empty());
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn connection_resilience_and_multiple_commands() {
-    let Some(c) = cfg() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let c = cfg();
 
     // Multiple connections sequentially.
     for _ in 0..3 {
@@ -1159,11 +1074,9 @@ fn connection_resilience_and_multiple_commands() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn multiple_result_sets_with_varying_column_counts() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     let mut reader = conn
         .execute_reader("SELECT 1; SELECT 1, 2; SELECT 1, 2, 3", &[])
         .unwrap();
@@ -1203,11 +1116,9 @@ fn multiple_result_sets_with_varying_column_counts() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA sample schema"]
 fn empty_result_set_followed_by_data() {
-    let Some(mut conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut conn = live_conn();
     let mut reader = conn
         .execute_reader(&format!("SELECT * FROM {TABLE} WHERE 1=0; SELECT 1"), &[])
         .unwrap();
@@ -1218,11 +1129,9 @@ fn empty_result_set_followed_by_data() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn command_timeout_property_defaults_and_set() {
-    let Some(conn) = live_conn() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let conn = live_conn();
     let mut cmd = conn.create_command("SELECT 1", vec![]);
     assert_eq!(cmd.command_timeout, 0);
     cmd.command_timeout = 60;
@@ -1230,17 +1139,18 @@ fn command_timeout_property_defaults_and_set() {
 }
 
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn out_of_band_cancel_interrupts_query_and_preserves_session() {
-    let Some(mut c) = cfg() else {
-        eprintln!("skipping: set NZ_RUN_LIVE_TESTS=1");
-        return;
-    };
+    let mut c = cfg();
     c.command_timeout = 0; // manual cancellation only
     let mut conn = NzConnection::connect(&c).unwrap();
 
     // Temp table proves the same backend session survives the cancel.
-    conn.batch_execute("CREATE TEMP TABLE RUST_CANCEL_TEST AS (SELECT 1 AS COL1)")
-        .unwrap();
+    let cancel_table = live_support::unique_name("RUST_CANCEL");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE {cancel_table} AS (SELECT 1 AS COL1)"
+    ))
+    .unwrap();
 
     let pid = conn.backend_process_id();
     let key = conn.backend_secret_key();
@@ -1258,7 +1168,7 @@ fn out_of_band_cancel_interrupts_query_and_preserves_session() {
     // Session preserved: the temp table is still visible.
     let mut ok = false;
     for _ in 0..20 {
-        if let Ok(r) = conn.query("SELECT COL1 FROM RUST_CANCEL_TEST", &[]) {
+        if let Ok(r) = conn.query(&format!("SELECT COL1 FROM {cancel_table}"), &[]) {
             assert_eq!(r.rows()[0].try_get::<_, i32>(0).unwrap(), 1);
             ok = true;
             break;
@@ -1278,11 +1188,9 @@ fn out_of_band_cancel_interrupts_query_and_preserves_session() {
 /// types report `type_len = -1` and carry their size in `type_mod` as
 /// `length + 16`, which is why the length can only come from the modifier.
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn column_type_metadata_matches_the_reference_table() {
-    let mut conn = match live_conn() {
-        Some(c) => c,
-        None => return,
-    };
+    let mut conn = live_conn();
     let sql = "SELECT 'a'::VARCHAR(32) AS V, 'b'::NVARCHAR(20) AS NV, 'c'::CHAR(5) AS C, \
                'd'::NCHAR(6) AS NC, 1.5::NUMERIC(10,4) AS N, 1::BYTEINT AS BI, \
                1::INT4 AS I4, 1::SMALLINT AS I2, 1::BIGINT AS I8, \
@@ -1340,11 +1248,9 @@ fn column_type_metadata_matches_the_reference_table() {
 /// `reader::ColumnMetadata` (the Node-style resolver) must agree on the
 /// declared length for the same types.
 #[test]
+#[ignore = "requires live Netezza appliance"]
 fn reader_metadata_agrees_with_the_descriptor() {
-    let mut conn = match live_conn() {
-        Some(c) => c,
-        None => return,
-    };
+    let mut conn = live_conn();
     let sql = "SELECT 'a'::VARCHAR(32) AS V, 'b'::NVARCHAR(20) AS NV, \
                1.5::NUMERIC(10,4) AS N, 1::BYTEINT AS BI";
     let result = conn.query(sql, &[]).expect("query");

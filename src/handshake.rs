@@ -105,6 +105,15 @@ impl NzStream {
         }
     }
 
+    /// Peek at the underlying TCP socket without consuming bytes.
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.peek(buf),
+            #[cfg(feature = "ssl")]
+            Self::Tls(s) => s.sock.peek(buf),
+        }
+    }
+
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.shutdown(std::net::Shutdown::Both),
@@ -494,7 +503,7 @@ fn conn_handshake_negotiate(stream: &mut dyn NzIo, buffer: &mut ReadBuffer) -> N
             b'N' => return Ok(version),
             b'M' => {
                 let c = read_byte(stream, buffer)?;
-                version = match c {
+                let proposed = match c {
                     b'2' => CP_VERSION_2,
                     b'3' => 3,
                     b'4' => CP_VERSION_4,
@@ -505,6 +514,14 @@ fn conn_handshake_negotiate(stream: &mut dyn NzIo, buffer: &mut ReadBuffer) -> N
                         )));
                     }
                 };
+                // Each downgrade must move strictly down, which also bounds
+                // the negotiation to a handful of round trips.
+                if proposed >= version {
+                    return Err(NzError::Protocol(format!(
+                        "Handshake negotiation: server proposed version {proposed} after {version}"
+                    )));
+                }
+                version = proposed;
             }
             MSG_ERROR_RESPONSE => {
                 return Err(throw_backend_error(
