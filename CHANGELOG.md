@@ -2,6 +2,38 @@
 
 All notable changes to `nz_rust` will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Native client: SHA-256 password authentication sent the base64 digest with
+  `=` padding (45 bytes) instead of unpadded like the legacy engine, MD5 path
+  and reference drivers.
+- Native client: requests issued while the connection task was shutting down
+  after a fatal error could wait forever; they now fail with `Closed`.
+- Native client: each `RowStream` owns its batch block, so a partially read
+  stream no longer stalls other streams on the same connection.
+- Pools (`Pool`, `NzPool`) no longer hand out an idle session whose socket the
+  server closed (or wrote unsolicited data to); checkout probes the socket and
+  replaces the session. NUL padding after `ReadyForQuery` is tolerated.
+- Legacy `NzConnection`: EOF or a transport error mid-response now closes the
+  connection (previously `is_closed()` stayed `false` and `NzPool` could reuse
+  it), and a command timeout inside a backend message retires the session
+  instead of resynchronizing from the middle of a payload.
+- Handshake version negotiation (both engines) now requires strictly
+  decreasing downgrades, bounding the negotiation.
+- `parse_row_description` no longer preallocates from the declared column
+  count before checking the payload can hold it.
+
+### Added
+
+- Test infrastructure: scripted mock backend with deterministic TCP
+  fragmentation, handshake/auth matrices, fault, cancel-race, stream-lifecycle,
+  pool and external-table failure suites, golden wire fixtures captured from a
+  real appliance, two new fuzz targets, property tests, `scripts/test-live.*`.
+- Appliance-backed tests are `#[ignore]`d and fail (instead of silently
+  passing) when run without `NZ_DEV_*` configuration.
+
 ## [0.3.3] - 2026-10-05
 
 ### Changed
