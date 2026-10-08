@@ -1146,8 +1146,11 @@ fn out_of_band_cancel_interrupts_query_and_preserves_session() {
     let mut conn = NzConnection::connect(&c).unwrap();
 
     // Temp table proves the same backend session survives the cancel.
-    conn.batch_execute("CREATE TEMP TABLE RUST_CANCEL_TEST AS (SELECT 1 AS COL1)")
-        .unwrap();
+    let cancel_table = live_support::unique_name("RUST_CANCEL");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE {cancel_table} AS (SELECT 1 AS COL1)"
+    ))
+    .unwrap();
 
     let pid = conn.backend_process_id();
     let key = conn.backend_secret_key();
@@ -1165,7 +1168,7 @@ fn out_of_band_cancel_interrupts_query_and_preserves_session() {
     // Session preserved: the temp table is still visible.
     let mut ok = false;
     for _ in 0..20 {
-        if let Ok(r) = conn.query("SELECT COL1 FROM RUST_CANCEL_TEST", &[]) {
+        if let Ok(r) = conn.query(&format!("SELECT COL1 FROM {cancel_table}"), &[]) {
             assert_eq!(r.rows()[0].try_get::<_, i32>(0).unwrap(), 1);
             ok = true;
             break;
