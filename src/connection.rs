@@ -1229,6 +1229,10 @@ pub struct NzConnection {
     /// the abandoned command's terminal response. The next command must wait
     /// for ReadyForQuery before writing its packet.
     protocol_sync_required: bool,
+    /// True while a backend message has been partially consumed (its type
+    /// byte was read but not its whole body). A timeout in that state leaves
+    /// the read position inside a payload, which cannot be resynchronized.
+    frame_in_progress: bool,
 }
 
 impl NzConnection {
@@ -1268,6 +1272,7 @@ impl NzConnection {
                         import_source: None,
                         command_deadline: None,
                         protocol_sync_required: false,
+                        frame_in_progress: false,
                     };
                     conn.finish_connect()?;
                     return Ok(conn);
@@ -1666,6 +1671,21 @@ impl NzConnection {
         }
     }
 
+    /// Retire the socket after an error that leaves its read position
+    /// unknown. A framing fault poisons the session; EOF or a transport error
+    /// (other than a command timeout, which resynchronizes via cancel) closes
+    /// it so `is_closed()` reports the truth and pools never reuse it.
+    fn mark_faulted_after(&mut self, error: &NzError) {
+        if error.is_protocol_fault() {
+            self.mark_protocol_fault();
+        } else if matches!(error, NzError::Closed(_))
+            || (matches!(error, NzError::Io(_)) && !is_command_timeout(error))
+        {
+            self.mark_protocol_fault();
+            self.protocol_faulted = false;
+        }
+    }
+
     fn run_batch(&mut self, sql: &str) -> NzResult<QueryResult> {
         self.run_batch_with_duration(
             sql,
@@ -1702,9 +1722,7 @@ impl NzConnection {
                 self.protocol_sync_required = true;
                 let _ = self.cancel();
             }
-            if e.is_protocol_fault() {
-                self.mark_protocol_fault();
-            }
+            self.mark_faulted_after(&e);
             self.executing = false;
             self.command_deadline = None;
             return Err(e);
@@ -1726,9 +1744,7 @@ impl NzConnection {
                 // A failed COMMIT/ROLLBACK/END/ABORT must not clear an open
                 // transaction, or the pool would skip its rollback-on-release.
                 self.restore_tx_on_error(sql, prev_in_tx);
-                if e.is_protocol_fault() {
-                    self.mark_protocol_fault();
-                }
+                self.mark_faulted_after(&e);
                 Err(e)
             }
         }
@@ -1771,9 +1787,7 @@ impl NzConnection {
                 self.protocol_sync_required = true;
                 let _ = self.cancel();
             }
-            if e.is_protocol_fault() {
-                self.mark_protocol_fault();
-            }
+            self.mark_faulted_after(&e);
             self.executing = false;
             self.command_deadline = None;
             return Err(e);
@@ -1798,9 +1812,7 @@ impl NzConnection {
             }
             Err(e) => {
                 self.restore_tx_on_error(sql, prev_in_tx);
-                if e.is_protocol_fault() {
-                    self.mark_protocol_fault();
-                }
+                self.mark_faulted_after(&e);
                 Err(e)
             }
         }
@@ -1902,7 +1914,9 @@ impl NzConnection {
 
         let outcome: NzResult<()> = (|| {
             loop {
+                self.frame_in_progress = false;
                 let msg_type = self.read_type_byte()?;
+                self.frame_in_progress = true;
                 match msg_type {
                     // -- external-table protocol (before the shared 4-byte header) --
                     b'u' => {
@@ -2310,8 +2324,16 @@ impl NzConnection {
                     // the appliance stops the abandoned execution. The cancel
                     // response is asynchronous, so the next command must
                     // drain it before sending a new packet.
-                    self.protocol_sync_required = true;
                     let _ = self.cancel();
+                    if self.frame_in_progress {
+                        // The orphaned response cannot be framed from inside
+                        // a payload: retire the socket instead of guessing.
+                        self.mark_faulted_after(&NzError::Closed(
+                            "command timed out inside a backend message".into(),
+                        ));
+                    } else {
+                        self.protocol_sync_required = true;
+                    }
                     return Err(NzError::Timeout("Command execution timeout".into()));
                 }
                 Err(e)
@@ -3539,6 +3561,7 @@ mod tests {
             import_source: None,
             command_deadline: None,
             protocol_sync_required: false,
+            frame_in_progress: false,
         };
         connection
             .buffer
