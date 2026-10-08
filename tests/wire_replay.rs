@@ -22,7 +22,7 @@ fn load(name: &str) -> Records {
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert_eq!(&data[..8], b"NZWIRE01", "{name}: bad magic");
     let mut offset = 8;
-    let mut u32_at = |data: &[u8], offset: &mut usize| {
+    let u32_at = |data: &[u8], offset: &mut usize| {
         let value = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
         *offset += 4;
         value
