@@ -42,12 +42,15 @@ jobs:
     name: Feature set ${{ matrix.features }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         features: ["", "ssl", "chrono", "compat", "ssl,chrono,compat"]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets --no-default-features --features "${{ matrix.features }}" --locked
+      # --all-targets skips doctests; run them for every feature set too.
+      - run: cargo test --doc --no-default-features --features "${{ matrix.features }}" --locked
 
   msrv:
     name: Rust MSRV 1.87

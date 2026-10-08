@@ -24,6 +24,9 @@ All notable changes to `nz_rust` will be documented here.
   decreasing downgrades, bounding the negotiation.
 - `parse_row_description` no longer preallocates from the declared column
   count before checking the payload can hold it.
+- The crate-level quick start (`Client::connect` returns a `Client`, not a
+  `(Client, Connection)` tuple) and the legacy-module doc examples now compile
+  in every feature set; CI runs doctests per feature set.
 
 ### Added
 
@@ -58,8 +61,6 @@ All notable changes to `nz_rust` will be documented here.
 - Reconstructed metadata DDL now handles quoted and reserved identifiers,
   synonym targets, procedure comments, and external-table layouts.
 - External-table compression and layout options are emitted in valid SQL form.
-
-## [Unreleased]
 
 ## [0.3.2] - 2026-10-03
 

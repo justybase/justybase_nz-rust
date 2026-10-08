@@ -318,8 +318,8 @@ fn resolve_column_metadata(col: &ColumnDesc, index: usize) -> ColumnMetadata {
 /// Forward-only reader over a buffered [`QueryResult`].
 ///
 /// ```no_run
-/// # use nz_rust::NzConnection;
-/// # fn f(conn: &mut NzConnection) -> nz_rust::error::NzResult<()> {
+/// # #[cfg(feature = "compat")]
+/// # fn f(conn: &mut nz_rust::NzConnection) -> nz_rust::error::NzResult<()> {
 /// let mut reader = conn.execute_reader("SELECT 1 AS ONE", &[])?;
 /// while reader.read()? {
 ///     let one: i32 = reader.try_get(0)?;

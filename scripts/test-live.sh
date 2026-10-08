@@ -17,8 +17,11 @@
 #                    empty test database)
 #   --stress         live_stress (pool stress and connection cycling; slow).
 #                    Tune with NZ_STRESS_QUERIES / NZ_STRESS_CYCLES.
+#   --admin          live_admin: tests that need administrative rights (e.g.
+#                    DROP SESSION on a session the test itself created).
+#                    Never part of the default run or --all.
 #   --capture        regenerate tests/fixtures/wire/*.bin from the appliance
-#   --all            functional + stress
+#   --all            functional + stress (not admin)
 #
 # Every suite runs serially (--test-threads=1) so results are deterministic.
 set -euo pipefail
@@ -66,6 +69,9 @@ case "$mode" in
     ;;
   --stress)
     run_suite live_stress "$@"
+    ;;
+  --admin)
+    run_suite live_admin "$@"
     ;;
   --capture)
     cargo run -p nz_rust --features "$features" --example capture_wire_fixtures -- \

@@ -129,7 +129,7 @@ pub(crate) fn take_import_source(id: &str) -> Option<ImportSource> {
 /// exactly like `tokio_postgres::Row`:
 ///
 /// ```no_run
-/// # use nz_rust::NzConnection;
+/// # #[cfg(feature = "compat")]
 /// # fn f(reader_row: nz_rust::connection::Row) -> nz_rust::error::NzResult<()> {
 /// let id: i32 = reader_row.try_get(0)?;
 /// let name: Option<String> = reader_row.try_get("name")?;
@@ -1195,6 +1195,8 @@ impl NzCommand {
 /// Typical use (tokio-postgres flavor):
 ///
 /// ```no_run
+/// # #[cfg(feature = "compat")]
+/// # fn demo() {
 /// use nz_rust::{NzConnection, NzConnectionConfig};
 /// use nz_rust::types::value::ToSql;
 ///
@@ -1205,6 +1207,7 @@ impl NzCommand {
 ///     let a: i32 = row.try_get(0).unwrap();
 ///     println!("{a}");
 /// }
+/// # }
 /// ```
 pub struct NzConnection {
     config: NzConnectionConfig,

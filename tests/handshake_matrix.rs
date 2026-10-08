@@ -149,11 +149,13 @@ async fn handshake_version_matrix_sends_the_right_options() {
             },
             |session| session.serve_all(|_| select_one()),
         );
-        for (engine, result) in connect_all(&server).await {
+        let results = connect_all(&server).await;
+        let expected_logs = results.len();
+        for (engine, result) in results {
             result.unwrap_or_else(|e| panic!("{engine} v{negotiated}: {e}"));
         }
-        let logs = server.logs.lock().unwrap().clone();
-        assert!(!logs.is_empty());
+        let logs = server.wait_for_logs(expected_logs);
+        assert_eq!(logs.len(), expected_logs);
         let config = server.config();
         for log in logs {
             assert_eq!(log.begin_versions, begins, "v{negotiated}");
@@ -283,13 +285,16 @@ async fn authentication_matrix_sends_exact_credentials() {
             },
             |session| session.serve_all(|_| select_one()),
         );
-        for (engine, result) in connect_all(&server).await {
+        let results = connect_all(&server).await;
+        let expected_logs = results.len();
+        for (engine, result) in results {
             if let Err(error) = result {
                 assert_no_secret(&error);
                 panic!("{engine} {name}: handshake failed: {error}");
             }
         }
-        let logs = server.logs.lock().unwrap().clone();
+        let logs = server.wait_for_logs(expected_logs);
+        assert_eq!(logs.len(), expected_logs, "{name}");
         for log in &logs {
             assert!(log.completed, "{name}");
             // Compare without echoing secrets on failure.

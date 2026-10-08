@@ -511,8 +511,9 @@ instead of skipping:
 scripts/test-live.sh                    # live_qualification + live_driver + live_integration
 scripts/test-live.sh --qualification    # self-contained TEMP-table matrix only
 scripts/test-live.sh --stress           # pool stress / connection cycling (slow)
+scripts/test-live.sh --admin            # tests needing admin rights (DROP SESSION of its own session)
 scripts/test-live.sh --capture          # refresh tests/fixtures/wire from the appliance
-# PowerShell: scripts/test-live.ps1 [-Qualification] [-Stress] [-Capture] [-All]
+# PowerShell: scripts/test-live.ps1 [-Qualification] [-Stress] [-Admin] [-Capture] [-All]
 ```
 
 or by hand:
@@ -526,6 +527,7 @@ Test categories:
 | Functional LIVE (`live_qualification`, `live_driver`, `live_integration`) | yes | local, serial |
 | Data-heavy LIVE (tests whose ignore reason mentions the `JUST_DATA` sample schema) | yes + sample data | local |
 | Stress LIVE (`live_stress`; `NZ_STRESS_QUERIES`, `NZ_STRESS_CYCLES`) | yes | local, opt-in |
+| Admin LIVE (`live_admin`: `DROP SESSION` of a session the test created) | yes + admin rights | local, opt-in (`--admin`) |
 
 `live_qualification` creates only session TEMP tables, so it works on an empty
 test database. Persistent test objects use unique `RUST_<pid>_<time>_<n>`

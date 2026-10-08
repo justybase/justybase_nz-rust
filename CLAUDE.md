@@ -23,10 +23,10 @@ CI also runs the feature matrix (`""`, `ssl`, `chrono`, `compat`, `ssl,chrono,co
 GitHub CI has no appliance and never will; LIVE tests are `#[ignore]`d and run only locally:
 
 ```bash
-scripts/test-live.sh [--qualification | --stress | --capture | --all]   # .ps1 on Windows
+scripts/test-live.sh [--qualification | --stress | --admin | --capture | --all]   # .ps1 on Windows
 ```
 
-Needs `NZ_DEV_HOST`, `NZ_DEV_USER`, `NZ_DEV_PASSWORD`, `NZ_DEV_DB` (or `NZ_DEV_DATABASE`), optional `NZ_DEV_PORT`; missing vars fail the run (`tests/live_support`). `live_qualification` uses only TEMP tables; tests whose ignore reason mentions `JUST_DATA` need the sample schema. `--capture` regenerates `tests/fixtures/wire/*.bin` (format in its README); review the diff before committing.
+Needs `NZ_DEV_HOST`, `NZ_DEV_USER`, `NZ_DEV_PASSWORD`, `NZ_DEV_DB` (or `NZ_DEV_DATABASE`), optional `NZ_DEV_PORT`; missing vars fail the run (`tests/live_support`). `live_qualification` uses only TEMP tables and needs no special rights (`--admin` runs `live_admin`, which needs `DROP SESSION`); tests whose ignore reason mentions `JUST_DATA` need the sample schema. `--capture` regenerates `tests/fixtures/wire/*.bin` (format in its README); review the diff before committing.
 
 ## Architecture
 
@@ -41,6 +41,6 @@ Wire facts worth knowing: backend frames are `[type][4 skipped bytes][i32 BE len
 
 ## Testing infrastructure
 
-Offline protocol tests use `tests/support/mod.rs`: byte-exact frame encoders (text, DBOS), `Chunking` fragmentation plans (whole/1/2/3/4/7 bytes/seeded), and `MockServer` (scripted handshake versions and auth, per-connection handler `Session`, `accepted` counter and `cancels` board to prove physical-connection identity and cancel packets). Prefer it for new tests; use `wait_until` only for flags the driver publishes asynchronously (e.g. `Client::is_closed()` right after an error). `tests/allocation_bounds.rs` installs a per-thread tracking global allocator. `fuzz/fuzz_targets/*` have mirrored bodies in `tests/fuzz_regressions.rs` — keep them in sync. Soak new concurrency tests on one core (`taskset -c 0 cargo test …`) to expose scheduling assumptions.
+Offline protocol tests use `tests/support/mod.rs`: byte-exact frame encoders (text, DBOS), `Chunking` fragmentation plans (whole/1/2/3/4/7 bytes/seeded), and `MockServer` (scripted handshake versions and auth, per-connection handler `Session`, `accepted` counter and `cancels` board to prove physical-connection identity and cancel packets). Prefer it for new tests; use `wait_until` only for flags the driver publishes asynchronously (e.g. `Client::is_closed()` right after an error). `tests/allocation_bounds.rs` installs a per-thread tracking global allocator. `fuzz/fuzz_targets/*` have mirrored bodies in `tests/fuzz_regressions.rs` — keep them in sync. Soak new concurrency tests on one core (`taskset -c 0 cargo test …`) to expose scheduling assumptions, and do it **per feature set** (`--no-default-features --features ""` and `compat`), not only `--all-features`: extra connections in the `compat` build hide races (a handshake-log race once passed locally and failed CI only in the `""` job). Read backend-side state such as `server.logs` through `MockServer::wait_for_logs`, never directly after `connect()`. `cargo test --all-targets` skips doctests, so CI runs `cargo test --doc` per feature set separately.
 
 Encoding caveat for live work: the test appliance's `VARCHAR` is Latin (non-UTF-8); use `NVARCHAR` for Unicode in fixtures/tests.

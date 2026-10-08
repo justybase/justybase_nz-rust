@@ -14,6 +14,8 @@
     (default)       live_qualification, live_driver, live_integration
     -Qualification  only live_qualification (self-contained)
     -Stress         live_stress (slow; NZ_STRESS_QUERIES / NZ_STRESS_CYCLES)
+    -Admin          live_admin: needs administrative rights (DROP SESSION on a
+                    session the test created); never part of the default run
     -Capture        regenerate tests/fixtures/wire/*.bin
     -All            functional + stress
 
@@ -23,6 +25,7 @@
 param(
     [switch]$Qualification,
     [switch]$Stress,
+    [switch]$Admin,
     [switch]$Capture,
     [switch]$All,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -62,6 +65,10 @@ if ($Qualification) {
 }
 if ($Stress) {
     Invoke-Suite 'live_stress'
+    exit 0
+}
+if ($Admin) {
+    Invoke-Suite 'live_admin'
     exit 0
 }
 Invoke-Suite 'live_qualification'

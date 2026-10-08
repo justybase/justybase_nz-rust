@@ -35,13 +35,13 @@
 //!
 //! # async fn example() -> nz_rust::NzResult<()> {
 //! let config = NzConnectionConfig::new("nz-host", "JUST_DATA", "admin", "secret");
-//! let (client, connection) = Client::connect(&config).await?;
-//! let driver = tokio::spawn(connection);
+//! // `Client::connect` spawns the protocol task itself. To drive it on your own
+//! // executor instead, use `nz_rust::connect`, which returns `(Client, Connection)`.
+//! let client = Client::connect(&config).await?;
 //! let row = client.query_one("SELECT 1 AS one", &[]).await?;
 //! let value: i32 = row.try_get("one")?;
 //! println!("{value}");
 //! client.close().await?;
-//! driver.await??;
 //! # Ok(())
 //! # }
 //! ```

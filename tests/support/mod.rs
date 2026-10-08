@@ -851,6 +851,24 @@ impl MockServer {
         }
     }
 
+    /// Handshake logs of the first `count` completed handshakes.
+    ///
+    /// The backend publishes a log from its own thread right after it sends
+    /// `ReadyForQuery`, so a client that just returned from `connect()` can
+    /// observe the connection before its log exists. Waiting here (instead of
+    /// reading `logs` directly) removes that race, and fails loudly rather
+    /// than letting a loop over an empty log pass vacuously.
+    pub fn wait_for_logs(&self, count: usize) -> Vec<HandshakeLog> {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                self.logs.lock().unwrap().len() >= count
+            }),
+            "expected {count} handshake log(s), got {}",
+            self.logs.lock().unwrap().len()
+        );
+        self.logs.lock().unwrap().clone()
+    }
+
     pub fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
