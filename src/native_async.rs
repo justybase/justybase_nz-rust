@@ -236,8 +236,8 @@ const BATCH_BYTES: usize = 1024 * 1024;
 const STREAM_BATCH_ROWS: usize = 256;
 const STREAM_BATCH_BYTES: usize = 1024 * 1024;
 const STREAM_EVENT_CHANNEL_BATCHES: usize = 6;
-// A single reusable block bounds retained rows to 256, including while it is
-// queued or held by the public stream adapter.
+// A single reusable block per stream bounds retained rows to 256, including
+// while it is queued or held by the public stream adapter.
 const STREAM_BATCH_POOL_SIZE: usize = 1;
 
 struct StreamBatchPool {
@@ -708,7 +708,6 @@ pub struct Client {
     control: Arc<Control>,
     session: Arc<tokio::sync::Mutex<()>>,
     sql_templates: Arc<Mutex<SqlTemplateCache>>,
-    stream_batch_pool: Arc<StreamBatchPool>,
     exclusive: bool,
 }
 
@@ -808,7 +807,6 @@ pub async fn connect(config: &NzConnectionConfig) -> NzResult<(Client, Connectio
             control: control.clone(),
             session: Arc::new(tokio::sync::Mutex::new(())),
             sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
-            stream_batch_pool: Arc::new(StreamBatchPool::new()),
             exclusive: false,
         },
         Connection {
@@ -1042,7 +1040,10 @@ impl Client {
                     sender,
                     control: self.control.clone(),
                     budget: Arc::new(Semaphore::new(STREAM_BYTES)),
-                    batch_pool: self.stream_batch_pool.clone(),
+                    // One reusable block per stream: a partially consumed
+                    // stream that still holds its rows must not starve the
+                    // producer of a later stream on the same connection.
+                    batch_pool: Arc::new(StreamBatchPool::new()),
                 }),
                 batch: None,
                 terminal,
@@ -2740,7 +2741,6 @@ mod tests {
             control: Arc::new(Control::default()),
             session: Arc::new(tokio::sync::Mutex::new(())),
             sql_templates: Arc::new(Mutex::new(SqlTemplateCache::default())),
-            stream_batch_pool: Arc::new(StreamBatchPool::new()),
             exclusive: false,
         }
     }
