@@ -230,7 +230,7 @@ async fn protocol_fault_marks_connection_unusable() {
         // The next request must fail without touching the socket.
         let next = tokio::time::timeout(Duration::from_secs(10), client.query("SELECT 1", &[]))
             .await
-            .unwrap();
+            .unwrap_or_else(|_| panic!("{}: request after the fault hung", fault.name));
         assert!(next.is_err(), "{}: poisoned client was reused", fault.name);
         assert!(
             wait_until(Duration::from_secs(5), || client.is_closed()),
@@ -332,6 +332,44 @@ fn protocol_fault_blocking_pool_retires_connection() {
     drop(conn);
     assert_eq!(server.accepted(), 2);
     pool.close();
+    server.assert_no_handler_panics();
+}
+
+/// Regression: a request issued while the driver task was shutting down
+/// after a fatal error could be enqueued after the task's last read and then
+/// wait forever for a response. Every such request must fail promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_racing_driver_shutdown_fail_promptly() {
+    let server = MockServer::start(HandshakeScript::default(), |session| {
+        // Read the first query, then hang up without answering.
+        let _ = session.read_query();
+    });
+    for iteration in 0..500 {
+        let client = nz_rust::Client::connect(&server.config()).await.unwrap();
+        assert!(client.query("SELECT 1", &[]).await.is_err());
+        let next = async {
+            if iteration % 2 == 0 {
+                client.query("SELECT 2", &[]).await.map(|_| ())
+            } else {
+                match client.query_stream("SELECT 2", &[]).await {
+                    Ok(mut stream) => match std::future::poll_fn(|cx| {
+                        futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
+                    })
+                    .await
+                    {
+                        Some(Ok(_)) => Ok(()),
+                        Some(Err(error)) => Err(error),
+                        None => Err(NzError::Closed("stream ended".into())),
+                    },
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(10), next)
+            .await
+            .unwrap_or_else(|_| panic!("iteration {iteration}: request hung after driver exit"));
+        assert!(outcome.is_err(), "iteration {iteration}: {outcome:?}");
+    }
     server.assert_no_handler_panics();
 }
 

@@ -1464,6 +1464,12 @@ async fn run_connection(
             break;
         }
     }
+    // A client may have reserved channel capacity before the loop ended and
+    // still push its request afterwards; such a request would never be
+    // answered. Close the queue and drain it until every outstanding permit
+    // is released, so each late caller observes `Closed` instead of hanging.
+    receiver.close();
+    while receiver.recv().await.is_some() {}
     tokio::time::timeout(Duration::from_secs(5), session.close())
         .await
         .map_err(|_| NzError::Timeout("connection close timeout".into()))?
