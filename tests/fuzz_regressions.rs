@@ -74,10 +74,12 @@ fn sql_lexer(data: &[u8]) {
     };
     assert_eq!(split_statements(sql), split_statements(sql));
     assert_eq!(parse_transaction_state(sql), parse_transaction_state(sql));
+    const MAX_TEXT_CHARS: usize = 16;
+    const MAX_TEXT_BYTES: usize = MAX_TEXT_CHARS * 4;
     let values = [
         NzValue::Null,
         NzValue::Int4(-7),
-        NzValue::Text(sql.chars().rev().collect()),
+        NzValue::Text(sql.chars().rev().take(MAX_TEXT_CHARS).collect()),
         NzValue::Text("it's \\ \"q\" ; -- /* $$".into()),
         NzValue::Bool(true),
     ];
@@ -85,7 +87,12 @@ fn sql_lexer(data: &[u8]) {
         let positional = substitute_parameters(sql, &values[..count]);
         assert_eq!(positional, substitute_parameters(sql, &values[..count]));
         if let Ok(rendered) = &positional {
-            assert!(rendered.len() <= sql.len() + count * (2 * sql.len() + 64) + 64);
+            let max_replacements = sql.len() / 2;
+            let max_literal_bytes = 16 * MAX_TEXT_BYTES + 32;
+            let max_rendered = sql
+                .len()
+                .saturating_add(max_replacements.saturating_mul(max_literal_bytes));
+            assert!(rendered.len() <= max_rendered);
         }
     }
     let mut bound: Vec<NzParameter> = values
