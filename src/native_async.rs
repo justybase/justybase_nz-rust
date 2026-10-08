@@ -1625,8 +1625,10 @@ impl AsyncSession {
                 hasher.update(&salt);
                 hasher.update(self.config.password.as_bytes());
                 let digest = hasher.finalize();
-                self.write_auth_response(format!("{}\0", base64_encode(&digest)).as_bytes())
-                    .await?;
+                self.write_auth_response(
+                    format!("{}\0", base64_encode(&digest).trim_end_matches('=')).as_bytes(),
+                )
+                .await?;
             }
             other => {
                 return Err(NzError::Protocol(format!(
@@ -1676,7 +1678,7 @@ impl AsyncSession {
             match self.read_byte().await? {
                 b'N' => return Ok(version),
                 b'M' => {
-                    version = match self.read_byte().await? {
+                    let proposed = match self.read_byte().await? {
                         b'2' => CP_VERSION_2,
                         b'4' => CP_VERSION_4,
                         b'5' => CP_VERSION_5,
@@ -1687,6 +1689,14 @@ impl AsyncSession {
                             )))
                         }
                     };
+                    // Each downgrade must move strictly down, which also
+                    // bounds the negotiation to a handful of round trips.
+                    if proposed >= version {
+                        return Err(NzError::Protocol(format!(
+                            "handshake negotiation: server proposed version {proposed} after {version}"
+                        )));
+                    }
+                    version = proposed;
                 }
                 b'E' => return Err(self.read_backend_error("handshakeNegotiationError").await),
                 other => {

@@ -499,6 +499,8 @@ pub struct HandshakeLog {
     pub begin_versions: Vec<i16>,
     /// Option opcodes after `CLIENT_BEGIN` (DB, SSL_NEGOTIATE, USER, ...).
     pub opcodes: Vec<i16>,
+    /// Payload of each option frame, parallel to `opcodes`.
+    pub option_payloads: Vec<Vec<u8>>,
     /// Raw authentication response payload (after its length prefix).
     pub auth_response: Option<Vec<u8>>,
     /// Whether the handshake reached ReadyForQuery.
@@ -573,8 +575,9 @@ pub fn serve_handshake_after_begin(
     }
 
     loop {
-        let (opcode, _) = read_option_frame(stream)?;
+        let (opcode, payload) = read_option_frame(stream)?;
         log.opcodes.push(opcode);
+        log.option_payloads.push(payload);
         if opcode == OP_CLIENT_DONE {
             break;
         }
