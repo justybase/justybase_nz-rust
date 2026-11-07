@@ -29,17 +29,24 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 #[cfg(feature = "chrono")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NzTimeTz {
+    /// Wall-clock time.
     pub time: NaiveTime,
+    /// Offset from UTC.
     pub offset: FixedOffset,
 }
 
 /// A single Netezza value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NzValue {
+    /// SQL NULL.
     Null,
+    /// BOOLEAN.
     Bool(bool),
+    /// SMALLINT / BYTEINT.
     Int2(i16),
+    /// INTEGER.
     Int4(i32),
+    /// BIGINT.
     Int8(i64),
     /// IEEE 754 single precision (REAL).
     Float4(f32),
@@ -192,6 +199,7 @@ impl NzValue {
         }
     }
 
+    /// Whether the value is SQL NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, NzValue::Null)
     }
@@ -277,6 +285,7 @@ impl<'a> RawValue<'a> {
         }
     }
 
+    /// Whether the raw cell is SQL NULL.
     pub fn is_null(&self) -> bool {
         match self.decoded {
             Some(NzValue::Null) => true,
@@ -285,6 +294,7 @@ impl<'a> RawValue<'a> {
         }
     }
 
+    /// Raw value bytes, when the cell kept a wire-identical representation.
     pub fn as_bytes(&self) -> Option<&'a [u8]> {
         self.bytes
     }
@@ -296,14 +306,17 @@ impl<'a> RawValue<'a> {
         self.decoded
     }
 
+    /// PostgreSQL OID reported by the row description.
     pub fn type_oid(&self) -> i32 {
         self.type_oid
     }
 
+    /// Type modifier (declared length/precision) reported by the row description.
     pub fn type_mod(&self) -> i32 {
         self.type_mod
     }
 
+    /// Wire format: `0` text, `1` binary/DBOS.
     pub fn format(&self) -> u8 {
         self.format
     }
@@ -352,6 +365,7 @@ impl<'a> RawValue<'a> {
 /// remains borrowed from [`NzValue`] so downstream implementations written
 /// against earlier releases continue to compile.
 pub trait FromSql: Sized {
+    /// Convert an owned [`NzValue`] into `Self`.
     fn from_sql(value: &NzValue) -> NzResult<Self>;
     /// Decode only the selected field. Existing implementations receive its value.
     fn from_raw(value: RawValue<'_>) -> NzResult<Self> {
@@ -365,6 +379,7 @@ pub trait FromSql: Sized {
 /// access to the lazy row representation. Use [`crate::connection::Row::try_get_raw_typed`]
 /// rather than changing an existing [`FromSql`] implementation.
 pub trait FromSqlRaw<'a>: Sized {
+    /// Convert one borrowed raw cell into `Self`.
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self>;
 }
 
@@ -700,7 +715,7 @@ impl FromSql for String {
                 return Self::from_sql(decoded);
             }
         }
-        if let Some(bytes) = value.as_bytes() {
+        if value.as_bytes().is_some() {
             let textual = value
                 .dbos
                 .map(|(d, _, _, i)| matches!(d.field_type[i], 15 | 16 | 21 | 25 | 26 | 30 | 32))
@@ -709,9 +724,11 @@ impl FromSql for String {
                     18 | 19 | 25 | 1042 | 1043 | 2522 | 2530
                 ));
             if textual {
-                return Ok(<&str as FromSqlRaw>::from_sql_raw(value)?.to_owned());
+                return match <&str as FromSqlRaw>::from_sql_raw(value) {
+                    Ok(text) => Ok(text.to_owned()),
+                    Err(_) => Self::from_sql(&value.to_nz_value()?),
+                };
             }
-            let _ = bytes;
         }
         Self::from_sql(&value.to_nz_value()?)
     }
@@ -834,16 +851,42 @@ impl<'a> FromSqlRaw<'a> for String {
 impl<'a> FromSqlRaw<'a> for &'a str {
     fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
         if let Some(bytes) = value.as_bytes() {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| NzError::Config(format!("invalid UTF-8 SQL text: {e}")))?;
             if let Some((descriptor, _, _, index)) = value.dbos {
-                return match descriptor.field_type[index] {
-                    15 => Ok(text.trim_end_matches(' ')),
-                    25 | 26 => Ok(text.trim_end_matches('\0')),
-                    16 | 21 | 30 | 32 => Ok(text),
-                    _ => Err(NzError::Config("binary field is not text".into())),
+                let field_type = descriptor.field_type[index];
+                let encoding = descriptor.char_varchar_encoding;
+                let utf8 = || {
+                    std::str::from_utf8(bytes)
+                        .map(std::borrow::Cow::Borrowed)
+                        .map_err(|error| error.to_string())
                 };
+                let decoded = match field_type {
+                    15 => encoding.decode(bytes),
+                    16 | 21 => encoding.decode(bytes),
+                    25 | 26 => utf8(),
+                    30 | 32 => utf8(),
+                    _ => return Err(NzError::Config("binary field is not text".into())),
+                };
+                let text = decoded.map_err(|error| {
+                    NzError::Config(format!("invalid encoded SQL text: {error}"))
+                })?;
+                // A borrowed `&str` cannot hold a transcoded Latin-1 value.
+                // `String`/`try_get` uses the shared `NzValue` decoder instead.
+                let text = match text {
+                    std::borrow::Cow::Borrowed(text) => text,
+                    std::borrow::Cow::Owned(_) => {
+                        return Err(NzError::Config(
+                            "non-ASCII Latin-1 text requires String or try_get".into(),
+                        ))
+                    }
+                };
+                return Ok(if matches!(field_type, 15 | 25 | 26) {
+                    text.trim_end_matches([' ', '\0'])
+                } else {
+                    text
+                });
             }
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| NzError::Config(format!("invalid UTF-8 SQL text: {error}")))?;
             return Ok(text);
         }
         match value.decoded {
@@ -904,7 +947,9 @@ fn unexpected(value: &NzValue, expected: &str) -> NzError {
 // `ToSql` mirrors `tokio-postgres::types::ToSql`: any `&dyn ToSql` can be
 // bound as `$1, $2, …` and is escaped client-side (Netezza simple-query path
 // has no server-side bind — see `crate::params`).
+/// A value that can be rendered as a SQL literal for client-side parameters.
 pub trait ToSql: std::fmt::Debug + Sync {
+    /// Render the value as one escaped SQL literal.
     fn to_nz_value(&self) -> NzValue;
 
     /// Append this value as a Netezza SQL literal.

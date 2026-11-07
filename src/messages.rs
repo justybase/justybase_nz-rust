@@ -17,6 +17,9 @@
 //! Port of the Node driver `protocol/constants.ts` plus the statement /
 //! CommandComplete helpers from `NzConnection.ts`.
 
+// Protocol constants are intentionally an internal compatibility surface.
+#![allow(missing_docs)]
+
 /// Backend message type bytes. Netezza-specific codes documented inline.
 pub mod code {
     pub const AUTHENTICATION_REQUEST: u8 = b'R'; // 82

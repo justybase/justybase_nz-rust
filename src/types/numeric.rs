@@ -175,16 +175,20 @@ fn write_scaled_decimal(out: &mut String, magnitude: u128, scale: usize, negativ
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Result of decoding a NUMERIC wire value.
 pub enum NumericDecoded {
+    /// Value that fits an `f64` without losing its canonical scale.
     Number(f64),
     /// Exact decimal whose coefficient and scale fit `rust_decimal`'s 96-bit
     /// representation. This preserves scale/trailing zeroes without a heap
     /// allocated decimal string in the binary row decoder.
     Decimal(Decimal),
+    /// Exact decimal text for values outside the fixed-width range.
     Exact(String),
 }
 
 impl NumericDecoded {
+    /// Render the canonical decimal text (no exponent, scale preserved).
     pub fn into_canonical(self) -> String {
         match self {
             NumericDecoded::Number(n) => format!("{n}"),

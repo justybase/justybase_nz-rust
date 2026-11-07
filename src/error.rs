@@ -40,6 +40,7 @@ pub struct NzDatabaseError {
 }
 
 impl NzDatabaseError {
+    /// Build a database error from the raw backend text.
     pub fn new(raw: impl Into<String>) -> Self {
         let raw = raw.into();
         Self {
@@ -190,6 +191,7 @@ impl From<NzDatabaseError> for NzError {
     }
 }
 
+/// Result type used by all driver operations.
 pub type NzResult<T> = Result<T, NzError>;
 
 /// Upper bound for length-prefixed protocol fields (port of `MAX_PROTOCOL_PAYLOAD`).

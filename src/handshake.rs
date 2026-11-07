@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 //! Connection handshake — faithful port of the Node driver `Handshake.ts`
-//! (itself ported from C# `Handshake.cs` / nzpy).
-//!
+//! (itself ported from C# `Handshake.cs` / nzpy).//!
 //! Byte-for-byte sequence validated against a live appliance capture:
 //! 1. negotiate connection-protocol version (`HSV2_CLIENT_BEGIN` + version 6;
 //!    server downgrades via `'M'` + version char, e.g. `'M''5'` → v5)
@@ -204,13 +205,14 @@ fn upgrade_tls(stream: NzStream, config: &NzConnectionConfig) -> NzResult<NzStre
     let NzStream::Plain(tcp) = stream else {
         return Ok(stream);
     };
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::ServerName;
     use std::sync::Arc;
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = &config.ssl_cert_path {
-        let pem = std::fs::File::open(path).map_err(NzError::Io)?;
-        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
+        let pem = std::fs::read(path).map_err(NzError::Io)?;
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| NzError::Config(format!("invalid TLS CA certificate: {e}")))?;
         for cert in certs {

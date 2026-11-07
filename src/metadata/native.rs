@@ -17,13 +17,19 @@ pub struct AsyncMetadata<'a> {
 /// Related catalog lists retrieved in one protocol request.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    /// Visible schemas.
     pub schemas: Vec<String>,
+    /// Databases.
     pub databases: Vec<NzDatabaseInfo>,
+    /// Tables in the requested schema.
     pub tables: Vec<NzTableInfo>,
+    /// Views in the requested schema.
     pub views: Vec<NzViewInfo>,
+    /// Procedures in the requested schema.
     pub procedures: Vec<NzProcedureInfo>,
 }
 impl Client {
+    /// Borrow this client for catalog/metadata queries.
     pub fn metadata(&self) -> AsyncMetadata<'_> {
         AsyncMetadata { client: self }
     }
@@ -33,6 +39,7 @@ impl AsyncMetadata<'_> {
         self.client.query(sql, &[]).await
     }
 
+    /// Return the database selected by the active session.
     pub async fn current_database(&self) -> NzResult<Option<String>> {
         self.query_rows("SELECT current_catalog")
             .await?
@@ -42,6 +49,7 @@ impl AsyncMetadata<'_> {
             .map(Option::flatten)
     }
 
+    /// List visible schemas.
     pub async fn schemas(&self) -> NzResult<Vec<String>> {
         self.client
             .query("SELECT schema FROM _v_schema ORDER BY schema", &[])
@@ -50,6 +58,7 @@ impl AsyncMetadata<'_> {
             .map(|row| row.try_get(0))
             .collect()
     }
+    /// List databases.
     pub async fn databases(&self) -> NzResult<Vec<NzDatabaseInfo>> {
         self.client
             .query(
@@ -61,6 +70,7 @@ impl AsyncMetadata<'_> {
             .map(database_from_row)
             .collect()
     }
+    /// List tables, optionally filtered by schema and a SQL `LIKE` pattern.
     pub async fn tables(
         &self,
         schema: Option<&str>,
@@ -73,6 +83,7 @@ impl AsyncMetadata<'_> {
             .map(table_from_row)
             .collect()
     }
+    /// List columns of one table.
     pub async fn columns(&self, table: &str, schema: Option<&str>) -> NzResult<Vec<NzColumnInfo>> {
         self.client
             .query(&columns_sql(table, schema)?, &[])
@@ -81,6 +92,7 @@ impl AsyncMetadata<'_> {
             .map(column_from_row)
             .collect()
     }
+    /// List views, optionally limited to a schema.
     pub async fn views(&self, schema: Option<&str>) -> NzResult<Vec<NzViewInfo>> {
         self.client
             .query(&views_sql(schema)?, &[])
@@ -89,6 +101,7 @@ impl AsyncMetadata<'_> {
             .map(view_from_row)
             .collect()
     }
+    /// List stored procedures, optionally limited to a schema.
     pub async fn procedures(&self, schema: Option<&str>) -> NzResult<Vec<NzProcedureInfo>> {
         self.client
             .query(&procedures_sql(schema)?, &[])
@@ -96,6 +109,322 @@ impl AsyncMetadata<'_> {
             .iter()
             .map(procedure_from_row)
             .collect()
+    }
+
+    /// Return the current schema search path.
+    pub async fn current_schema(&self) -> NzResult<Option<String>> {
+        self.query_rows("SELECT current_schema")
+            .await?
+            .first()
+            .map(|row| super::optional_text(row, 0))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// List visible sequences.
+    pub async fn sequences(&self, schema: Option<&str>) -> NzResult<Vec<NzSequenceInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, seqname, owner, objid FROM _v_sequence WHERE seqname IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, seqname");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(NzSequenceInfo {
+                    schema: super::text(row, 0)?,
+                    name: super::text(row, 1)?,
+                    owner: super::optional_text(row, 2)?,
+                    object_id: super::optional_i64(row, 3)?,
+                })
+            })
+            .collect()
+    }
+
+    /// List users visible to the current connection.
+    pub async fn users(&self) -> NzResult<Vec<NzUserInfo>> {
+        self.query_rows("SELECT username, objid FROM _v_user ORDER BY username")
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(NzUserInfo {
+                    name: super::text(row, 0)?,
+                    object_id: super::optional_i64(row, 1)?,
+                })
+            })
+            .collect()
+    }
+
+    /// List database groups.
+    pub async fn groups(&self) -> NzResult<Vec<NzGroupInfo>> {
+        self.query_rows("SELECT groupname, objid FROM _v_group ORDER BY groupname")
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(NzGroupInfo {
+                    name: super::text(row, 0)?,
+                    object_id: super::optional_i64(row, 1)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Return recent queries, newest first; an absent history view is empty.
+    pub async fn query_history(
+        &self,
+        limit: usize,
+        username: Option<&str>,
+    ) -> NzResult<Vec<NzQueryHistoryInfo>> {
+        let mut sql = String::from(
+            "SELECT qh_sessionid, qh_user, qh_database, qh_sql, qh_tsubmit, qh_tstart, qh_resrows FROM _v_qryhist WHERE 1=1",
+        );
+        if let Some(username) = username {
+            sql.push_str(&format!(" AND qh_user = {}", super::literal(username)?));
+        }
+        sql.push_str(&format!(" ORDER BY qh_tsubmit DESC LIMIT {limit}"));
+        let rows = match self.query_rows(&sql).await {
+            Ok(rows) => rows,
+            Err(error) if missing_relation(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        rows.iter()
+            .map(|row| {
+                Ok(NzQueryHistoryInfo {
+                    session_id: super::optional_i64(row, 0)?,
+                    username: super::optional_text(row, 1)?,
+                    database: super::optional_text(row, 2)?,
+                    query_text: super::optional_text(row, 3)?,
+                    submit_time: super::optional_text(row, 4)?,
+                    start_time: super::optional_text(row, 5)?,
+                    result_rows: super::optional_i64(row, 6)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Return storage statistics for user tables.
+    pub async fn table_sizes(&self, schema: Option<&str>) -> NzResult<Vec<NzTableSizeInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, tablename, used_bytes, allocated_bytes, (used_bytes / 1048576)::BIGINT AS size_mb, skew FROM _v_table_storage_stat WHERE tablename IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY used_bytes DESC");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(table_size_from_row)
+            .collect()
+    }
+
+    /// List active sessions.
+    pub async fn sessions(&self) -> NzResult<Vec<NzSessionInfo>> {
+        self.query_rows(
+            "SELECT id, username, dbname, conntime, priority, status, type, client_os_username FROM _v_session ORDER BY conntime DESC",
+        )
+        .await?
+        .iter()
+        .map(session_from_row)
+        .collect()
+    }
+
+    /// List user-defined functions.
+    pub async fn functions(&self, schema: Option<&str>) -> NzResult<Vec<NzFunctionInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, function, owner, objid, functionsignature, returns, env FROM _v_function WHERE function IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, function");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(function_from_row)
+            .collect()
+    }
+
+    /// List synonyms.
+    pub async fn synonyms(&self, schema: Option<&str>) -> NzResult<Vec<NzSynonymInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, synonym_name, refobjname, refdatabase, refschema, description FROM _v_synonym WHERE synonym_name IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, synonym_name");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(synonym_from_row)
+            .collect()
+    }
+
+    /// List primary, unique and foreign keys.
+    pub async fn constraints(&self, schema: Option<&str>) -> NzResult<Vec<NzConstraintInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, relation, constraintname, contype, attname, pkdatabase, pkschema, pkrelation, pkattname, updt_type, del_type FROM _v_relation_keydata WHERE relation IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, relation, conseq");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(constraint_from_row)
+            .collect()
+    }
+
+    /// Distribution keys across every table in a schema.
+    pub async fn all_distribution_keys(
+        &self,
+        schema: Option<&str>,
+    ) -> NzResult<Vec<NzDistributionKeyInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, tablename, attname, distattnum FROM _v_table_dist_map WHERE tablename IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, tablename, distseqno");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(distribution_from_row)
+            .collect()
+    }
+
+    /// Organize keys across every table in a schema.
+    pub async fn organize_keys(&self, schema: Option<&str>) -> NzResult<Vec<NzOrganizeKeyInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, tablename, attname, attnum FROM _v_table_organize_column WHERE tablename IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" ORDER BY schema, tablename, orgseqno");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(organize_from_row)
+            .collect()
+    }
+
+    /// Object definitions and comments from `_v_object_data`.
+    pub async fn object_details(&self, schema: Option<&str>) -> NzResult<Vec<NzObjectDetailInfo>> {
+        let mut sql = String::from(
+            "SELECT schema, objname, objtype, owner, objid, description, createdate FROM _v_object_data WHERE objname IS NOT NULL",
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" AND objtype NOT IN ('AGGREGATE','CONSTRAINT','DATABASE','DATATYPE','GROUP','MANAGEMENT INDEX','MANAGEMENT SEQ','MANAGEMENT TABLE','MANAGEMENT VIEW','SCHEDULER RULE','SCHEMA','SYSTEM INDEX','SYSTEM SEQ','SYSTEM TABLE','SYSTEM VIEW','USER') ORDER BY schema, objtype, objname");
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(object_detail_from_row)
+            .collect()
+    }
+
+    /// Return the owner of a table, if found.
+    pub async fn table_owner(&self, table: &str, schema: Option<&str>) -> NzResult<Option<String>> {
+        let (schema, table) = normalize_object_name(table, schema)?;
+        let mut sql = format!(
+            "SELECT owner FROM _v_table WHERE tablename = {}",
+            super::literal(&table)?
+        );
+        if let Some(schema) = &schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        match self.query_rows(&sql).await {
+            Ok(rows) => rows
+                .first()
+                .map(|row| super::optional_text(row, 0))
+                .transpose()
+                .map(Option::flatten),
+            Err(error) if missing_relation(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Search object details by a case-insensitive substring.
+    pub async fn search_objects_detailed(
+        &self,
+        pattern: &str,
+        schema: Option<&str>,
+    ) -> NzResult<Vec<NzObjectDetailInfo>> {
+        let mut sql = format!(
+            "SELECT schema, objname, objtype, owner, objid, description, createdate FROM _v_object_data WHERE UPPER(objname) LIKE UPPER({})",
+            super::like_contains_literal(pattern)?
+        );
+        if let Some(schema) = schema {
+            sql.push_str(&format!(" AND schema = {}", super::literal(schema)?));
+        }
+        sql.push_str(" AND objtype NOT IN ('AGGREGATE','CONSTRAINT','DATABASE','DATATYPE','GROUP','MANAGEMENT INDEX','MANAGEMENT SEQ','MANAGEMENT TABLE','MANAGEMENT VIEW','SCHEDULER RULE','SCHEMA','SYSTEM INDEX','SYSTEM SEQ','SYSTEM TABLE','SYSTEM VIEW','USER') ORDER BY schema, objtype, objname");
+        let folded_pattern = pattern.to_ascii_lowercase();
+        self.query_rows(&sql)
+            .await?
+            .iter()
+            .map(object_detail_from_row)
+            .filter(|detail| {
+                detail
+                    .as_ref()
+                    .map(|detail| detail.name.to_ascii_lowercase().contains(&folded_pattern))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Search tables, views and procedures by a case-insensitive substring.
+    pub async fn objects(
+        &self,
+        pattern: &str,
+        schema: Option<&str>,
+    ) -> NzResult<Vec<NzObjectInfo>> {
+        let like = format!("%{pattern}%");
+        let folded_pattern = pattern.to_ascii_lowercase();
+        let mut objects = Vec::new();
+        for table in self.tables(schema, Some(&like)).await? {
+            objects.push(NzObjectInfo {
+                schema: table.schema,
+                name: table.name,
+                object_type: "TABLE".into(),
+                owner: table.owner,
+                object_id: table.object_id,
+            });
+        }
+        for view in self.views(schema).await? {
+            if view.name.to_ascii_lowercase().contains(&folded_pattern) {
+                objects.push(NzObjectInfo {
+                    schema: view.schema,
+                    name: view.name,
+                    object_type: "VIEW".into(),
+                    owner: view.owner,
+                    object_id: view.object_id,
+                });
+            }
+        }
+        for procedure in self.procedures(schema).await? {
+            if procedure
+                .name
+                .to_ascii_lowercase()
+                .contains(&folded_pattern)
+            {
+                objects.push(NzObjectInfo {
+                    schema: procedure.schema,
+                    name: procedure.name,
+                    object_type: "PROCEDURE".into(),
+                    owner: procedure.owner,
+                    object_id: procedure.object_id,
+                });
+            }
+        }
+        Ok(objects)
     }
 
     /// Detailed column definitions, defaults and comments for DDL generation.
@@ -466,6 +795,7 @@ impl AsyncMetadata<'_> {
         Ok(ddl)
     }
 
+    /// Return the distribution-key columns of one table.
     pub async fn distribution_key(
         &self,
         table: &str,
@@ -487,6 +817,7 @@ impl AsyncMetadata<'_> {
             .collect()
     }
 
+    /// Return ORGANIZE ON columns in catalog order.
     pub async fn organize_columns(
         &self,
         table: &str,
@@ -509,6 +840,7 @@ impl AsyncMetadata<'_> {
         rows.iter().map(|row| extended_text(row, 0)).collect()
     }
 
+    /// Return primary, unique and foreign keys grouped by constraint name.
     pub async fn table_keys(
         &self,
         table: &str,
@@ -565,6 +897,7 @@ impl AsyncMetadata<'_> {
         Ok(keys)
     }
 
+    /// Return a table or view comment, if present.
     pub async fn table_comment(
         &self,
         table: &str,
@@ -1040,6 +1373,7 @@ impl AsyncMetadata<'_> {
         Ok(results)
     }
 
+    /// Reconstruct CREATE TABLE DDL for every table matching the filter.
     pub async fn tables_ddl(
         &self,
         schema: Option<&str>,
@@ -1049,6 +1383,7 @@ impl AsyncMetadata<'_> {
         self.table_ddl_batch(schema, pattern, tables, None).await
     }
 
+    /// Reconstruct CREATE OR REPLACE VIEW DDL for every matching view.
     pub async fn views_ddl(
         &self,
         schema: Option<&str>,
@@ -1058,6 +1393,7 @@ impl AsyncMetadata<'_> {
         self.view_ddl_batch(schema, pattern, views).await
     }
 
+    /// Reconstruct CREATE OR REPLACE PROCEDURE DDL for every matching procedure.
     pub async fn procedures_ddl(
         &self,
         schema: Option<&str>,

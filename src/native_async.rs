@@ -462,19 +462,31 @@ pub struct RowStream {
 /// A row or a server notice observed while a native Tokio query is running.
 #[derive(Debug)]
 pub enum QueryStreamEvent {
+    /// One decoded row.
     Row(Row),
+    /// One server notice.
     Notice(String),
+    /// A new result set started.
     ResultSetStart {
+        /// Zero-based result-set index.
         index: usize,
+        /// Column descriptions for the set.
         columns: Arc<[ColumnDesc]>,
+        /// Per-column nullable flags for DBOS sets.
         nullability: Option<Vec<bool>>,
     },
+    /// A result set ended.
     ResultSetEnd {
+        /// Zero-based result-set index.
         index: usize,
+        /// Number of rows in the set.
         row_count: u64,
     },
+    /// A command completed.
     CommandComplete {
+        /// Server command tag.
         tag: String,
+        /// Affected-row count (`-1` when not applicable).
         rows_affected: i64,
     },
 }
@@ -488,7 +500,6 @@ pub struct QueryEventStream {
 }
 
 impl QueryEventStream {
-    /// Snapshot of all notices received so far.
     /// Number of notices evicted from the capped history (events remain ordered).
     pub fn dropped_notices(&self) -> u64 {
         self.notices
@@ -497,6 +508,7 @@ impl QueryEventStream {
             .unwrap_or_default()
     }
 
+    /// Snapshot of all notices received so far.
     pub fn notices(&self) -> Vec<String> {
         self.notices
             .lock()
@@ -518,7 +530,6 @@ impl Stream for QueryEventStream {
 }
 
 impl RowStream {
-    /// Snapshot notices received so far while this result stream is running.
     /// Number of notices evicted from the capped history (events remain ordered).
     pub fn dropped_notices(&self) -> u64 {
         self.notices
@@ -527,6 +538,7 @@ impl RowStream {
             .unwrap_or_default()
     }
 
+    /// Snapshot notices received so far while this result stream is running.
     pub fn notices(&self) -> Vec<String> {
         self.notices
             .lock()
@@ -873,6 +885,7 @@ impl Client {
         Ok(client)
     }
 
+    /// Connect from a `netezza://` or `nz://` connection string.
     pub async fn connect_with_str(connection_string: &str) -> NzResult<Self> {
         let config = crate::parse_connection_string(connection_string)?;
         Self::connect(&config).await
@@ -900,6 +913,7 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// Execute one or more statements and return every result set.
     pub async fn query_multi(
         &self,
         sql: &str,
@@ -995,6 +1009,7 @@ impl Client {
     ) -> NzResult<QueryEventStream> {
         self.start_stream(sql, params, Some(options)).await
     }
+    /// Start a bounded event stream with an explicit deadline.
     pub async fn query_stream_with_options(
         &self,
         sql: &str,
@@ -1081,6 +1096,7 @@ impl Client {
         })
     }
 
+    /// Execute a query that must return exactly one row.
     pub async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
         let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
         let parsed = self.send_query(sql, RowPolicy::FirstExact, None).await?;
@@ -1103,6 +1119,7 @@ impl Client {
             .expect("one row checked above"))
     }
 
+    /// Execute a query returning at most one row.
     pub async fn query_opt(
         &self,
         sql: &str,
@@ -1124,6 +1141,7 @@ impl Client {
         }
     }
 
+    /// Execute a statement and return its affected-row count.
     pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
         Ok(self
@@ -1133,6 +1151,7 @@ impl Client {
             .rows_affected)
     }
 
+    /// Execute one or more statements, discarding all rows.
     pub async fn batch_execute(&self, sql: &str) -> NzResult<()> {
         self.send_query(sql.to_owned(), RowPolicy::Discard, None)
             .await
@@ -1172,14 +1191,17 @@ impl Client {
         receiver.await.unwrap_or(false)
     }
 
+    /// Whether the protocol task has shut down.
     pub fn is_closed(&self) -> bool {
         self.requests.is_closed() || self.control.closed.load(Ordering::Acquire)
     }
 
+    /// Whether the session has an open explicit transaction.
     pub fn in_transaction(&self) -> bool {
         self.control.transaction.load(Ordering::Acquire)
     }
 
+    /// Shut down the protocol task and close the socket.
     pub async fn close(&self) -> NzResult<()> {
         self.control.closing.store(true, Ordering::Release);
         self.control.changed.notify_waiters();
@@ -1240,9 +1262,11 @@ pub struct Transaction {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 impl Transaction {
+    /// Run one query inside the transaction.
     pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
         self.client.query(sql, params).await
     }
+    /// Run one query and return every result set.
     pub async fn query_multi(
         &self,
         sql: &str,
@@ -1250,17 +1274,21 @@ impl Transaction {
     ) -> NzResult<QueryResult> {
         self.client.query_multi(sql, params).await
     }
+    /// Execute a statement inside the transaction.
     pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         self.client.execute(sql, params).await
     }
+    /// Execute one or more statements inside the transaction.
     pub async fn batch_execute(&self, sql: &str) -> NzResult<()> {
         self.client.batch_execute(sql).await
     }
+    /// Commit and release the exclusive connection guard.
     pub async fn commit(mut self) -> NzResult<()> {
         self.client.batch_execute("COMMIT").await?;
         self.guard.take();
         Ok(())
     }
+    /// Roll back and release the exclusive connection guard.
     pub async fn rollback(mut self) -> NzResult<()> {
         self.client.batch_execute("ROLLBACK").await?;
         self.guard.take();
@@ -2000,8 +2028,11 @@ impl AsyncSession {
                         false,
                     )? as usize;
                     let data = self.read_bytes(len).await?;
-                    let descriptor =
-                        Arc::new(DbosTupleDesc::parse(&data, cached_columns.as_deref())?);
+                    let descriptor = Arc::new(DbosTupleDesc::parse_with_encoding(
+                        &data,
+                        cached_columns.as_deref(),
+                        self.config.char_varchar_encoding,
+                    )?);
                     let columns = cached_columns
                         .clone()
                         .unwrap_or_else(|| Arc::from(descriptor.to_column_descs()));
@@ -2457,8 +2488,9 @@ impl AsyncSession {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         if let Some(path) = &self.config.ssl_cert_path {
-            let pem = std::fs::File::open(path).map_err(NzError::Io)?;
-            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(pem))
+            use rustls::pki_types::pem::PemObject;
+            let pem = std::fs::read(path).map_err(NzError::Io)?;
+            let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| NzError::Config(format!("invalid TLS CA certificate: {error}")))?;
             for cert in certs {

@@ -25,14 +25,20 @@ on one session (later statements may use TEMP tables created by earlier ones).
   `N`, `E`, `Z`) for the statements listed in `fixtures()`.
 * Never included: anything client→server (so no credentials), the handshake
   and authentication exchange, `BackendKeyData`, host/user/database names. The
-  capture tool scans each response for the configured user, password and host
-  and refuses to write a fixture containing one.
+  capture tool scans each recorded statement/response for the configured
+  password and host and refuses to write a fixture containing one. (The user
+  name is not scanned because catalog fixtures legitimately contain role names
+  such as `ADMIN`.)
 
 ## Regenerating
 
 ```
 scripts/test-live.sh --capture        # needs NZ_DEV_* and a plaintext session
 ```
+
+`capture_wire_fixtures` also accepts `--suite encoding|metadata|ddl|types|errors|all`
+and writes `manifest.json` with each fixture's suite, SHA-256 and SQL statements.
+A full `--suite all` recapture is required when adding or changing fixtures.
 
 Review the diff before committing: the statements and expected values in
 `tests/wire_replay.rs` are hand-written from the SQL literals, so a changed

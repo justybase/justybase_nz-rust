@@ -346,15 +346,10 @@ async fn live_varchar_length_boundaries_text_and_binary_paths() {
 }
 
 fn assert_latin_varchar_decode(result: Result<QueryResult, NzError>, label: &str) {
-    match result {
-        Ok(result) => {
-            let set = &result.result_sets[0];
-            assert!(set.nullability.is_some(), "{label}: expected DBOS rows");
-            assert_eq!(set.rows[0].try_get::<_, String>(0).unwrap(), "ó", "{label}");
-        }
-        Err(NzError::Protocol(message)) if message.contains("UTF-8") => {}
-        other => panic!("{label}: expected success or an UTF-8 Protocol error, got {other:?}"),
-    }
+    let result = result.unwrap_or_else(|error| panic!("{label}: expected success, got {error:?}"));
+    let set = &result.result_sets[0];
+    assert!(set.nullability.is_some(), "{label}: expected DBOS rows");
+    assert_eq!(set.rows[0].try_get::<_, String>(0).unwrap(), "ó", "{label}");
 }
 
 fn assert_unicode_nvarchar_rows(result: QueryResult, label: &str) {
@@ -369,7 +364,7 @@ fn assert_unicode_nvarchar_rows(result: QueryResult, label: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live Netezza appliance"]
-async fn live_latin_varchar_decode_errors_keep_native_pool_and_legacy_sessions() {
+async fn live_latin_varchar_decode_keeps_native_pool_and_legacy_sessions() {
     const UNICODE: &str = "Zażółć gęślą jaźń…";
 
     // The appliance database uses a Latin encoding for VARCHAR. A single ó
@@ -975,7 +970,7 @@ async fn live_wide_rows_around_byte_and_column_boundaries() {
 // P16: temporal values
 // ---------------------------------------------------------------------------
 
-const TEMPORAL_CASES: [(&str, &str); 25] = [
+const TEMPORAL_CASES: [(&str, &str); 27] = [
     ("DATE", "0001-01-01"),
     ("DATE", "1999-12-31"),
     ("DATE", "2000-01-01"),
@@ -999,6 +994,8 @@ const TEMPORAL_CASES: [(&str, &str); 25] = [
     ("INTERVAL", "1 year 2 months"),
     ("INTERVAL", "36 hours"),
     ("INTERVAL", "0.000001 seconds"),
+    ("INTERVAL", "1 year 3 days"),
+    ("INTERVAL", "-3 days"),
     ("TIMETZ", "12:00:00+05:30"),
     ("TIMETZ", "23:59:59-08"),
 ];

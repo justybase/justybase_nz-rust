@@ -18,6 +18,9 @@
 //! Keeps unconsumed bytes compacted at the front; grows geometrically so a
 //! lagging consumer can never corrupt the stream alignment.
 
+// Protocol internals are not part of the stable documented API.
+#![allow(missing_docs)]
+
 use crate::error::{validate_protocol_length, NzError, NzResult, MAX_PROTOCOL_PAYLOAD};
 use std::io::Read;
 

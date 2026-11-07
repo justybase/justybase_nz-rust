@@ -21,7 +21,8 @@
 
 use std::fmt::Write as _;
 
-pub const POSTGRES_EPOCH_DAYS: i64 = 10_957; // days from 1970-01-01 to 2000-01-01
+/// Days from 1970-01-01 to the Netezza epoch (2000-01-01).
+pub const POSTGRES_EPOCH_DAYS: i64 = 10_957;
 const MS_PER_DAY: i64 = 86_400_000;
 const US_PER_DAY: i64 = 86_400_000_000;
 
@@ -181,6 +182,8 @@ pub(crate) fn timetz_from_bytes_into(data: &[u8], fld_len: usize, out: &mut Stri
     } else if tz_m != 0 {
         let _ = write!(out, "{sign}{tz_h:02}:{tz_m:02}");
     } else {
+        // Match the server's text rendering: whole-hour offsets omit `:00`
+        // (`+02`), so binary and text paths stay identical.
         let _ = write!(out, "{sign}{tz_h:02}");
     }
 }
@@ -196,18 +199,43 @@ pub(crate) fn interval_from_12bytes_into(data: &[u8], out: &mut String) {
     let micros = i64::from_le_bytes(data[0..8].try_into().unwrap());
     let months = i32::from_le_bytes(data[8..12].try_into().unwrap());
     out.clear();
-    if months == 0 {
-        append_time_from_8bytes(micros, out);
+    if months == 0 && micros == 0 {
+        append_time_from_8bytes(0, out);
         return;
     }
-    let years = months / 12;
-    let remaining = months % 12;
-    if years != 0 {
-        let _ = write!(out, "{years} years {remaining} mons ");
-    } else {
-        let _ = write!(out, "{remaining} mons ");
+
+    let years = i64::from(months / 12);
+    let remaining_months = i64::from(months % 12);
+    append_interval_component(years, "year", "years", out);
+    append_interval_component(remaining_months, "mon", "mons", out);
+
+    // The 8-byte field is a single signed duration; split whole days from the
+    // clock part with truncation toward zero so `-3 days -04:05:06` keeps the
+    // same sign on both components (Euclidean division would flip them).
+    let days = micros / US_PER_DAY;
+    let clock = micros % US_PER_DAY;
+    append_interval_component(days, "day", "days", out);
+    if clock != 0 || (months == 0 && days == 0) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        append_time_from_8bytes(clock, out);
     }
-    append_time_from_8bytes(micros, out);
+}
+
+fn append_interval_component(value: i64, singular: &str, plural: &str, out: &mut String) {
+    if value == 0 {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    let unit = if value == 1 || value == -1 {
+        singular
+    } else {
+        plural
+    };
+    let _ = write!(out, "{value} {unit}");
 }
 
 /// Parse `HH:MM:SS[.f]` (or `MM:SS`) text into (hours, minutes, seconds, micros).
@@ -312,6 +340,11 @@ mod tests {
         data[0..8].copy_from_slice(&43_260_000_000i64.to_le_bytes());
         data[8..12].copy_from_slice(&(-41_100i32).to_le_bytes());
         assert_eq!(timetz_from_bytes(&data, 12), "12:01:00+11:25");
+
+        data[8..12].copy_from_slice(&0i32.to_le_bytes());
+        assert_eq!(timetz_from_bytes(&data, 12), "12:01:00-00");
+        data[8..12].copy_from_slice(&30i32.to_le_bytes());
+        assert_eq!(timetz_from_bytes(&data, 12), "12:01:00-00:00:30");
     }
 
     #[test]
@@ -320,6 +353,23 @@ mod tests {
         data[8..12].copy_from_slice(&26i32.to_le_bytes()); // 26 months
         data[0..8].copy_from_slice(&3_600_000_000i64.to_le_bytes());
         assert_eq!(interval_from_12bytes(&data), "2 years 2 mons 01:00:00");
+
+        // Live appliance value: -1 year -2 months -3 days -04:05:06.789012.
+        data[8..12].copy_from_slice(&(-14i32).to_le_bytes());
+        data[0..8].copy_from_slice(&(-273_906_789_012i64).to_le_bytes());
+        assert_eq!(
+            interval_from_12bytes(&data),
+            "-1 year -2 mons -3 days -04:05:06.789012"
+        );
+
+        // A zero clock part is omitted when days or months are present.
+        data[8..12].copy_from_slice(&0i32.to_le_bytes());
+        data[0..8].copy_from_slice(&(-3 * US_PER_DAY).to_le_bytes());
+        assert_eq!(interval_from_12bytes(&data), "-3 days");
+        data[0..8].copy_from_slice(&(3 * US_PER_DAY).to_le_bytes());
+        assert_eq!(interval_from_12bytes(&data), "3 days");
+        data[0..8].copy_from_slice(&(4_320_000_000i64).to_le_bytes());
+        assert_eq!(interval_from_12bytes(&data), "01:12:00");
     }
 
     #[test]
@@ -333,12 +383,16 @@ mod tests {
             let mut bytes = [0u8; 12];
             bytes[8..].copy_from_slice(&months.to_le_bytes());
             let value = interval_from_12bytes(&bytes);
-            if months < -11 {
-                assert!(
-                    value.starts_with(&format!("{} years", months / 12)),
-                    "{value}"
-                );
-            }
+            let expected = match months {
+                -25 => "-2 years -1 mon",
+                -13 => "-1 year -1 mon",
+                -12 => "-1 year",
+                0 => "00:00:00",
+                12 => "1 year",
+                13 => "1 year 1 mon",
+                _ => unreachable!(),
+            };
+            assert_eq!(value, expected, "months={months}");
         }
         assert_eq!(time_from_8bytes(-1), "-00:00:00.000001");
         assert_eq!(time_from_8bytes(-3_600_000_000), "-01:00:00");

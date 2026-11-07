@@ -33,17 +33,20 @@ pub struct BlockingClient {
 
 #[cfg(feature = "compat")]
 impl BlockingClient {
+    /// Connect using the compatibility protocol driver.
     pub fn connect(config: &NzConnectionConfig) -> NzResult<Self> {
         Ok(Self {
             inner: NzConnection::connect(config)?,
         })
     }
 
+    /// Connect from a `netezza://` or `nz://` connection string.
     pub fn connect_with_str(connection_string: &str) -> NzResult<Self> {
         let config = crate::parse_connection_string(connection_string)?;
         Self::connect(&config)
     }
 
+    /// Execute one or more statements and return every result set.
     pub fn query_multi(
         &mut self,
         sql: &str,
@@ -53,6 +56,7 @@ impl BlockingClient {
         self.inner.query_values(sql, &values)
     }
 
+    /// Execute one query and return its rows; rejects multiple result sets.
     pub fn query(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
         let result = self.query_multi(sql, params)?;
         if result.result_sets.len() > 1 {
@@ -68,6 +72,7 @@ impl BlockingClient {
             .unwrap_or_default())
     }
 
+    /// Execute a query that must return exactly one row.
     pub fn query_one(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
         let rows = self.query(sql, params)?;
         if rows.len() != 1 {
@@ -79,6 +84,7 @@ impl BlockingClient {
         Ok(rows.into_iter().next().expect("one row checked above"))
     }
 
+    /// Execute a query returning at most one row.
     pub fn query_opt(
         &mut self,
         sql: &str,
@@ -94,15 +100,18 @@ impl BlockingClient {
         }
     }
 
+    /// Execute a statement and return its affected-row count.
     pub fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         let values: Vec<NzValue> = params.iter().map(|value| value.to_nz_value()).collect();
         self.inner.execute_values(sql, &values)
     }
 
+    /// Execute one or more statements, discarding all rows.
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
         self.inner.batch_execute(sql)
     }
 
+    /// Execute a query and stream its rows into `sink` without buffering them.
     pub fn execute_stream<S: QueryStreamSink>(
         &mut self,
         sql: &str,
@@ -128,14 +137,17 @@ impl BlockingClient {
         }
     }
 
+    /// Close the underlying session.
     pub fn close(&mut self) {
         self.inner.close();
     }
 
+    /// Borrow the underlying compatibility connection.
     pub fn inner(&self) -> &NzConnection {
         &self.inner
     }
 
+    /// Mutably borrow the underlying compatibility connection.
     pub fn inner_mut(&mut self) -> &mut NzConnection {
         &mut self.inner
     }
@@ -149,6 +161,7 @@ pub struct LegacyTransaction<'a> {
 }
 #[cfg(feature = "compat")]
 impl BlockingClient {
+    /// Start an explicit transaction; dropping it without commit rolls back.
     pub fn begin_transaction(&mut self) -> NzResult<LegacyTransaction<'_>> {
         if self.inner.in_transaction() {
             return Err(NzError::Config("nested transaction is unsupported".into()));
@@ -162,11 +175,13 @@ impl BlockingClient {
 }
 #[cfg(feature = "compat")]
 impl LegacyTransaction<'_> {
+    /// Commit the transaction.
     pub fn commit(mut self) -> NzResult<()> {
         self.client.batch_execute("COMMIT")?;
         self.finished = true;
         Ok(())
     }
+    /// Roll back the transaction.
     pub fn rollback(mut self) -> NzResult<()> {
         self.client.batch_execute("ROLLBACK")?;
         self.finished = true;
@@ -212,6 +227,7 @@ pub struct Client {
     client: crate::Client,
 }
 impl Client {
+    /// Connect using a private single-worker Tokio runtime.
     pub fn connect(config: &NzConnectionConfig) -> NzResult<Self> {
         let runtime = std::sync::Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -222,12 +238,15 @@ impl Client {
         let client = runtime.block_on(crate::Client::connect(config))?;
         Ok(Self { runtime, client })
     }
+    /// Connect from a `netezza://` or `nz://` connection string.
     pub fn connect_with_str(uri: &str) -> NzResult<Self> {
         Self::connect(&crate::parse_connection_string(uri)?)
     }
+    /// Execute one query and return its rows; rejects multiple result sets.
     pub fn query(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
         self.runtime.block_on(self.client.query(sql, params))
     }
+    /// Execute one or more statements and return every result set.
     pub fn query_multi(
         &mut self,
         sql: &str,
@@ -235,9 +254,11 @@ impl Client {
     ) -> NzResult<QueryResult> {
         self.runtime.block_on(self.client.query_multi(sql, params))
     }
+    /// Execute a query that must return exactly one row.
     pub fn query_one(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Row> {
         self.runtime.block_on(self.client.query_one(sql, params))
     }
+    /// Execute a query returning at most one row.
     pub fn query_opt(
         &mut self,
         sql: &str,
@@ -245,12 +266,15 @@ impl Client {
     ) -> NzResult<Option<Row>> {
         self.runtime.block_on(self.client.query_opt(sql, params))
     }
+    /// Execute a statement and return its affected-row count.
     pub fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         self.runtime.block_on(self.client.execute(sql, params))
     }
+    /// Execute one or more statements, discarding all rows.
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
         self.runtime.block_on(self.client.batch_execute(sql))
     }
+    /// Execute a query with an explicit deadline.
     pub fn query_with_options(
         &mut self,
         sql: &str,
@@ -261,6 +285,7 @@ impl Client {
             .block_on(self.client.query_with_options(sql, params, options))
     }
     /// Iterator keeps the session exclusively borrowed; drop cancels and drains.
+    /// Begin a blocking row iterator over one query.
     pub fn query_iter(
         &mut self,
         sql: &str,
@@ -275,6 +300,7 @@ impl Client {
             client: &self.client,
         })
     }
+    /// Start an exclusive transaction.
     pub fn transaction(&mut self) -> NzResult<Transaction<'_>> {
         let transaction = self.runtime.block_on(self.client.transaction())?;
         Ok(Transaction {
@@ -282,9 +308,11 @@ impl Client {
             client: self,
         })
     }
+    /// Whether the protocol task has shut down.
     pub fn is_closed(&self) -> bool {
         self.client.is_closed()
     }
+    /// Shut down the protocol task and close the socket.
     pub fn close(&mut self) -> NzResult<()> {
         self.runtime.block_on(self.client.close())
     }
@@ -332,6 +360,7 @@ pub struct Transaction<'a> {
     client: &'a mut Client,
 }
 impl Transaction<'_> {
+    /// Run one query inside the transaction.
     pub fn query(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
         self.client.runtime.block_on(
             self.transaction
@@ -340,6 +369,7 @@ impl Transaction<'_> {
                 .query(sql, params),
         )
     }
+    /// Run one query and return every result set.
     pub fn query_multi(
         &mut self,
         sql: &str,
@@ -352,6 +382,7 @@ impl Transaction<'_> {
                 .query_multi(sql, params),
         )
     }
+    /// Execute a statement inside the transaction.
     pub fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         self.client.runtime.block_on(
             self.transaction
@@ -360,6 +391,7 @@ impl Transaction<'_> {
                 .execute(sql, params),
         )
     }
+    /// Execute one or more statements inside the transaction.
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
         self.client.runtime.block_on(
             self.transaction
@@ -368,6 +400,7 @@ impl Transaction<'_> {
                 .batch_execute(sql),
         )
     }
+    /// Commit the transaction.
     pub fn commit(mut self) -> NzResult<()> {
         self.client.runtime.block_on(
             self.transaction
@@ -376,6 +409,7 @@ impl Transaction<'_> {
                 .commit(),
         )
     }
+    /// Roll back the transaction.
     pub fn rollback(mut self) -> NzResult<()> {
         self.client.runtime.block_on(
             self.transaction
@@ -409,8 +443,10 @@ pub struct Pool {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
     pool: crate::Pool,
 }
+/// Blocking pool configuration (alias of [`crate::PoolConfig`]).
 pub type PoolConfig = crate::PoolConfig;
 impl Pool {
+    /// Build a blocking pool and open its minimum connections.
     pub fn connect(config: PoolConfig) -> NzResult<Self> {
         let runtime = std::sync::Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -421,6 +457,7 @@ impl Pool {
         let pool = runtime.block_on(crate::Pool::connect(config))?;
         Ok(Self { runtime, pool })
     }
+    /// Check out one pooled connection.
     pub fn get(&self) -> NzResult<PooledConnection> {
         let lease = self.runtime.block_on(self.pool.get())?;
         Ok(PooledConnection {
@@ -428,21 +465,27 @@ impl Pool {
             lease: Some(lease),
         })
     }
+    /// Run one query on a pooled connection and return its rows.
     pub fn query(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         self.runtime.block_on(self.pool.query(sql, params))
     }
+    /// Run one query on a pooled connection and return every result set.
     pub fn query_multi(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         self.runtime.block_on(self.pool.query_multi(sql, params))
     }
+    /// Execute a statement on a pooled connection.
     pub fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         self.runtime.block_on(self.pool.execute(sql, params))
     }
+    /// Close the pool and all idle connections. Idempotent.
     pub fn close(&self) {
         self.runtime.block_on(self.pool.close());
     }
+    /// Number of managed connections (idle plus checked out).
     pub fn total_count(&self) -> usize {
         self.runtime.block_on(self.pool.total_count())
     }
+    /// Number of idle connections.
     pub fn idle_count(&self) -> usize {
         self.runtime.block_on(self.pool.idle_count())
     }
@@ -458,6 +501,7 @@ pub struct PooledConnection {
     lease: Option<crate::async_pool::AsyncPooledConnection>,
 }
 impl PooledConnection {
+    /// Run one query on this lease.
     pub fn query(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         self.runtime.block_on(
             self.lease
@@ -466,6 +510,7 @@ impl PooledConnection {
                 .query(sql, params),
         )
     }
+    /// Run one query and return every result set.
     pub fn query_multi(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         self.runtime.block_on(
             self.lease
@@ -474,6 +519,7 @@ impl PooledConnection {
                 .query_multi(sql, params),
         )
     }
+    /// Execute a statement on this lease.
     pub fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         self.runtime.block_on(
             self.lease
@@ -482,6 +528,7 @@ impl PooledConnection {
                 .execute(sql, params),
         )
     }
+    /// Execute one or more statements, discarding rows.
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
         self.runtime.block_on(
             self.lease
@@ -490,6 +537,7 @@ impl PooledConnection {
                 .batch_execute(sql),
         )
     }
+    /// Return the lease to the pool.
     pub fn release(mut self) {
         if let Some(lease) = self.lease.take() {
             self.runtime.block_on(lease.release());

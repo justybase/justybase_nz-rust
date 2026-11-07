@@ -34,15 +34,22 @@ use crate::types::value::{FromSql, NzValue};
 /// `Object`, `String`); this enum is the Rust-idiomatic equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnDataType {
+    /// BOOLEAN.
     Bool,
+    /// Numeric value mapped to a JS `Number`.
     Number,
+    /// 64-bit integer mapped to a JS `BigInt`.
     BigInt,
+    /// Date/time value.
     Date,
+    /// Binary/opaque value.
     Object,
+    /// Text value.
     String,
 }
 
 impl ColumnDataType {
+    /// JS constructor name used by the reference drivers.
     pub fn name(self) -> &'static str {
         match self {
             ColumnDataType::Bool => "Boolean",
@@ -59,41 +66,65 @@ impl ColumnDataType {
 /// / C# `NzDbColumn`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMetadata {
+    /// Zero-based column position.
     pub index: usize,
+    /// Column name.
     pub name: String,
+    /// PostgreSQL OID.
     pub provider_type: i32,
+    /// Type modifier.
     pub type_modifier: i32,
+    /// Wire type length.
     pub type_length: i16,
+    /// Base type name.
     pub type_name: String,
+    /// Type name including declared length/precision.
     pub declared_type_name: String,
+    /// Declared character length, when applicable.
     pub declared_length: Option<i32>,
+    /// NUMERIC precision.
     pub numeric_precision: i32,
+    /// NUMERIC scale.
     pub numeric_scale: i32,
+    /// Reference-driver data type.
     pub data_type: ColumnDataType,
+    /// Column size in bytes.
     pub column_size: i64,
+    /// Whether the value is an unbounded/long type.
     pub is_long: bool,
 }
 
 /// One `getSchemaTable()` row (Node `SchemaRow` / ADO.NET `DataTable` row).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaRow {
+    /// Column name.
     pub column_name: String,
     /// 1-based ordinal (Node `ColumnOrdinal`).
     pub column_ordinal: i32,
+    /// Column size in bytes.
     pub column_size: i64,
+    /// NUMERIC precision.
     pub numeric_precision: i32,
+    /// NUMERIC scale.
     pub numeric_scale: i32,
+    /// Reference-driver data type.
     pub data_type: ColumnDataType,
+    /// PostgreSQL OID.
     pub provider_type: i32,
+    /// Whether the column accepts NULL.
     pub allow_db_null: bool,
+    /// Whether the column is read-only.
     pub is_read_only: bool,
+    /// Whether the value is an unbounded/long type.
     pub is_long: bool,
 }
 
 /// Schema table returned by [`NzDataReader::get_schema_table`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaTable {
+    /// One row per column.
     pub rows: Vec<SchemaRow>,
+    /// Number of columns.
     pub columns_count: usize,
 }
 
@@ -343,6 +374,11 @@ pub struct NzDataReader {
 }
 
 impl NzDataReader {
+    /// Wrap a buffered [`QueryResult`] as a forward-only reader.
+    ///
+    /// A statement with no result set still gets one empty set so
+    /// [`NzDataReader::has_rows`] reports `false` instead of the reader
+    /// appearing to have no results at all (Node/C# parity).
     pub fn from_result(mut result: QueryResult) -> Self {
         // A statement that returns no result set (DDL, `DELETE`, …) still forms
         // one reader result in the ADO.NET/Node model, so `has_rows()` reports
@@ -372,6 +408,7 @@ impl NzDataReader {
             .unwrap_or(&[])
     }
 
+    /// Number of columns in the current result set.
     pub fn field_count(&self) -> usize {
         self.columns().len()
     }
@@ -432,6 +469,7 @@ impl NzDataReader {
         Ok(true)
     }
 
+    /// Whether the current result set contains at least one row.
     pub fn has_rows(&self) -> bool {
         self.result
             .result_sets
@@ -440,16 +478,19 @@ impl NzDataReader {
             .unwrap_or(false)
     }
 
+    /// Whether [`NzDataReader::close`] was called.
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
+    /// Mark the reader closed; further [`NzDataReader::read`] calls return `false`.
     pub fn close(&mut self) {
         self.closed = true;
     }
 
     // -- metadata (C#/Node parity) -------------------------------------------
 
+    /// Column name at `i`.
     pub fn get_name(&self, i: usize) -> NzResult<&str> {
         self.columns()
             .get(i)
@@ -457,6 +498,7 @@ impl NzDataReader {
             .ok_or_else(|| NzError::Config(format!("Column ordinal {i} is out of range")))
     }
 
+    /// Resolve a column name to its ordinal (case-insensitive).
     pub fn get_ordinal(&self, name: &str) -> NzResult<usize> {
         self.columns()
             .iter()
@@ -464,14 +506,17 @@ impl NzDataReader {
             .ok_or_else(|| NzError::Config(format!("Column '{name}' not found")))
     }
 
+    /// Base SQL type name (`VARCHAR`, `NUMERIC`, …).
     pub fn get_type_name(&self, i: usize) -> NzResult<String> {
         self.get_column_metadata(i).map(|m| m.type_name)
     }
 
+    /// Type name including declared length/precision (`VARCHAR(20)`).
     pub fn get_declared_type_name(&self, i: usize) -> NzResult<String> {
         self.get_column_metadata(i).map(|m| m.declared_type_name)
     }
 
+    /// PostgreSQL OID reported for the column.
     pub fn get_provider_type(&self, i: usize) -> NzResult<i32> {
         self.get_column_metadata(i).map(|m| m.provider_type)
     }
@@ -581,24 +626,29 @@ impl NzDataReader {
         row.try_get_value(i)
     }
 
+    /// Clone the value of column `i` in the current row.
     pub fn get_value(&self, i: usize) -> NzResult<NzValue> {
         Ok(self.value(i)?.clone())
     }
 
+    /// Clone a value resolved by (case-insensitive) column name.
     pub fn get_value_by_name(&self, name: &str) -> NzResult<NzValue> {
         let i = self.get_ordinal(name)?;
         self.get_value(i)
     }
 
+    /// Typed access to the current row through [`FromSql`].
     pub fn try_get<I: RowIndex, T: FromSql>(&self, idx: I) -> NzResult<T> {
         let row = self.require_row()?;
         row.try_get(idx)
     }
 
+    /// Whether column `i` in the current row is SQL NULL.
     pub fn is_db_null(&self, i: usize) -> NzResult<bool> {
         Ok(self.value(i)?.is_null())
     }
 
+    /// Boolean conversion; SQL NULL reads as `false` (ADO.NET parity).
     pub fn get_bool(&self, i: usize) -> NzResult<bool> {
         let v = self.value(i)?;
         match v {
@@ -616,39 +666,48 @@ impl NzDataReader {
         }
     }
 
+    /// `i16` conversion of column `i`.
     pub fn get_i16(&self, i: usize) -> NzResult<i16> {
         let value = self.value(i)?;
         i16::from_sql(value)
     }
+    /// `i32` conversion of column `i`.
     pub fn get_i32(&self, i: usize) -> NzResult<i32> {
         let value = self.value(i)?;
         i32::from_sql(value)
     }
+    /// `i64` conversion of column `i`.
     pub fn get_i64(&self, i: usize) -> NzResult<i64> {
         let value = self.value(i)?;
         i64::from_sql(value)
     }
+    /// `u8` conversion of column `i` (BYTEINT).
     pub fn get_u8(&self, i: usize) -> NzResult<u8> {
         let value = self.value(i)?;
         u8::from_sql(value)
     }
+    /// `u16` conversion of column `i`.
     pub fn get_u16(&self, i: usize) -> NzResult<u16> {
         let value = self.value(i)?;
         u16::from_sql(value)
     }
+    /// `u32` conversion of column `i`.
     pub fn get_u32(&self, i: usize) -> NzResult<u32> {
         let value = self.value(i)?;
         u32::from_sql(value)
     }
+    /// `f32` conversion of column `i` (REAL).
     pub fn get_f32(&self, i: usize) -> NzResult<f32> {
         let value = self.value(i)?;
         f32::from_sql(value)
     }
+    /// `f64` conversion of column `i` (DOUBLE PRECISION).
     pub fn get_f64(&self, i: usize) -> NzResult<f64> {
         let value = self.value(i)?;
         f64::from_sql(value)
     }
 
+    /// Canonical text rendering of column `i`; SQL NULL reads as `None`.
     pub fn get_string(&self, i: usize) -> NzResult<Option<String>> {
         match self.value(i)? {
             NzValue::Null => Ok(None),
@@ -675,6 +734,7 @@ impl NzDataReader {
         }
     }
 
+    /// Byte rendering of column `i`; SQL NULL reads as `None`.
     pub fn get_bytes(&self, i: usize) -> NzResult<Option<Vec<u8>>> {
         match self.value(i)? {
             NzValue::Null => Ok(None),

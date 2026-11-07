@@ -8,10 +8,12 @@ Pure Rust client driver for IBM Netezza and PureData System for Analytics.
 [![docs.rs](https://docs.rs/nz_rust/badge.svg)](https://docs.rs/nz_rust)
 
 > [!WARNING]
-> **Preview software.** This crate is under active development and its public
-> API, protocol coverage and behavior may change between releases. It is ready
-> for evaluation, integration work and controlled internal use; validate it
-> against your Netezza environment before using it in production.
+> **Preview software through `1.0.0-rc.1`.** The public API is frozen for the
+> `1.0` series and the driver is validated against a real appliance, but the
+> `1.0.0` release is intentionally held until the release candidate has soaked
+> in controlled use. Validate it against your Netezza environment before using
+> it in production, and see [COMPATIBILITY.md](COMPATIBILITY.md) for the
+> supported appliance, encoding, type and API matrix.
 
 ## What it is
 
@@ -43,24 +45,29 @@ the following areas:
 | Legacy async facade | Opt-in | Enable `compat`; `AsyncNzConnection` uses Tokio's blocking pool |
 | Connection pooling | Available | Sync and async pools |
 | Transactions and cancellation | Available | Recreate a connection after an unsynchronized protocol failure |
-| Catalog metadata | Available | Schemas, tables, columns and additional catalog helpers |
+| Catalog metadata and DDL | Available | Native async and legacy surfaces; table/view/procedure/synonym reconstruction |
+| Character encoding | Configurable | Latin-1 default for `CHAR`/`VARCHAR`; `NCHAR`/`NVARCHAR` remain UTF-8 |
+| Golden wire replay | Available | 15 appliance-captured fixtures in `tests/fixtures/wire` |
 | TLS | Opt-in | Enable the `ssl` feature |
-| Netezza appliance coverage | Preview | Verify behavior against your appliance and server version |
+| Netezza appliance coverage | Release candidate | Validated against `Release 11.2.2.1 [Build 20]`; see [COMPATIBILITY.md](COMPATIBILITY.md) |
 
 The compatibility APIs `query` and `execute_reader` buffer result sets. For
 large results, use `execute_stream` or the async streaming facade described
 below.
 
-The project does not currently promise long-term API stability or complete
-coverage of every Netezza server feature. Missing or appliance-specific
-behavior should be reported as an issue with the server version, SQL example
-and a sanitized error or protocol trace.
+The `1.0` public API is frozen from `1.0.0-rc.1` (see [API stability](#api-stability)),
+but the driver does not claim complete coverage of every Netezza server feature.
+Missing or appliance-specific behavior should be reported as an issue with the
+server version, SQL example and a sanitized error or protocol trace.
 
 ## Contents
 
+- [Status and support expectations](#status-and-support-expectations)
+- [1.0 API and migration](#10-api-and-migration)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Connection strings](#connection-strings)
+- [Character encoding](#character-encoding)
 - [Queries, values and parameters](#querying-values-and-parameters)
 - [Streaming](#bounded-streaming)
 - [Async and pooling](#async-and-pooling-apis)
@@ -69,17 +76,40 @@ and a sanitized error or protocol trace.
 - [Errors and connection lifecycle](#errors-and-connection-lifecycle)
 - [Security and compatibility](#security-and-compatibility)
 - [Testing](#testing-and-validation)
-- [Compatibility notes](#compatibility-notes)
-- [Contributing](#contributing-and-support)
 - [License](#license)
+- [Contributing](#contributing-and-support)
+- [Compatibility notes](#compatibility-notes)
+- [API stability](#api-stability)
 
-## 0.3 API and migration
+## 1.0 API and migration
 
-Version 0.3.2 is published on crates.io.
-Use `Client` for Tokio, `blocking::Client` for synchronous code, `Pool` for
-Tokio pooling and `blocking::Pool` for synchronous pooling. The primary
-blocking API runs the same protocol driver as the Tokio API. Use it outside
-an existing Tokio runtime.
+Version `1.0.0-rc.1` freezes the public API for the `1.0` series; `1.0.0`
+follows after the release-candidate soak. Use `Client` for Tokio,
+`blocking::Client` for synchronous code, `Pool` for Tokio pooling and
+`blocking::Pool` for synchronous pooling. The primary blocking API runs the
+same protocol driver as the Tokio API. Use it outside an existing Tokio
+runtime.
+
+The release candidate consolidates the hardening work since `0.3`:
+
+- Binary `CHAR`, `VARCHAR` and `VAR_FIXED_CHAR` decoding is configurable and
+  defaults to Latin-1; see [Character encoding](#character-encoding).
+- Native `client.metadata()` covers the catalog surface through DDL
+  reconstruction, table sizes, sessions, query history and object search.
+- Binary `INTERVAL` and `TIMETZ` values now render exactly like the server text
+  path, including negative and multi-unit intervals.
+- Fifteen golden wire fixtures captured from a real appliance replay offline,
+  covering encoding, native/legacy metadata, DDL, temporal/numeric edges and
+  structured errors.
+- `#![warn(missing_docs)]` and `#![forbid(unsafe_code)]` are enforced, and
+  [COMPATIBILITY.md](COMPATIBILITY.md) records the appliance, type, encoding,
+  feature and API-freeze policy.
+- CI runs Linux and cross-platform test jobs, `cargo-deny`, a 70% line-coverage
+  gate and `cargo package` / `cargo publish --dry-run`.
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete `1.0.0-rc.1` change list.
+
+Public API notes for the `1.0` series:
 
 - `query` returns rows from one result set; use `query_multi` for scripts.
   `query_one` requires exactly one row and `query_opt` allows zero or one.
@@ -124,21 +154,22 @@ procedures, external tables and synonyms. Multi-object table/view/procedure
 DDL batches fetch catalog rows in groups. `TextExportSink` writes directly
 from a stream without retaining rows.
 
-Version 0.3 changes the default public API compared with 0.2: `NzConnection`,
+Historically, version 0.3 changed the default public API compared with 0.2: `NzConnection`,
 `NzCommand`, `NzDataReader`, `AsyncNzConnection`, `NzPool` and
 `AsyncNzPool` require the `compat` feature. Enable it while migrating and
 import legacy items from `nz_rust::compat`; the modern default API is
 `Client`, `blocking::Client`, `Pool` and `blocking::Pool`.
 
 ```toml
-nz_rust = { version = "0.3", features = ["compat"] }
+nz_rust = { version = "1.0.0-rc.1", features = ["compat"] }
 ```
 
 For example, change `use nz_rust::NzConnection` to
 `use nz_rust::compat::NzConnection`. Remove the feature after migrating to
 the native client and pool APIs.
 
-See [QUALITY_REPORT.md](QUALITY_REPORT.md) for measured results and validation.
+See [QUALITY_REPORT.md](QUALITY_REPORT.md) for `1.0.0-rc.1` validation results
+and the clearly labelled historical `0.3.0` benchmarks.
 
 ## Installation
 
@@ -146,7 +177,7 @@ Add the crate from crates.io with:
 
 ```toml
 [dependencies]
-nz_rust = "0.3"
+nz_rust = "1.0.0-rc.1"
 ```
 
 When using the workspace checkout:
@@ -160,7 +191,7 @@ TLS support is opt-in:
 
 ```toml
 [dependencies]
-nz_rust = { version = "0.3", features = ["ssl"] }
+nz_rust = { version = "1.0.0-rc.1", features = ["ssl"] }
 ```
 
 The default build has no TLS dependency. The `ssl` feature enables Rustls and
@@ -217,15 +248,58 @@ let mut connection = Client::connect_with_str(
 ```
 
 Supported connection-string details include percent-decoding, query options
-such as `sslmode`, `securityLevel`, `commandTimeout` and
-`connectionTimeout`, and bracketed IPv6 hosts:
+such as `sslmode`, `securityLevel`, `commandTimeout`, `connectionTimeout` and
+`char_varchar_encoding`, and bracketed IPv6 hosts:
 
 ```text
 nz://user:password@[2001:db8::10]:5480/JUST_DATA?sslmode=verify-full
 ```
 
+Character encoding for `CHAR`/`VARCHAR` values is selected with the
+`char_varchar_encoding` option (`latin1` by default, `utf8` for UTF-8
+databases); see [Character encoding](#character-encoding).
+
 Do not put credentials in source control. Prefer environment variables or a
 secret manager in applications and CI.
+
+## Character encoding
+
+Netezza reports a session encoding, but an appliance can still store
+`CHAR`/`VARCHAR` bytes in a different database encoding. The Node driver and
+`nzpy` therefore treat those types as Latin-1 by default, and `nz_rust` does the
+same on the binary (DBOS) result path.
+
+| Column type and path | Default decoding | How to change it |
+|---|---|---|
+| `CHAR`, `VARCHAR`, `VAR_FIXED_CHAR` (binary) | Latin-1 | `char_varchar_encoding` |
+| `CHAR`, `VARCHAR`, `VAR_FIXED_CHAR` (text) | UTF-8 | server text form |
+| `NCHAR`, `NVARCHAR` | UTF-8 | not needed |
+
+Set the encoding in configuration or in a connection string:
+
+```rust,no_run
+use nz_rust::{CharEncoding, NzConnectionConfig};
+
+let mut config = NzConnectionConfig::new("nz-host", "JUST_DATA", "admin", "secret");
+assert_eq!(config.char_varchar_encoding, CharEncoding::Latin1);
+config.char_varchar_encoding = CharEncoding::Utf8;
+
+let parsed = nz_rust::parse_connection_string(
+    "nz://admin:secret@nz-host:5480/JUST_DATA?char_varchar_encoding=utf8",
+)?;
+assert_eq!(parsed.char_varchar_encoding, CharEncoding::Utf8);
+# Ok::<(), nz_rust::NzError>(())
+```
+
+Use `CharEncoding::Latin1` when the database stores ISO-8859-1/CP1250-style
+single-byte text and `CharEncoding::Utf8` when it truly stores UTF-8.
+Characters outside Latin-1 (for example Polish `ł` or `ą`) cannot be recovered
+from a `VARCHAR` Latin-1 payload; store them in `NVARCHAR`.
+
+`try_get_raw_typed::<_, &str>` borrows ASCII text without copying but returns an
+error for non-ASCII Latin-1 data, because a borrowed `&str` cannot hold a
+transcoded value. Use `String`, `try_get` or `try_values()` for those columns.
+The full encoding and type matrix is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Querying, values and parameters
 
@@ -430,6 +504,30 @@ println!("{} schemas, {} tables, {} columns", schemas.len(), tables.len(), colum
 # }
 ```
 
+The native Tokio client exposes the same catalog surface through an async
+borrow:
+
+```rust,no_run
+use nz_rust::{Client, NzConnectionConfig};
+
+# async fn run() -> nz_rust::NzResult<()> {
+let client = Client::connect(&NzConnectionConfig::new(
+    "nz-host", "JUST_DATA", "admin", "secret",
+)).await?;
+
+let schemas = client.metadata().schemas().await?;
+let tables = client.metadata().tables(Some("ADMIN"), Some("FACT%")).await?;
+let ddl = client.metadata()
+    .table_ddl("FACTPRODUCTINVENTORY", Some("ADMIN"), None)
+    .await?;
+println!("{} schemas, {} tables", schemas.len(), tables.len());
+println!("{ddl}");
+
+client.close().await?;
+# Ok(())
+# }
+```
+
 The metadata surface includes schemas, databases, tables, columns, views,
 procedures, functions, synonyms, constraints, distribution keys, organize
 keys, table sizes, sessions, object details and object search. Use
@@ -496,10 +594,18 @@ Offline/unit validation from the workspace root:
 
 ```bash
 cargo fmt --all -- --check
-cargo test -p nz_rust --all-targets --all-features
-cargo clippy -p nz_rust --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features --offline
+cargo test -p nz_rust --all-targets --all-features --locked
+cargo test -p nz_rust --doc --all-features --locked
+cargo clippy -p nz_rust --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+cargo deny check advisories licenses bans sources
+cargo llvm-cov --all-features --locked --summary-only
 ```
+
+CI enforces formatting, Clippy and rustdoc with warnings denied, the
+appliance-independent suite, the `cargo-deny` advisories/licenses/bans/sources
+policy in `deny.toml`, and a 70% line-coverage floor. The `1.0.0-rc.1`
+validation run measured 73.84% line coverage.
 
 Live tests need a real appliance and are `#[ignore]`d, so `cargo test` never
 runs (or silently "passes") them. Configure `NZ_DEV_HOST`, `NZ_DEV_USER`,
@@ -516,7 +622,22 @@ scripts/test-live.sh --capture          # refresh tests/fixtures/wire from the a
 # PowerShell: scripts/test-live.ps1 [-Qualification] [-Stress] [-Admin] [-Capture] [-All]
 ```
 
-or by hand:
+Run the same self-contained qualification suite against two appliances (for
+example two server builds or encoding configurations) with:
+
+```bash
+scripts/test-live-matrix.sh              # primary NZ_DEV_* + optional NZ_DEV2_*
+scripts/test-live-matrix.sh --require-two
+# PowerShell: scripts/test-live-matrix.ps1 [-RequireTwo]
+```
+
+The report is written to `target/live-matrix/report.txt`; credentials are read
+only from the environment and are never written there. A two-appliance matrix
+run is required before tagging `1.0.0` and recommended for every appliance
+patch level. The exact support matrix and semver policy are in
+[COMPATIBILITY.md](COMPATIBILITY.md).
+
+Run one suite directly with
 `cargo test --features compat --test live_qualification -- --ignored --nocapture --test-threads=1`.
 
 Test categories:
@@ -602,3 +723,25 @@ private connection details.
 - The crate does not impose `chrono` or `time`; it uses `rust_decimal` for
   exact NUMERIC values within its fixed-width range and retains a string
   fallback for wider Netezza values.
+- `CHAR`/`VARCHAR` binary bytes default to Latin-1; use
+  `char_varchar_encoding=utf8` or `CharEncoding::Utf8` for UTF-8 databases.
+  Store characters outside Latin-1 in `NVARCHAR`.
+- On Netezza 11.2 some errors arrive as legacy raw text without SQLSTATE;
+  `NzDatabaseError.raw` keeps the original message.
+
+## API stability
+
+The `1.0.0-rc.1` release freezes the public API for the `1.0` series:
+
+- `1.0.x` releases contain bug, security and documentation fixes only.
+- `1.x.0` releases may add public items, trait implementations, feature flags
+  and enum variants; breaking changes require `2.0.0`.
+- `1.0.0-rc.N` releases may still correct API mistakes before `1.0.0`; pin the
+  exact prerelease while evaluating.
+- The minimum supported Rust version is `1.87`; raising it is a minor release
+  and is documented in `CHANGELOG.md`.
+- Internal wire modules (`messages`, `buffer`, `handshake`, `tuple_desc`) are
+  published for tooling but are not a stable application API.
+
+The full policy, the documented appliance/type/feature matrix and the live
+two-appliance procedure are in [COMPATIBILITY.md](COMPATIBILITY.md).

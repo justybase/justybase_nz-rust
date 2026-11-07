@@ -15,6 +15,10 @@
 //! Binary tuple descriptor — port of C# `DbosTupleDesc.cs` / Node
 //! `DbosTupleDesc.ts` plus the shared [`ColumnDesc`] metadata type.
 
+// Wire-descriptor internals; `ColumnDesc` is the documented public view.
+#![allow(missing_docs)]
+
+use crate::config::CharEncoding;
 use crate::error::{validate_protocol_length, NzError, NzResult};
 use crate::messages::nz_type;
 use crate::types::datetime;
@@ -186,6 +190,8 @@ pub struct DbosTupleDesc {
     pub field_spring_field: Vec<i32>,
     pub date_style: i32,
     pub euro_dates: i32,
+    /// Encoding applied to `CHAR`/`VARCHAR`/`VAR_FIXED_CHAR` fields.
+    pub char_varchar_encoding: CharEncoding,
 }
 
 impl DbosTupleDesc {
@@ -218,7 +224,20 @@ impl DbosTupleDesc {
     }
     /// Parse the descriptor. `cached_columns` supplies the text-path column
     /// metadata (used for the abstime OID 702 fix, nzpy issue #61).
+    ///
+    /// `CHAR`/`VARCHAR` values decoded from rows produced with this descriptor
+    /// use Latin-1; use [`Self::parse_with_encoding`] to select another
+    /// encoding.
     pub fn parse(data: &[u8], cached_columns: Option<&[ColumnDesc]>) -> NzResult<Self> {
+        Self::parse_with_encoding(data, cached_columns, CharEncoding::default())
+    }
+
+    /// Parse the descriptor with an explicit `CHAR`/`VARCHAR` encoding.
+    pub fn parse_with_encoding(
+        data: &[u8],
+        cached_columns: Option<&[ColumnDesc]>,
+        char_varchar_encoding: CharEncoding,
+    ) -> NzResult<Self> {
         if data.len() < 36 {
             return Err(NzError::Protocol(
                 "Invalid RowDescriptionStandard payload: descriptor header is truncated; reconnect is required."
@@ -238,6 +257,7 @@ impl DbosTupleDesc {
             fixed_fields_size: be32(24),
             max_record_size: be32(28),
             num_fields: 0,
+            char_varchar_encoding,
             ..Default::default()
         };
         let num_fields_i = be32(32);
@@ -739,8 +759,9 @@ impl DbosTupleDesc {
                     .checked_add(fld_len)
                     .and_then(|end| row.get(off..end))
                     .ok_or_else(|| protocol_trunc(i))?;
-                let text = std::str::from_utf8(s)
-                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
+                let text = self.char_varchar_encoding.decode(s).map_err(|error| {
+                    NzError::Protocol(format!("invalid UTF-8 field {i}: {error}"))
+                })?;
                 let target = string_value_slot(out, StringValueKind::Text);
                 target.clear();
                 target.push_str(text.trim_end_matches(' '));
@@ -759,10 +780,25 @@ impl DbosTupleDesc {
                 target.clear();
                 target.push_str(text.trim_end_matches('\0'));
             }
-            nz_type::NZ_TYPE_VARCHAR
-            | nz_type::NZ_TYPE_VAR_FIXED_CHAR
-            | nz_type::NZ_TYPE_JSON
-            | nz_type::NZ_TYPE_JSONPATH => {
+            nz_type::NZ_TYPE_VARCHAR | nz_type::NZ_TYPE_VAR_FIXED_CHAR => {
+                if off + 2 > row.len() {
+                    return Err(protocol_trunc(i));
+                }
+                let cursize = u16::from_le_bytes(row[off..off + 2].try_into().unwrap()) as i32 - 2;
+                if cursize < 0 || off + 2 + cursize as usize > row.len() {
+                    return Err(protocol_trunc(i));
+                }
+                let text = self
+                    .char_varchar_encoding
+                    .decode(slice_of(row, off + 2, cursize as usize))
+                    .map_err(|error| {
+                        NzError::Protocol(format!("invalid UTF-8 field {i}: {error}"))
+                    })?;
+                let target = string_value_slot(out, StringValueKind::Text);
+                target.clear();
+                target.push_str(&text);
+            }
+            nz_type::NZ_TYPE_JSON | nz_type::NZ_TYPE_JSONPATH => {
                 if off + 2 > row.len() {
                     return Err(protocol_trunc(i));
                 }
@@ -1165,7 +1201,9 @@ mod tests {
             }
         }
         payload.extend_from_slice(&[0; 8]);
-        let descriptor = DbosTupleDesc::parse(&payload, None).unwrap();
+        let descriptor =
+            DbosTupleDesc::parse_with_encoding(&payload, None, crate::config::CharEncoding::Utf8)
+                .unwrap();
         let build = |text: &[u8]| {
             let mut row = vec![0, 0, 0];
             row.extend_from_slice(&5i32.to_le_bytes());

@@ -1,11 +1,13 @@
-//! A value that cannot be decoded (invalid UTF-8 in a VARCHAR, a malformed
-//! scalar) is a *data* problem, not a *framing* problem: the whole message was
-//! consumed and the stream stays synchronized. The driver must report the
-//! decode error for that statement and keep the session; framing faults (bad
-//! lengths, truncation, inconsistent cell layout) must still retire it.
+//! A value that cannot be decoded (invalid UTF-8 under an explicit UTF-8
+//! `char_varchar_encoding`, a malformed scalar) is a *data* problem, not a
+//! *framing* problem: the whole message was consumed and the stream stays
+//! synchronized. The driver must report the decode error for that statement
+//! and keep the session; framing faults (bad lengths, truncation,
+//! inconsistent cell layout) must still retire it.
 //!
-//! Motivating case: a Latin (non-UTF-8) database returns non-UTF-8 VARCHAR
-//! bytes on the binary path; one such row used to kill the pooled session.
+//! The production default decodes `CHAR`/`VARCHAR` as Latin-1, which makes
+//! every byte sequence decodable; these tests opt into UTF-8 so the
+//! session-survival path is still exercised.
 
 mod support;
 
@@ -116,6 +118,16 @@ fn start() -> MockServer {
     })
 }
 
+/// The binary-path decode-error cases assert that a *genuinely* undecodable
+/// value (invalid UTF-8) keeps the session alive. With the production default
+/// `CHAR`/`VARCHAR` bytes are Latin-1 and therefore always decodable, so these
+/// tests opt into UTF-8 decoding explicitly.
+fn utf8_config(server: &MockServer) -> nz_rust::NzConnectionConfig {
+    let mut config = server.config();
+    config.char_varchar_encoding = nz_rust::CharEncoding::Utf8;
+    config
+}
+
 async fn assert_session_kept(client: &nz_rust::Client, server: &MockServer, label: &str) {
     assert!(!client.is_closed(), "{label}: session was closed");
     let rows = tokio::time::timeout(Duration::from_secs(10), client.query("SELECT ok", &[]))
@@ -129,7 +141,8 @@ async fn assert_session_kept(client: &nz_rust::Client, server: &MockServer, labe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecodable_values_fail_the_statement_but_keep_the_session() {
     let server = start();
-    let client = nz_rust::Client::connect(&server.config()).await.unwrap();
+    let config = utf8_config(&server);
+    let client = nz_rust::Client::connect(&config).await.unwrap();
     for sql in ["TEXT_UTF8", "TEXT_SCALAR", "DBOS_UTF8", "DBOS_MANY", "MANY"] {
         let result = client.query_multi(sql, &[]).await;
         assert!(
@@ -160,7 +173,7 @@ async fn a_server_error_wins_over_a_decode_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pooled_sessions_survive_undecodable_values() {
     let server = start();
-    let mut config = nz_rust::PoolConfig::new(server.config());
+    let mut config = nz_rust::PoolConfig::new(utf8_config(&server));
     config.max = 1;
     let pool = nz_rust::Pool::new(config).unwrap();
     for _ in 0..3 {
@@ -181,7 +194,8 @@ async fn pooled_sessions_survive_undecodable_values() {
 async fn lazy_rows_report_the_bad_field_only() {
     use futures_core::Stream;
     let server = start();
-    let client = nz_rust::Client::connect(&server.config()).await.unwrap();
+    let config = utf8_config(&server);
+    let client = nz_rust::Client::connect(&config).await.unwrap();
     let mut stream = client.query_stream("DBOS_UTF8", &[]).await.unwrap();
     let row = std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx))
         .await
@@ -255,7 +269,8 @@ mod legacy {
     #[test]
     fn legacy_buffered_queries_keep_the_session_after_an_undecodable_value() {
         let server = start();
-        let mut conn = nz_rust::NzConnection::connect(&server.config()).unwrap();
+        let config = utf8_config(&server);
+        let mut conn = nz_rust::NzConnection::connect(&config).unwrap();
         for sql in [
             "TEXT_UTF8",
             "TEXT_SCALAR",
@@ -290,7 +305,8 @@ mod legacy {
     #[test]
     fn legacy_streaming_keeps_the_session_and_delivers_the_good_rows() {
         let server = start();
-        let mut conn = nz_rust::NzConnection::connect(&server.config()).unwrap();
+        let config = utf8_config(&server);
+        let mut conn = nz_rust::NzConnection::connect(&config).unwrap();
         for (sql, expected) in [("DBOS_MANY", vec![3, 1]), ("MANY", vec![1, 1])] {
             let mut sink = RowCounter::default();
             let result = conn.execute_stream(sql, &[], &mut sink);

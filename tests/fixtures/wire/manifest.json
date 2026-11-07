@@ -1,0 +1,244 @@
+{
+  "fixtures": [
+    {
+      "name": "text_types",
+      "sha256": "4d3a43e8a9bf3a464c2988abbea96121950a3dc33a045499d1b5db9d7dbadcd8",
+      "statements": [
+        "SELECT CAST(-2147483648 AS INTEGER) AS I, CAST('Zażółć gęślą jaźń' AS NVARCHAR(40)) AS V, CAST('3.1400' AS NUMERIC(10,4)) AS N, CAST('2024-02-29' AS DATE) AS D, CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP) AS TS, TRUE AS B, CAST(1.5 AS DOUBLE PRECISION) AS F, CAST('12:34:56' AS TIME) AS T"
+      ],
+      "suite": "encoding"
+    },
+    {
+      "name": "dbos_types",
+      "sha256": "dcbb0d4499d07e0059acb8a6a3c577eb50710dc503ea6209fbc464a01a7fd1dc",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_T (I INTEGER, V NVARCHAR(40), N NUMERIC(10,4), D DATE, TS TIMESTAMP, B BOOLEAN, F DOUBLE PRECISION, T TIME, BI BIGINT, SI SMALLINT, BY BYTEINT) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_T VALUES (-2147483648, 'Zażółć gęślą jaźń', 3.1400, '2024-02-29', '2024-02-29 12:34:56.123456', TRUE, 1.5, '12:34:56', -9223372036854775807, -32768, -128)",
+        "INSERT INTO RUST_WIRE_T VALUES (2147483647, '', -0.0001, '0001-01-01', '1999-12-31 23:59:59.999999', FALSE, -2.5, '00:00:00', 9223372036854775807, 32767, 127)",
+        "SELECT I, V, N, D, TS, B, F, T, BI, SI, BY FROM RUST_WIRE_T ORDER BY I"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "null_matrix",
+      "sha256": "2e6ab914ec00515a54478cb6a1fa46e7008275ef78790131a6c2d667d51bfbc4",
+      "statements": [
+        "SELECT CAST(NULL AS INTEGER) AS C0, CAST(1 AS INTEGER) AS C1, CAST(NULL AS VARCHAR(8)) AS C2, CAST(3 AS INTEGER) AS C3, CAST(NULL AS INTEGER) AS C4, CAST('v5' AS VARCHAR(8)) AS C5, CAST(NULL AS INTEGER) AS C6, CAST(7 AS INTEGER) AS C7, CAST(NULL AS VARCHAR(8)) AS C8, CAST(9 AS INTEGER) AS C9, CAST(NULL AS INTEGER) AS C10, CAST('v11' AS VARCHAR(8)) AS C11, CAST(NULL AS INTEGER) AS C12, CAST(13 AS INTEGER) AS C13, CAST(NULL AS VARCHAR(8)) AS C14, CAST(15 AS INTEGER) AS C15, CAST(NULL AS INTEGER) AS C16, CAST('v17' AS VARCHAR(8)) AS C17, CAST(NULL AS INTEGER) AS C18, CAST(19 AS INTEGER) AS C19, CAST(NULL AS VARCHAR(8)) AS C20, CAST(21 AS INTEGER) AS C21, CAST(NULL AS INTEGER) AS C22, CAST('v23' AS VARCHAR(8)) AS C23, CAST(NULL AS INTEGER) AS C24, CAST(25 AS INTEGER) AS C25, CAST(NULL AS VARCHAR(8)) AS C26, CAST(27 AS INTEGER) AS C27, CAST(NULL AS INTEGER) AS C28, CAST('v29' AS VARCHAR(8)) AS C29, CAST(NULL AS INTEGER) AS C30, CAST(31 AS INTEGER) AS C31, CAST(NULL AS VARCHAR(8)) AS C32",
+        "CREATE TEMP TABLE RUST_WIRE_N (C0 INTEGER, C1 INTEGER, C2 VARCHAR(8), C3 INTEGER, C4 INTEGER, C5 VARCHAR(8), C6 INTEGER, C7 INTEGER, C8 VARCHAR(8), C9 INTEGER, C10 INTEGER, C11 VARCHAR(8), C12 INTEGER, C13 INTEGER, C14 VARCHAR(8), C15 INTEGER, C16 INTEGER, C17 VARCHAR(8), C18 INTEGER, C19 INTEGER, C20 VARCHAR(8), C21 INTEGER, C22 INTEGER, C23 VARCHAR(8), C24 INTEGER, C25 INTEGER, C26 VARCHAR(8), C27 INTEGER, C28 INTEGER, C29 VARCHAR(8), C30 INTEGER, C31 INTEGER, C32 VARCHAR(8)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_N VALUES (NULL, 1, NULL, 3, NULL, 'v5', NULL, 7, NULL, 9, NULL, 'v11', NULL, 13, NULL, 15, NULL, 'v17', NULL, 19, NULL, 21, NULL, 'v23', NULL, 25, NULL, 27, NULL, 'v29', NULL, 31, NULL)",
+        "SELECT * FROM RUST_WIRE_N"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "numeric_matrix",
+      "sha256": "3f327bf5f500f521c67570a7492f3ac58486d23d3ad0b0b8cfcf48cf3fc1aeb6",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_NUM0 (ID INTEGER, V NUMERIC(1,0)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM0 VALUES (0, CAST('0' AS NUMERIC(1,0)))",
+        "INSERT INTO RUST_WIRE_NUM0 VALUES (1, CAST('9' AS NUMERIC(1,0)))",
+        "INSERT INTO RUST_WIRE_NUM0 VALUES (2, CAST('-9' AS NUMERIC(1,0)))",
+        "SELECT V FROM RUST_WIRE_NUM0 ORDER BY ID",
+        "SELECT CAST('0' AS NUMERIC(1,0)), CAST('9' AS NUMERIC(1,0)), CAST('-9' AS NUMERIC(1,0))",
+        "CREATE TEMP TABLE RUST_WIRE_NUM1 (ID INTEGER, V NUMERIC(18,0)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM1 VALUES (0, CAST('0' AS NUMERIC(18,0)))",
+        "INSERT INTO RUST_WIRE_NUM1 VALUES (1, CAST('999999999999999999' AS NUMERIC(18,0)))",
+        "INSERT INTO RUST_WIRE_NUM1 VALUES (2, CAST('-999999999999999999' AS NUMERIC(18,0)))",
+        "SELECT V FROM RUST_WIRE_NUM1 ORDER BY ID",
+        "SELECT CAST('0' AS NUMERIC(18,0)), CAST('999999999999999999' AS NUMERIC(18,0)), CAST('-999999999999999999' AS NUMERIC(18,0))",
+        "CREATE TEMP TABLE RUST_WIRE_NUM2 (ID INTEGER, V NUMERIC(38,0)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM2 VALUES (0, CAST('0' AS NUMERIC(38,0)))",
+        "INSERT INTO RUST_WIRE_NUM2 VALUES (1, CAST('99999999999999999999999999999999999999' AS NUMERIC(38,0)))",
+        "SELECT V FROM RUST_WIRE_NUM2 ORDER BY ID",
+        "SELECT CAST('0' AS NUMERIC(38,0)), CAST('99999999999999999999999999999999999999' AS NUMERIC(38,0))",
+        "CREATE TEMP TABLE RUST_WIRE_NUM3 (ID INTEGER, V NUMERIC(10,4)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM3 VALUES (0, CAST('0' AS NUMERIC(10,4)))",
+        "INSERT INTO RUST_WIRE_NUM3 VALUES (1, CAST('3.1400' AS NUMERIC(10,4)))",
+        "INSERT INTO RUST_WIRE_NUM3 VALUES (2, CAST('-0.0001' AS NUMERIC(10,4)))",
+        "INSERT INTO RUST_WIRE_NUM3 VALUES (3, CAST('999999.9999' AS NUMERIC(10,4)))",
+        "SELECT V FROM RUST_WIRE_NUM3 ORDER BY ID",
+        "SELECT CAST('0' AS NUMERIC(10,4)), CAST('3.1400' AS NUMERIC(10,4)), CAST('-0.0001' AS NUMERIC(10,4)), CAST('999999.9999' AS NUMERIC(10,4))",
+        "CREATE TEMP TABLE RUST_WIRE_NUM4 (ID INTEGER, V NUMERIC(38,10)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM4 VALUES (0, CAST('1.0000000001' AS NUMERIC(38,10)))",
+        "INSERT INTO RUST_WIRE_NUM4 VALUES (1, CAST('-12345678901234567890123456.7890123456' AS NUMERIC(38,10)))",
+        "SELECT V FROM RUST_WIRE_NUM4 ORDER BY ID",
+        "SELECT CAST('1.0000000001' AS NUMERIC(38,10)), CAST('-12345678901234567890123456.7890123456' AS NUMERIC(38,10))",
+        "CREATE TEMP TABLE RUST_WIRE_NUM5 (ID INTEGER, V NUMERIC(38,38)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_NUM5 VALUES (0, CAST('0.99999999999999999999999999999999999999' AS NUMERIC(38,38)))",
+        "INSERT INTO RUST_WIRE_NUM5 VALUES (1, CAST('-0.5' AS NUMERIC(38,38)))",
+        "SELECT V FROM RUST_WIRE_NUM5 ORDER BY ID",
+        "SELECT CAST('0.99999999999999999999999999999999999999' AS NUMERIC(38,38)), CAST('-0.5' AS NUMERIC(38,38))"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "varchar_32767",
+      "sha256": "44d4f6fe35149fd02af5da235239e2a3797d9c15891f29390621a09f28c0c870",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_VC (ID INTEGER, V VARCHAR(64000)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_VC VALUES (32766, 'A' || REPEAT('x', 32764) || 'Z')",
+        "SELECT CAST('A' || REPEAT('x', 32764) || 'Z' AS VARCHAR(64000))",
+        "INSERT INTO RUST_WIRE_VC VALUES (32767, 'A' || REPEAT('x', 32765) || 'Z')",
+        "SELECT CAST('A' || REPEAT('x', 32765) || 'Z' AS VARCHAR(64000))",
+        "INSERT INTO RUST_WIRE_VC VALUES (32768, 'A' || REPEAT('x', 32766) || 'Z')",
+        "SELECT CAST('A' || REPEAT('x', 32766) || 'Z' AS VARCHAR(64000))",
+        "SELECT ID, V FROM RUST_WIRE_VC ORDER BY ID"
+      ],
+      "suite": "encoding"
+    },
+    {
+      "name": "multi_result",
+      "sha256": "5260c244b2cf35df8bb319a17bb735e3f8427574b462b77f2bb40959d943a0b2",
+      "statements": [
+        "SELECT 1 AS A; SELECT 'x' AS B, 2 AS C; SELECT CAST(NULL AS INTEGER) AS D"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "notice",
+      "sha256": "07e97d0952411b7ca5f4406191c0c6e0688802c7ea7bee239e2d766487714609",
+      "statements": [
+        "ROLLBACK",
+        "COMMIT",
+        "CREATE TEMP TABLE RUST_WIRE_NT (A INTEGER)",
+        "SELECT 1 AS AFTER_NOTICE"
+      ],
+      "suite": "errors"
+    },
+    {
+      "name": "error",
+      "sha256": "b35d782c9bad42f5a9fe7a6c5f67ec0269b0e9f2e909d9989e40e05bd28be4cc",
+      "statements": [
+        "SELECT FROM FROM",
+        "SELECT 1/0",
+        "SELECT 1 AS AFTER_ERROR"
+      ],
+      "suite": "errors"
+    },
+    {
+      "name": "latin_varchar",
+      "sha256": "512f49ddecb4cf4245ea984eb44a46d09cb2abf8d556a6a2760976a23d990796",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_LATIN (ID INTEGER, V VARCHAR(64), C CHAR(10), N NVARCHAR(64)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_LATIN VALUES (1, 'ó', 'ó', 'Zażółć gęślą jaźń')",
+        "INSERT INTO RUST_WIRE_LATIN VALUES (2, 'café', 'café', '¡Hola! ¿Qué tal?')",
+        "SELECT ID, V, C, N FROM RUST_WIRE_LATIN ORDER BY ID"
+      ],
+      "suite": "encoding"
+    },
+    {
+      "name": "text_encoding",
+      "sha256": "c990f55fb7c5989e805c5209c137c70892ae72e44631b8b8a29b5b2d8af4b6bc",
+      "statements": [
+        "SELECT CAST('ó' AS VARCHAR(10)) AS V, CAST('Zażółć gęślą jaźń' AS NVARCHAR(40)) AS N, CAST('ab' AS CHAR(5)) AS C, CAST('ab' AS NCHAR(5)) AS NC"
+      ],
+      "suite": "encoding"
+    },
+    {
+      "name": "error_details",
+      "sha256": "06c85b7f74fd06153311915330f168ee29d5cd4aabf18fb2cd84073e6a4333d4",
+      "statements": [
+        "SELECT * FROM RUST_WIRE_MISSING_TABLE",
+        "SELECT CAST('not-a-number' AS INTEGER)",
+        "SELECT 1/0",
+        "SELECT 1 AS AFTER_ERROR"
+      ],
+      "suite": "errors"
+    },
+    {
+      "name": "temporal_boundaries",
+      "sha256": "ca72a35fd14dced9ce303e7a72029362ade3dc25ed428f108cdfba15314b8c9a",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_TEMPORAL (ID INTEGER, D DATE, TS TIMESTAMP, T TIME, TZ TIMETZ, IV INTERVAL) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_TEMPORAL VALUES (1, '0001-01-01', '0001-01-01 00:00:00', '00:00:00', '12:34:56+05:30', '-1 year -2 months -3 days -04:05:06.789012')",
+        "INSERT INTO RUST_WIRE_TEMPORAL VALUES (2, '9999-12-31', '9999-12-31 23:59:59.999999', '23:59:59.999999', '00:00:00-00:00', '1 year 2 months 3 days 04:05:06.789012')",
+        "SELECT ID, D, TS, T, TZ, IV FROM RUST_WIRE_TEMPORAL ORDER BY ID",
+        "SELECT CAST('0001-01-01' AS DATE) AS D, CAST('9999-12-31 23:59:59.999999' AS TIMESTAMP) AS TS, CAST('23:59:59.999999' AS TIME) AS T, CAST('-1 year -2 months -3 days -04:05:06.789012' AS INTERVAL) AS IV"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "numeric_edges",
+      "sha256": "3862d8f01c6a4f1f86e20bb08c911f6a50fbc6bbf023a5651d49e1b77ff89b73",
+      "statements": [
+        "CREATE TEMP TABLE RUST_WIRE_EDGE (ID INTEGER, V NUMERIC(38,19)) DISTRIBUTE ON RANDOM",
+        "INSERT INTO RUST_WIRE_EDGE VALUES (1, 0)",
+        "INSERT INTO RUST_WIRE_EDGE VALUES (2, -0.0000000000000000001)",
+        "INSERT INTO RUST_WIRE_EDGE VALUES (3, 9999999999999999999.9999999999999999999)",
+        "INSERT INTO RUST_WIRE_EDGE VALUES (4, -9999999999999999999.9999999999999999999)",
+        "SELECT ID, V FROM RUST_WIRE_EDGE ORDER BY ID",
+        "SELECT CAST('9999999999999999999.9999999999999999999' AS NUMERIC(38,19)) AS V, CAST('-0.0000000000000000001' AS NUMERIC(38,19)) AS N"
+      ],
+      "suite": "types"
+    },
+    {
+      "name": "metadata_core",
+      "sha256": "44f81bb4dc85f6618d0cbe8e8997aea0b2ab7dca93e4be19f521cb787387c4ed",
+      "statements": [
+        "DROP SCHEMA RUST_WIRE_META CASCADE",
+        "CREATE SCHEMA RUST_WIRE_META",
+        "CREATE TABLE RUST_WIRE_META.T (ID INTEGER NOT NULL, NAME VARCHAR(20), AMT NUMERIC(10,2), PRIMARY KEY (ID)) DISTRIBUTE ON (ID) ORGANIZE ON (ID, NAME)",
+        "INSERT INTO RUST_WIRE_META.T VALUES (1, 'alpha', 3.14)",
+        "CREATE VIEW RUST_WIRE_META.V AS SELECT ID, NAME FROM RUST_WIRE_META.T",
+        "COMMENT ON TABLE RUST_WIRE_META.T IS 'meta table comment'",
+        "COMMENT ON COLUMN RUST_WIRE_META.T.NAME IS 'display name'",
+        "CREATE SYNONYM RUST_WIRE_META.S FOR RUST_WIRE_META.T",
+        "SELECT current_catalog",
+        "SELECT current_schema",
+        "SELECT schema FROM _v_schema ORDER BY schema",
+        "SELECT database, owner, defschema FROM _v_database ORDER BY database",
+        "SELECT schema, tablename, owner, objtype, objid, reltuples FROM _v_table WHERE tablename IS NOT NULL AND schema = 'RUST_WIRE_META' AND schema NOT IN ('DEFINITION_SCHEMA', 'INZA', 'NZ_QUERY_HISTORY') AND objtype <> 'SYSTEM_TABLE' ORDER BY schema, tablename",
+        "SELECT attname, attnum, format_type, CASE WHEN attnotnull THEN 'N' ELSE 'Y' END, objid, description FROM _v_relation_column WHERE name = 'T' AND schema = 'RUST_WIRE_META' ORDER BY attnum",
+        "SELECT schema, viewname, owner, objid, definition FROM _v_view WHERE viewname IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, viewname",
+        "SELECT schema, procedure, owner, objid, proceduresignature, returns, builtin, proceduresource, executedasowner, arguments, description FROM _v_procedure WHERE procedure IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, procedure",
+        "SELECT attname FROM _v_table_dist_map WHERE tablename = 'T' AND schema = 'RUST_WIRE_META' ORDER BY distattnum",
+        "SELECT attname FROM _v_table_organize_column WHERE tablename = 'T' AND schema = 'RUST_WIRE_META' ORDER BY orgseqno",
+        "SELECT schema, tablename, used_bytes, allocated_bytes, (used_bytes / 1048576)::BIGINT AS size_mb, skew FROM _v_table_storage_stat WHERE tablename IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY used_bytes DESC",
+        "SELECT id, username, dbname, conntime, priority, status, type, client_os_username FROM _v_session ORDER BY conntime DESC",
+        "SELECT schema, function, owner, objid, functionsignature, returns, env FROM _v_function WHERE function IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, function",
+        "SELECT schema, synonym_name, refobjname, refdatabase, refschema, description FROM _v_synonym WHERE synonym_name IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, synonym_name",
+        "SELECT schema, relation, constraintname, contype, attname, pkdatabase, pkschema, pkrelation, pkattname, updt_type, del_type FROM _v_relation_keydata WHERE relation IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, relation, conseq",
+        "SELECT schema, tablename, attname, distattnum FROM _v_table_dist_map WHERE tablename IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, tablename, distseqno",
+        "SELECT schema, tablename, attname, attnum FROM _v_table_organize_column WHERE tablename IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, tablename, orgseqno",
+        "SELECT schema, objname, objtype, owner, objid, description, createdate FROM _v_object_data WHERE objname IS NOT NULL AND schema = 'RUST_WIRE_META' AND objtype NOT IN ('AGGREGATE','CONSTRAINT','DATABASE','DATATYPE','GROUP','MANAGEMENT INDEX','MANAGEMENT SEQ','MANAGEMENT TABLE','MANAGEMENT VIEW','SCHEDULER RULE','SCHEMA','SYSTEM INDEX','SYSTEM SEQ','SYSTEM TABLE','SYSTEM VIEW','USER') ORDER BY schema, objtype, objname",
+        "SELECT schema, seqname, owner, objid FROM _v_sequence WHERE seqname IS NOT NULL AND schema = 'RUST_WIRE_META' ORDER BY schema, seqname",
+        "SELECT username, objid FROM _v_user ORDER BY username",
+        "SELECT groupname, objid FROM _v_group ORDER BY groupname",
+        "SELECT qh_sessionid, qh_user, qh_database, qh_sql, qh_tsubmit, qh_tstart, qh_resrows FROM _v_qryhist WHERE 1=1 ORDER BY qh_tsubmit DESC LIMIT 10",
+        "SELECT schema, attname, attnum, format_type, attnotnull, coldefault, description FROM _v_relation_column WHERE name = 'T' AND schema = 'RUST_WIRE_META' ORDER BY attnum",
+        "SELECT constraintname, contype, attname, pkdatabase, pkschema, pkrelation, pkattname, updt_type, del_type FROM _v_relation_keydata WHERE relation = 'T' AND schema = 'RUST_WIRE_META' ORDER BY constraintname, conseq",
+        "SELECT description FROM _v_object_data WHERE objname = 'T' AND schema = 'RUST_WIRE_META' AND objtype = 'TABLE'",
+        "SELECT owner FROM _v_table WHERE tablename = 'T' AND schema = 'RUST_WIRE_META'",
+        "DROP SCHEMA RUST_WIRE_META CASCADE"
+      ],
+      "suite": "metadata"
+    },
+    {
+      "name": "ddl_reconstruction",
+      "sha256": "c4198bdf4342cc906a486fd43fe5ce691e0279e4e2bfa6f380b913ea0b6aa488",
+      "statements": [
+        "DROP SCHEMA RUST_WIRE_DDL CASCADE",
+        "CREATE SCHEMA RUST_WIRE_DDL",
+        "CREATE TABLE RUST_WIRE_DDL.T (ID INTEGER NOT NULL, NAME VARCHAR(20), AMT NUMERIC(10,2) DEFAULT 0, PRIMARY KEY (ID)) DISTRIBUTE ON (ID) ORGANIZE ON (ID, NAME)",
+        "COMMENT ON TABLE RUST_WIRE_DDL.T IS 'table comment'",
+        "COMMENT ON COLUMN RUST_WIRE_DDL.T.NAME IS 'column comment'",
+        "CREATE VIEW RUST_WIRE_DDL.V AS SELECT ID, NAME FROM RUST_WIRE_DDL.T",
+        "COMMENT ON VIEW RUST_WIRE_DDL.V IS 'view comment'",
+        "COMMENT ON COLUMN RUST_WIRE_DDL.V.NAME IS 'view column comment'",
+        "CREATE SYNONYM RUST_WIRE_DDL.S FOR RUST_WIRE_DDL.T",
+        "SELECT current_catalog; SELECT schema, name, attname, attnum, format_type, attnotnull, coldefault, description FROM _v_relation_column WHERE ((name = 'T' AND schema = 'RUST_WIRE_DDL')) ORDER BY schema, name, attnum; SELECT schema, tablename, attname FROM _v_table_dist_map WHERE ((tablename = 'T' AND schema = 'RUST_WIRE_DDL')) ORDER BY schema, tablename, distattnum; SELECT schema, tablename, attname FROM _v_table_organize_column WHERE ((tablename = 'T' AND schema = 'RUST_WIRE_DDL')) ORDER BY schema, tablename, orgseqno; SELECT schema, relation, constraintname, contype, attname, pkdatabase, pkschema, pkrelation, pkattname, updt_type, del_type FROM _v_relation_keydata WHERE ((relation = 'T' AND schema = 'RUST_WIRE_DDL')) ORDER BY schema, relation, constraintname, conseq; SELECT schema, objname, description FROM _v_object_data WHERE ((objname = 'T' AND schema = 'RUST_WIRE_DDL')) AND objtype = 'TABLE'",
+        "SELECT schema, viewname, definition FROM _v_view WHERE viewname = 'V' AND schema = 'RUST_WIRE_DDL' ORDER BY schema, viewname",
+        "SELECT schema, attname, attnum, format_type, attnotnull, coldefault, description FROM _v_relation_column WHERE name = 'V' AND schema = 'RUST_WIRE_DDL' ORDER BY attnum",
+        "SELECT description FROM _v_object_data WHERE objname = 'V' AND schema = 'RUST_WIRE_DDL' AND objtype = 'TABLE'",
+        "SELECT description FROM _v_object_data WHERE objname = 'V' AND schema = 'RUST_WIRE_DDL'",
+        "SELECT schema, owner, synonym_name, refobjname, description, refdatabase, refschema FROM _v_synonym WHERE synonym_name = 'S' AND schema = 'RUST_WIRE_DDL'",
+        "DROP SCHEMA RUST_WIRE_DDL CASCADE"
+      ],
+      "suite": "ddl"
+    }
+  ],
+  "format": 1,
+  "generated_at_unix": 1794062871,
+  "server_encoding": "NOTICE:  UTF8",
+  "server_version": "Release 11.2.2.1 [Build 20]"
+}

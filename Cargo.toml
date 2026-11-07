@@ -1,6 +1,6 @@
 [package]
 name = "nz_rust"
-version = "0.3.3"
+version = "1.0.0-rc.1"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -12,6 +12,9 @@ description = "Pure Rust driver for IBM Netezza / PureData — port of JustyBase
 readme = "README.md"
 keywords = ["netezza", "database", "sql", "driver", "tokio"]
 categories = ["database", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
 exclude = [
     "benchmarks/**",
     "fuzz/**",
@@ -29,7 +32,6 @@ compat = []
 chrono = ["dep:chrono"]
 ssl = [
     "dep:rustls",
-    "dep:rustls-pemfile",
     "dep:tokio-rustls",
     "dep:webpki-roots",
 ]
@@ -42,11 +44,10 @@ futures-core = "0.3.34"
 md5 = "0.8"
 sha2 = "0.11"
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
-tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
-rustls = { version = "0.23.45", optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+rustls = { version = "0.23.46", optional = true }
 tokio-rustls = { version = "0.26.5", optional = true }
-webpki-roots = { version = "1.0.9", optional = true }
+webpki-roots = { version = "1.0.10", optional = true }
 
 [dev-dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["miniz_oxide"] }
@@ -81,6 +82,11 @@ required-features = ["compat"]
 [[test]]
 name = "mock_server"
 path = "tests/mock_server.rs"
+required-features = ["compat"]
+
+[[test]]
+name = "metadata_mock"
+path = "tests/metadata_mock.rs"
 required-features = ["compat"]
 
 [[test]]

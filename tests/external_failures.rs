@@ -12,11 +12,14 @@ mod support;
 use nz_rust::{ExternalFilePolicy, NzConnectionConfig, NzError};
 use std::io::Read;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use support::*;
 use tokio::io::{AsyncRead, ReadBuf};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What the client sent for one transfer.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -31,13 +34,15 @@ struct Transfer {
 type Log = Arc<Mutex<Vec<Transfer>>>;
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
+    let sequence = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "nz_rust_ext_{tag}_{}_{}",
+        "nz_rust_ext_{tag}_{}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        sequence
     ))
 }
 

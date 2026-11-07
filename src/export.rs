@@ -118,12 +118,14 @@ pub struct TextExportSink<W> {
     include_header: bool,
 }
 impl<W: Write> TextExportSink<W> {
+    /// Create a sink around `writer`.
     pub fn new(writer: W, include_header: bool) -> Self {
         Self {
             writer,
             include_header,
         }
     }
+    /// Return the underlying writer.
     pub fn into_inner(self) -> W {
         self.writer
     }

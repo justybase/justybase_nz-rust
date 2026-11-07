@@ -6,71 +6,107 @@ use crate::connection::Row;
 /// Sequence identity returned by the catalog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzSequenceInfo {
+    /// Schema that owns the sequence.
     pub schema: String,
+    /// Sequence name.
     pub name: String,
+    /// Sequence owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
 }
 
 /// User identity returned by the catalog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzUserInfo {
+    /// User name.
     pub name: String,
+    /// Catalog object id.
     pub object_id: Option<i64>,
 }
 
 /// Group identity returned by the catalog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzGroupInfo {
+    /// Group name.
     pub name: String,
+    /// Catalog object id.
     pub object_id: Option<i64>,
 }
 
-/// Available query history fields; absent values remain None.
+/// Available query history fields; absent values remain `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzQueryHistoryInfo {
+    /// Backend session id.
     pub session_id: Option<i64>,
+    /// User that submitted the query.
     pub username: Option<String>,
+    /// Database the query ran in.
     pub database: Option<String>,
+    /// SQL text.
     pub query_text: Option<String>,
+    /// Submit timestamp in server text form.
     pub submit_time: Option<String>,
+    /// Start timestamp in server text form.
     pub start_time: Option<String>,
+    /// Number of result rows.
     pub result_rows: Option<i64>,
 }
 
 /// Column definition and optional comments used for DDL reconstruction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzDetailedColumnInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Column name.
     pub name: String,
+    /// One-based ordinal position.
     pub ordinal: i32,
+    /// Formatted SQL type.
     pub type_name: String,
+    /// Whether the column is `NOT NULL`.
     pub not_null: bool,
+    /// Default expression.
     pub default_value: Option<String>,
+    /// Column comment.
     pub description: Option<String>,
 }
 
 /// Table constraint metadata, including referenced columns for foreign keys.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzTableKeyInfo {
+    /// Constraint name.
     pub name: String,
+    /// Canonical key type (`PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE`).
     pub key_type: String,
+    /// Raw catalog type character.
     pub type_char: char,
+    /// Constrained columns.
     pub columns: Vec<String>,
+    /// Referenced database for a foreign key.
     pub pk_database: Option<String>,
+    /// Referenced schema for a foreign key.
     pub pk_schema: Option<String>,
+    /// Referenced table for a foreign key.
     pub pk_relation: Option<String>,
+    /// Referenced columns for a foreign key.
     pub pk_columns: Vec<String>,
+    /// Referential UPDATE action.
     pub update_type: String,
+    /// Referential DELETE action.
     pub delete_type: String,
 }
 
-/// One batch DDL result; error is set when reconstruction failed.
+/// One batch DDL result; `error` is set when reconstruction failed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzDdlBatchResult {
+    /// Object schema.
     pub schema: String,
+    /// Object name.
     pub name: String,
+    /// Reconstructed DDL, empty on error.
     pub ddl: String,
+    /// Error message for this object, if reconstruction failed.
     pub error: Option<String>,
 }
 

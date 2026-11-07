@@ -26,6 +26,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "nz_rust") | .version')
+          test "v$version" = "$GITHUB_REF_NAME"
+
       - name: Verify package contents
         run: cargo package --locked
 

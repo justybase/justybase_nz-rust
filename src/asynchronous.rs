@@ -127,6 +127,7 @@ pub struct AsyncNzConnection {
 }
 
 impl AsyncNzConnection {
+    /// Connect on a blocking worker thread.
     pub async fn connect(config: &NzConnectionConfig) -> NzResult<Self> {
         let config = config.clone();
         let conn = tokio::task::spawn_blocking(move || NzConnection::connect(&config))
@@ -138,16 +139,19 @@ impl AsyncNzConnection {
         })
     }
 
+    /// Connect from a `netezza://` or `nz://` connection string.
     pub async fn connect_with_str(connection_string: &str) -> NzResult<Self> {
         let config = crate::parse_connection_string(connection_string)?;
         Self::connect(&config).await
     }
 
+    /// Execute one or more statements and return every result set.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         let values = params.iter().map(|p| p.to_nz_value()).collect::<Vec<_>>();
         self.query_values(sql, values).await
     }
 
+    /// Execute a query with pre-built [`NzValue`] parameters.
     pub async fn query_values(&self, sql: &str, params: Vec<NzValue>) -> NzResult<QueryResult> {
         let sql = sql.to_owned();
         self.with_connection(move |conn| conn.query_values(&sql, &params))
@@ -167,10 +171,12 @@ impl AsyncNzConnection {
             .await
     }
 
+    /// Rows of the first result set.
     pub async fn query_rows(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         Ok(self.query(sql, params).await?.into_rows())
     }
 
+    /// Execute a query that must return exactly one row.
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Row> {
         let rows = self.query_rows(sql, params).await?;
         if rows.len() != 1 {
@@ -182,6 +188,7 @@ impl AsyncNzConnection {
         Ok(rows.into_iter().next().expect("one row checked above"))
     }
 
+    /// Execute a query returning at most one row.
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Option<Row>> {
         let rows = self.query_rows(sql, params).await?;
         match rows.as_slice() {
@@ -194,6 +201,7 @@ impl AsyncNzConnection {
         }
     }
 
+    /// Execute a statement and return its affected-row count.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         let sql = sql.to_owned();
         let values = params.iter().map(|p| p.to_nz_value()).collect::<Vec<_>>();
@@ -214,6 +222,7 @@ impl AsyncNzConnection {
             .await
     }
 
+    /// Execute one or more statements, discarding all rows.
     pub async fn batch_execute(&self, sql: &str) -> NzResult<()> {
         let sql = sql.to_owned();
         self.with_connection(move |conn| conn.batch_execute(&sql))
@@ -262,21 +271,26 @@ impl AsyncNzConnection {
         .await
     }
 
+    /// Open an explicit transaction.
     pub async fn begin_transaction(&self) -> NzResult<()> {
         self.batch_execute("BEGIN").await
     }
+    /// Commit the open transaction.
     pub async fn commit(&self) -> NzResult<()> {
         self.batch_execute("COMMIT").await
     }
+    /// Roll back the open transaction.
     pub async fn rollback(&self) -> NzResult<()> {
         self.batch_execute("ROLLBACK").await
     }
 
+    /// Switch the session to another database.
     pub async fn change_database(&self, database: &str) -> NzResult<()> {
         let database = database.to_owned();
         self.with_connection(move |conn| conn.change_database(&database))
             .await
     }
+    /// Request out-of-band cancellation of the active statement.
     pub async fn cancel(&self) -> NzResult<()> {
         let control = self.control.clone();
         tokio::task::spawn_blocking(move || control.cancel())
@@ -286,15 +300,19 @@ impl AsyncNzConnection {
 
     // Metadata helpers intentionally mirror `NzMetadata` while keeping the
     // async facade free of a long-lived mutable borrow.
+
+    /// List visible schemas.
     pub async fn schemas(&self) -> NzResult<Vec<String>> {
         self.with_connection(|conn| conn.metadata().schemas()).await
     }
 
+    /// List databases.
     pub async fn databases(&self) -> NzResult<Vec<NzDatabaseInfo>> {
         self.with_connection(|conn| conn.metadata().databases())
             .await
     }
 
+    /// List tables, optionally filtered by schema and a SQL `LIKE` pattern.
     pub async fn tables(
         &self,
         schema: Option<&str>,
@@ -309,6 +327,7 @@ impl AsyncNzConnection {
         .await
     }
 
+    /// List columns of one table.
     pub async fn columns(&self, table: &str, schema: Option<&str>) -> NzResult<Vec<NzColumnInfo>> {
         let table = table.to_owned();
         let schema = schema.map(str::to_owned);
@@ -316,18 +335,21 @@ impl AsyncNzConnection {
             .await
     }
 
+    /// List views, optionally limited to a schema.
     pub async fn views(&self, schema: Option<&str>) -> NzResult<Vec<NzViewInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().views(schema.as_deref()))
             .await
     }
 
+    /// List stored procedures, optionally limited to a schema.
     pub async fn procedures(&self, schema: Option<&str>) -> NzResult<Vec<NzProcedureInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().procedures(schema.as_deref()))
             .await
     }
 
+    /// Return the distribution-key columns of one table.
     pub async fn distribution_key(
         &self,
         table: &str,
@@ -341,17 +363,20 @@ impl AsyncNzConnection {
         .await
     }
 
+    /// Return storage statistics for user tables.
     pub async fn table_sizes(&self, schema: Option<&str>) -> NzResult<Vec<NzTableSizeInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().table_sizes(schema.as_deref()))
             .await
     }
 
+    /// List active sessions.
     pub async fn sessions(&self) -> NzResult<Vec<NzSessionInfo>> {
         self.with_connection(|conn| conn.metadata().sessions())
             .await
     }
 
+    /// Search tables, views and procedures by a case-insensitive substring.
     pub async fn search_objects(
         &self,
         pattern: &str,
@@ -363,24 +388,28 @@ impl AsyncNzConnection {
             .await
     }
 
+    /// List user-defined functions.
     pub async fn functions(&self, schema: Option<&str>) -> NzResult<Vec<NzFunctionInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().functions(schema.as_deref()))
             .await
     }
 
+    /// List synonyms.
     pub async fn synonyms(&self, schema: Option<&str>) -> NzResult<Vec<NzSynonymInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().synonyms(schema.as_deref()))
             .await
     }
 
+    /// List primary, unique and foreign keys.
     pub async fn constraints(&self, schema: Option<&str>) -> NzResult<Vec<NzConstraintInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().constraints(schema.as_deref()))
             .await
     }
 
+    /// Distribution keys across every table in a schema.
     pub async fn all_distribution_keys(
         &self,
         schema: Option<&str>,
@@ -390,18 +419,21 @@ impl AsyncNzConnection {
             .await
     }
 
+    /// Organize keys across every table in a schema.
     pub async fn organize_keys(&self, schema: Option<&str>) -> NzResult<Vec<NzOrganizeKeyInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().organize_keys(schema.as_deref()))
             .await
     }
 
+    /// Object definitions and comments from `_v_object_data`.
     pub async fn object_details(&self, schema: Option<&str>) -> NzResult<Vec<NzObjectDetailInfo>> {
         let schema = schema.map(str::to_owned);
         self.with_connection(move |conn| conn.metadata().object_details(schema.as_deref()))
             .await
     }
 
+    /// Search object details by a case-insensitive substring.
     pub async fn search_objects_detailed(
         &self,
         pattern: &str,
@@ -416,6 +448,7 @@ impl AsyncNzConnection {
         .await
     }
 
+    /// Close the session and cancel any active operation.
     pub async fn close(&self) {
         self.control.closing.store(true, Ordering::Release);
         let _ = self.cancel().await;
@@ -427,6 +460,7 @@ impl AsyncNzConnection {
         self.control.closed.store(true, Ordering::Release);
     }
 
+    /// Whether the session is closed.
     pub async fn is_closed(&self) -> bool {
         self.inner
             .lock()
@@ -434,6 +468,7 @@ impl AsyncNzConnection {
             .unwrap_or(true)
     }
 
+    /// Whether the session has an open explicit transaction.
     pub async fn in_transaction(&self) -> bool {
         self.inner
             .lock()

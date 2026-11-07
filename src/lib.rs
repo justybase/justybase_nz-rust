@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 //! Pure Rust driver for IBM Netezza / PureData System for Analytics.
 //!
 //! 1:1 port of the proven Node.js driver (`@justybase/netezza-driver`,
@@ -21,9 +24,23 @@
 //! mirror the Node implementation byte for byte (validated against live
 //! appliance captures).
 //!
-//! The crate README contains the complete integration guide, including
-//! connection strings, pooling, metadata, bounded streaming, TLS, testing and
-//! the current C# / Node / Rust performance measurements.
+//! The crate README contains the complete integration guide: connection
+//! strings, character encoding, pooling, metadata and DDL reconstruction,
+//! bounded streaming, TLS, testing and the `1.0` compatibility policy.
+//! [COMPATIBILITY.md](https://github.com/justybase/justybase_nz-rust/blob/main/COMPATIBILITY.md)
+//! records the supported appliance, type, encoding and feature matrix.
+//!
+//! `1.0.0-rc.1` freezes the public API for the `1.0` series; `1.0.0` follows
+//! after the release-candidate soak. The crate forbids unsafe code and warns
+//! on undocumented public items.
+//!
+//! # Character encoding
+//!
+//! `CHAR`, `VARCHAR` and `VAR_FIXED_CHAR` values on the binary path decode as
+//! Latin-1 by default. Set [`CharEncoding::Utf8`] through
+//! [`NzConnectionConfig::char_varchar_encoding`] (or the
+//! `char_varchar_encoding=utf8` connection-string option) when the database
+//! stores UTF-8. `NCHAR`/`NVARCHAR` and the text result path are always UTF-8.
 //!
 //! Use [`Client`] in Tokio applications, [`blocking::Client`] in synchronous
 //! code, and [`Pool`] or [`blocking::Pool`] when connections should be reused.
@@ -94,6 +111,7 @@ pub mod reader;
 #[allow(dead_code)]
 mod reader;
 pub mod tuple_desc;
+/// Value, temporal and numeric types returned by the driver.
 pub mod types;
 
 #[cfg(feature = "compat")]
@@ -103,7 +121,9 @@ pub use async_pool::{Pool, PoolConfig, PooledRowStream, PooledTransaction};
 pub use asynchronous::AsyncNzConnection;
 #[cfg(feature = "compat")]
 pub use blocking::{BlockingClient, LegacyTransaction};
-pub use config::{parse_connection_string, ConfigBuilder, NzConnectionConfig, SecurityLevel};
+pub use config::{
+    parse_connection_string, CharEncoding, ConfigBuilder, NzConnectionConfig, SecurityLevel,
+};
 #[cfg(feature = "compat")]
 pub use connection::{NzCommand, NzConnection};
 pub use connection::{
@@ -144,22 +164,39 @@ pub use types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
 pub struct ClientTypeId(pub i16);
 
 impl ClientTypeId {
+    /// Invalid client type.
     pub const INVALID: i16 = -1;
+    /// Unspecified client type.
     pub const NONE: i16 = 0;
+    /// Generic SQL client.
     pub const SQL: i16 = 1;
+    /// ODBC SQL client.
     pub const SQL_ODBC: i16 = 2;
+    /// JDBC SQL client (crate default).
     pub const SQL_JDBC: i16 = 3;
+    /// Bulk loader client.
     pub const LOAD: i16 = 4;
+    /// Generic client.
     pub const CLIENT: i16 = 5;
+    /// Backup/restore client.
     pub const BNR: i16 = 6;
+    /// Reclaim client.
     pub const RECLAIM: i16 = 7;
+    /// Unknown client.
     pub const UNKNOWN: i16 = 8;
+    /// OLE DB SQL client.
     pub const SQL_OLEDB: i16 = 9;
+    /// Internal server client.
     pub const INTERNAL: i16 = 10;
+    /// .NET SQL client.
     pub const SQL_DOTNET: i16 = 11;
+    /// Go SQL client.
     pub const SQL_GOLANG: i16 = 12;
+    /// Python SQL client.
     pub const SQL_PYTHON: i16 = 13;
+    /// Reserved unknown value.
     pub const UNKNOWN2: i16 = 14;
+    /// Node.js client.
     pub const NODE: i16 = 15;
 }
 

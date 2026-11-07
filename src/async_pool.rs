@@ -23,19 +23,29 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Native Tokio pool configuration.
 #[derive(Debug, Clone)]
 pub struct AsyncNzPoolConfig {
+    /// Connection settings cloned for every pooled session.
     pub connection: NzConnectionConfig,
+    /// Max managed connections (default 10).
     pub max: usize,
+    /// Warm idle connections kept ready (default 0).
     pub min: usize,
+    /// Idle eviction after this long (default 10 s; zero disables).
     pub idle_timeout: Duration,
+    /// Max wait for a checkout (default none = wait indefinitely).
     pub wait_timeout: Option<Duration>,
+    /// Destroy a connection after this many checkouts.
     pub max_uses: Option<u64>,
+    /// Destroy a connection older than this.
     pub max_lifetime: Option<Duration>,
+    /// `ROLLBACK` open transactions before re-queueing (default true).
     pub rollback_on_release: bool,
 }
 
 impl AsyncNzPoolConfig {
+    /// Start from a connection config with the default limits.
     pub fn new(connection: NzConnectionConfig) -> Self {
         Self {
             connection,
@@ -93,7 +103,9 @@ impl Reservation {
         let state = self.state.clone();
         let retirement = tokio::spawn(async move {
             let _ = conn.close().await;
-            let mut state = state.lock().expect("pool state lock poisoned");
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.total = state.total.saturating_sub(1);
             drop(state);
             permit
@@ -109,7 +121,10 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.registered {
-            let mut state = self.state.lock().expect("pool state lock poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.total = state.total.saturating_sub(1);
         }
     }
@@ -144,11 +159,20 @@ impl AsyncNzPool {
         Ok(pool)
     }
 
+    /// Number of managed connections (idle plus checked out).
     pub async fn total_count(&self) -> usize {
-        self.state.lock().expect("pool lock").total
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total
     }
+    /// Number of idle connections.
     pub async fn idle_count(&self) -> usize {
-        self.state.lock().expect("pool lock").idle.len()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle
+            .len()
     }
 
     /// Checkout budget includes waiting and connection establishment.
@@ -176,7 +200,10 @@ impl AsyncNzPool {
         };
         loop {
             let idle = {
-                let mut state = self.state.lock().expect("pool lock");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
                     return Err(NzError::Closed("pool is closed".into()));
                 }
@@ -193,7 +220,12 @@ impl AsyncNzPool {
                 && !self.config.max_uses.is_some_and(|limit| idle.uses >= limit)
                 && (self.config.idle_timeout.is_zero()
                     || idle.idle_since.elapsed() < self.config.idle_timeout
-                    || self.state.lock().expect("pool lock").total <= self.config.min);
+                    || self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .total
+                        <= self.config.min);
             // Probe outside the state lock: a socket the server closed while
             // idle must not be handed out.
             let fresh = fresh && idle.conn.probe_idle().await;
@@ -212,7 +244,10 @@ impl AsyncNzPool {
             reservation.retire(idle.conn).await?;
         }
         {
-            let mut state = self.state.lock().expect("pool lock");
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
                 return Err(NzError::Closed("pool is closed".into()));
             }
@@ -220,7 +255,12 @@ impl AsyncNzPool {
             reservation.registered = true;
         }
         let conn = Client::connect(&self.config.connection).await?;
-        if self.state.lock().expect("pool lock").closed {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
+        {
             conn.stop();
             return Err(NzError::Closed("pool closed while connecting".into()));
         }
@@ -235,25 +275,32 @@ impl AsyncNzPool {
         })
     }
 
+    /// Run one query on a checked-out connection and return all result sets.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         let holder = self.get().await?;
         let result = holder.query_multi(sql, params).await;
         holder.release().await;
         result
     }
+    /// Run one query and return its rows.
     pub async fn query_rows(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         Ok(self.query(sql, params).await?.into_rows())
     }
+    /// Execute a statement on a checked-out connection.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         let holder = self.get().await?;
         let result = holder.execute(sql, params).await;
         holder.release().await;
         result
     }
+    /// Close the pool and all idle connections. Idempotent.
     pub async fn end(&self) {
         self.permits.close();
         let idle = {
-            let mut state = self.state.lock().expect("pool lock");
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
             let idle = std::mem::take(&mut state.idle);
             state.total = state.total.saturating_sub(idle.len());
@@ -268,7 +315,10 @@ impl AsyncNzPool {
 impl Drop for AsyncNzPool {
     fn drop(&mut self) {
         self.permits.close();
-        let mut state = self.state.lock().expect("pool lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
         let idle_count = state.idle.len();
         for idle in state.idle.drain(..) {
@@ -313,7 +363,11 @@ impl ReturnTask {
             );
         }
         let retained = {
-            let mut state = self.reservation.state.lock().expect("pool lock");
+            let mut state = self
+                .reservation
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !destroy && !state.closed {
                 state.idle.push(IdleConnection {
                     conn: self.conn.take().expect("connected holder"),
@@ -346,11 +400,13 @@ impl AsyncPooledConnection {
             .and_then(|task| task.conn.as_ref())
             .expect("released lease")
     }
+    /// Run one query on this lease and return all result sets.
     pub async fn query_multi(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         let params: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| *p as &(dyn ToSql + Sync)).collect();
         self.conn().query_multi(sql, &params).await
     }
+    /// Run one query and return its rows; rejects multiple result sets.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         let result = self.query_multi(sql, params).await?;
         if result.result_sets.len() > 1 {
@@ -360,20 +416,25 @@ impl AsyncPooledConnection {
         }
         Ok(result.into_rows())
     }
+    /// Execute a statement on this lease.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         let params: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| *p as &(dyn ToSql + Sync)).collect();
         self.conn().execute(sql, &params).await
     }
+    /// Execute one or more statements, discarding rows.
     pub async fn batch_execute(&self, sql: &str) -> NzResult<()> {
         self.conn().batch_execute(sql).await
     }
+    /// Request out-of-band cancellation of the current statement.
     pub async fn cancel(&self) -> NzResult<()> {
         self.conn().cancel().await
     }
+    /// Whether the connection has an open explicit transaction.
     pub fn in_transaction(&self) -> bool {
         self.conn().in_transaction()
     }
+    /// Return the lease to the pool, rolling back an open transaction when configured.
     pub async fn release(mut self) {
         if let Some(task) = self.task.take() {
             // Detaching cleanup makes release itself cancellation safe.
@@ -397,44 +458,55 @@ impl Drop for AsyncPooledConnection {
 pub struct Pool {
     inner: AsyncNzPool,
 }
+/// Standard pool configuration (alias of [`AsyncNzPoolConfig`]).
 pub type PoolConfig = AsyncNzPoolConfig;
 impl Pool {
+    /// Create a lazy pool (no connections opened until the first checkout).
     pub fn new(config: PoolConfig) -> NzResult<Self> {
         Ok(Self {
             inner: AsyncNzPool::new(config)?,
         })
     }
+    /// Create the pool and open its minimum connections.
     pub async fn connect(config: PoolConfig) -> NzResult<Self> {
         Ok(Self {
             inner: AsyncNzPool::connect(config).await?,
         })
     }
+    /// Check out one pooled connection.
     pub async fn get(&self) -> NzResult<AsyncPooledConnection> {
         self.inner.get().await
     }
+    /// Run one query on a pooled connection and return its rows.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         let holder = self.get().await?;
         let result = holder.query(sql, params).await;
         holder.release().await;
         result
     }
+    /// Run one query on a pooled connection and return every result set.
     pub async fn query_multi(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         self.inner.query(sql, params).await
     }
+    /// Execute a statement on a pooled connection.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         self.inner.execute(sql, params).await
     }
+    /// Number of managed connections (idle plus checked out).
     pub async fn total_count(&self) -> usize {
         self.inner.total_count().await
     }
+    /// Number of idle connections.
     pub async fn idle_count(&self) -> usize {
         self.inner.idle_count().await
     }
+    /// Close the pool and all idle connections. Idempotent.
     pub async fn close(&self) {
         self.inner.end().await
     }
 }
 impl AsyncPooledConnection {
+    /// Borrow this lease for catalog/metadata queries.
     pub fn metadata(&self) -> crate::AsyncMetadata<'_> {
         self.conn().metadata()
     }
@@ -449,6 +521,7 @@ impl AsyncPooledConnection {
             _lease: self,
         })
     }
+    /// Start an exclusive transaction on this lease.
     pub async fn transaction(&mut self) -> NzResult<PooledTransaction<'_>> {
         let transaction = self.conn().transaction().await?;
         Ok(PooledTransaction {
@@ -457,6 +530,7 @@ impl AsyncPooledConnection {
         })
     }
 }
+/// Row stream borrowing its pool lease until completion.
 pub struct PooledRowStream<'a> {
     stream: crate::RowStream,
     _lease: &'a AsyncPooledConnection,
@@ -470,11 +544,13 @@ impl futures_core::Stream for PooledRowStream<'_> {
         std::pin::Pin::new(&mut self.get_mut().stream).poll_next(cx)
     }
 }
+/// Exclusive transaction borrowing its pool lease until commit or rollback.
 pub struct PooledTransaction<'a> {
     transaction: Option<crate::Transaction>,
     _lease: &'a mut AsyncPooledConnection,
 }
 impl PooledTransaction<'_> {
+    /// Run one query inside the transaction.
     pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<Vec<Row>> {
         self.transaction
             .as_ref()
@@ -482,6 +558,7 @@ impl PooledTransaction<'_> {
             .query(sql, params)
             .await
     }
+    /// Execute a statement inside the transaction.
     pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> NzResult<i64> {
         self.transaction
             .as_ref()
@@ -489,6 +566,7 @@ impl PooledTransaction<'_> {
             .execute(sql, params)
             .await
     }
+    /// Commit the transaction.
     pub async fn commit(mut self) -> NzResult<()> {
         self.transaction
             .take()
@@ -496,6 +574,7 @@ impl PooledTransaction<'_> {
             .commit()
             .await
     }
+    /// Roll back the transaction.
     pub async fn rollback(mut self) -> NzResult<()> {
         self.transaction
             .take()

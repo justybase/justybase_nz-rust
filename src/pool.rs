@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 /// Pool configuration. `Clone`d from a connection config plus limits.
 #[derive(Debug, Clone)]
 pub struct NzPoolConfig {
+    /// Connection settings cloned for every pooled session.
     pub connection: NzConnectionConfig,
     /// Max managed connections (default 10).
     pub max: usize,
@@ -55,6 +56,7 @@ pub struct NzPoolConfig {
 }
 
 impl NzPoolConfig {
+    /// Start from a connection config with the default limits.
     pub fn new(connection: NzConnectionConfig) -> Self {
         NzPoolConfig {
             connection,
@@ -68,6 +70,7 @@ impl NzPoolConfig {
         }
     }
 
+    /// Validate `max`/`min` bounds.
     pub fn validate(&self) -> NzResult<()> {
         if self.max == 0 {
             return Err(NzError::Config(
@@ -101,6 +104,7 @@ pub struct NzPool {
 }
 
 impl NzPool {
+    /// Create a lazy pool (no connections opened until the first checkout).
     pub fn new(config: NzPoolConfig) -> NzResult<Self> {
         config.validate()?;
         let pool = NzPool {
@@ -117,12 +121,23 @@ impl NzPool {
         // Best-effort warm-up for `min` (failures surface on first checkout,
         // same as the Node driver's async warm-up).
         for _ in 0..pool.config.min {
-            if pool.state.0.lock().unwrap().total >= pool.config.max {
+            if pool
+                .state
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .total
+                >= pool.config.max
+            {
                 break;
             }
             match NzConnection::connect(&pool.config.connection) {
                 Ok(conn) => {
-                    let mut inner = pool.state.0.lock().unwrap();
+                    let mut inner = pool
+                        .state
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     inner.idle.push_back(IdleConn {
                         conn,
                         idle_since: Instant::now(),
@@ -137,10 +152,12 @@ impl NzPool {
         Ok(pool)
     }
 
+    /// Number of managed connections (idle plus checked out).
     pub fn total_count(&self) -> usize {
         self.state.0.lock().map(|s| s.total).unwrap_or(0)
     }
 
+    /// Number of idle connections.
     pub fn idle_count(&self) -> usize {
         self.state.0.lock().map(|s| s.idle.len()).unwrap_or(0)
     }
@@ -148,7 +165,11 @@ impl NzPool {
     /// Checkout a pooled connection. Blocking; honors `wait_timeout`.
     pub fn get(&self) -> NzResult<PooledConnection> {
         let deadline = self.config.wait_timeout.map(|t| Instant::now() + t);
-        let mut guard = self.state.0.lock().unwrap();
+        let mut guard = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if guard.closed {
                 return Err(NzError::Closed(
@@ -184,7 +205,11 @@ impl NzPool {
                         });
                     }
                     Err(e) => {
-                        let mut guard = self.state.0.lock().unwrap();
+                        let mut guard = self
+                            .state
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         guard.total = guard.total.saturating_sub(1);
                         self.state.1.notify_one();
                         drop(guard);
@@ -221,10 +246,12 @@ impl NzPool {
         r
     }
 
+    /// Run a query on a checked-out connection and return its rows.
     pub fn query_rows(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         Ok(self.query(sql, params)?.into_rows())
     }
 
+    /// Execute a statement on a checked-out connection.
     pub fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         let mut holder = self.get()?;
         let r = holder.execute(sql, params);
@@ -234,7 +261,11 @@ impl NzPool {
 
     /// Drain the pool and close all idle connections. Idempotent.
     pub fn close(&self) {
-        let mut guard = self.state.0.lock().unwrap();
+        let mut guard = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.closed = true;
         while let Some(idle) = guard.idle.pop_front() {
             guard.total = guard.total.saturating_sub(1);
@@ -326,7 +357,11 @@ impl PooledConnection {
         {
             destroy = true;
         }
-        let mut guard = self.pool.0.lock().unwrap();
+        let mut guard = self
+            .pool
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if destroy || guard.closed {
             guard.total = guard.total.saturating_sub(1);
             drop(guard);
@@ -353,7 +388,11 @@ impl PooledConnection {
     fn ensure_min(&self) {
         // Best-effort refill outside the lock.
         let (need, cfg) = {
-            let guard = self.pool.0.lock().unwrap();
+            let guard = self
+                .pool
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 guard.total < self.config.min && !guard.closed,
                 self.config.clone(),
@@ -361,7 +400,11 @@ impl PooledConnection {
         };
         if need {
             if let Ok(conn) = NzConnection::connect(&cfg.connection) {
-                let mut guard = self.pool.0.lock().unwrap();
+                let mut guard = self
+                    .pool
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !guard.closed && guard.total < cfg.max {
                     guard.idle.push_back(IdleConn {
                         conn,
@@ -378,6 +421,7 @@ impl PooledConnection {
 
     // -- pass-through query surface -----------------------------------------
 
+    /// Run one query on this checked-out connection.
     pub fn query(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<QueryResult> {
         self.conn
             .as_mut()
@@ -385,6 +429,7 @@ impl PooledConnection {
             .query(sql, params)
     }
 
+    /// Run one query and return its rows.
     pub fn query_rows(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<Vec<Row>> {
         self.conn
             .as_mut()
@@ -392,6 +437,7 @@ impl PooledConnection {
             .query_rows(sql, params)
     }
 
+    /// Execute a statement.
     pub fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> NzResult<i64> {
         self.conn
             .as_mut()
@@ -399,6 +445,7 @@ impl PooledConnection {
             .execute(sql, params)
     }
 
+    /// Execute one or more statements, discarding rows.
     pub fn batch_execute(&mut self, sql: &str) -> NzResult<()> {
         self.conn
             .as_mut()
@@ -406,6 +453,7 @@ impl PooledConnection {
             .batch_execute(sql)
     }
 
+    /// Whether the connection has an open explicit transaction.
     pub fn in_transaction(&self) -> bool {
         self.conn
             .as_ref()

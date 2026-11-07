@@ -87,6 +87,7 @@ fn parse_clock(input: &str) -> NzResult<i64> {
 /// Days since 2000-01-01.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NzDate {
+    /// Days since 2000-01-01.
     pub days: i32,
 }
 /// Microseconds since midnight, without a time zone.
@@ -95,12 +96,14 @@ pub struct NzTime {
     microseconds: i64,
 }
 impl NzTime {
+    /// Build a time from microseconds since midnight.
     pub fn new(microseconds: i64) -> NzResult<Self> {
         if !(0..DAY).contains(&microseconds) {
             return Err(invalid());
         }
         Ok(Self { microseconds })
     }
+    /// Microseconds since midnight.
     pub fn microseconds(self) -> i64 {
         self.microseconds
     }
@@ -108,12 +111,15 @@ impl NzTime {
 /// Microseconds since 2000-01-01, without a time zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NzTimestamp {
+    /// Microseconds since 2000-01-01.
     pub microseconds: i64,
 }
 /// Calendar months and signed microseconds, preserving mixed-sign intervals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NzInterval {
+    /// Calendar months.
     pub months: i32,
+    /// Signed microseconds (days, hours, minutes, seconds and fraction).
     pub microseconds: i64,
 }
 impl fmt::Display for NzDate {
@@ -252,12 +258,15 @@ pub struct NzTimetz {
     offset_seconds: i32,
 }
 impl NzTimetz {
+    /// Wall-clock time.
     pub fn time(self) -> NzTime {
         self.time
     }
+    /// Offset from UTC in seconds.
     pub fn offset_seconds(self) -> i32 {
         self.offset_seconds
     }
+    /// Build a TIMETZ value, rejecting offsets outside one day.
     pub fn new(time: NzTime, offset_seconds: i32) -> NzResult<Self> {
         if !(-86_400..86_400).contains(&offset_seconds) {
             return Err(invalid());

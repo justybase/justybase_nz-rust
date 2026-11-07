@@ -1444,15 +1444,15 @@ fn serve_tls_transport(
     assert_eq!(read_frame(&mut stream).0, 11);
     write_be(&mut stream, b"S");
     assert_eq!(read_frame(&mut stream).0, 12);
-    let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(include_bytes!(
+    use rustls::pki_types::pem::PemObject;
+    let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(include_bytes!(
         "fixtures/tls/localhost-cert.pem"
-    )))
+    ))
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(include_bytes!(
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(include_bytes!(
         "fixtures/tls/localhost-key.pem"
-    )))
-    .unwrap()
+    ))
     .unwrap();
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()

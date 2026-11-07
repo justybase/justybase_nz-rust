@@ -37,6 +37,31 @@ jobs:
           package_list="$RUNNER_TEMP/package-files.txt"
           cargo package --locked --list > "$package_list"
           ! grep -E '^(benchmarks/|examples/nz-editor/|AGENTS\.md$|\.github/|\.agents/|\.codex/)' "$package_list"
+      - name: Verify the package builds and publishes (dry run)
+        run: |
+          cargo package --locked
+          cargo publish --dry-run --locked
+
+  cross-platform:
+    name: Tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p nz_rust --all-targets --all-features --locked
+
+  dependency-policy:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
 
   features:
     name: Feature set ${{ matrix.features }}
@@ -60,9 +85,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.87.0
       - run: cargo check -p nz_rust --all-targets --all-features --locked
 
-  # Coverage is reported, never enforced: the useful signal is which protocol
-  # states are exercised, not a percentage. No appliance is involved; LIVE
-  # tests are #[ignore]d and stay local (scripts/test-live.sh).
+  # Coverage is enforced at 70% of lines with all features enabled. The gate is
+  # deliberately below the current ~74% so ordinary refactors have headroom
+  # while a real regression in protocol coverage fails the job.
   coverage:
     name: Coverage report
     runs-on: ubuntu-latest
@@ -73,8 +98,10 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --all-features --locked --lcov --output-path lcov.info
-      - name: Summarize coverage
-        run: cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Summarize coverage and enforce the line gate
+        run: |
+          cargo llvm-cov report --summary-only --fail-under-lines 70 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: lcov

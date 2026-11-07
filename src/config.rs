@@ -19,17 +19,96 @@
 use crate::error::{NzError, NzResult};
 use std::fmt;
 
+/// Requested transport security for the session handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityLevel {
     /// Default: request unsecured, allow the server to upgrade if it must.
     #[default]
     PreferredUnsecured,
+    /// Require a plaintext session; fail if the server demands TLS.
     OnlyUnsecuredSession,
+    /// Prefer TLS, but allow a plaintext session if the server refuses it.
     PreferredSecuredSession,
+    /// Require TLS; never fall back to plaintext.
     OnlySecuredSession,
 }
 
+/// Encoding used to decode `CHAR`, `VARCHAR` and `VAR_FIXED_CHAR` values on the
+/// binary (DBOS) result path.
+///
+/// Netezza stores those types in the database encoding, which is commonly
+/// Latin-1 even when the session encoding is UTF-8. `NCHAR`/`NVARCHAR` and the
+/// text result path always use UTF-8. The default matches the Node driver and
+/// `nzpy`'s `char_varchar_encoding=latin` default.
+///
+/// # Example
+///
+/// ```
+/// use nz_rust::{CharEncoding, NzConnectionConfig};
+///
+/// let mut config =
+///     NzConnectionConfig::new("nz-host", "JUST_DATA", "admin", "secret");
+/// assert_eq!(config.char_varchar_encoding, CharEncoding::Latin1);
+///
+/// config.char_varchar_encoding = CharEncoding::Utf8;
+/// assert_eq!(config.char_varchar_encoding.as_str(), "utf8");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CharEncoding {
+    /// ISO-8859-1 / Latin-1 (default).
+    #[default]
+    Latin1,
+    /// UTF-8.
+    Utf8,
+}
+
+impl CharEncoding {
+    /// Parse an encoding name from a connection string. Accepts the spellings
+    /// used by the reference drivers (`latin`, `latin1`, `iso-8859-1`, `utf8`,
+    /// `utf-8`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "latin" | "latin1" | "latin-1" | "iso-8859-1" | "iso8859-1" => Some(Self::Latin1),
+            "utf8" | "utf-8" => Some(Self::Utf8),
+            _ => None,
+        }
+    }
+
+    /// Canonical name (`latin1` or `utf8`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Latin1 => "latin1",
+            Self::Utf8 => "utf8",
+        }
+    }
+
+    /// Decode one `CHAR`/`VARCHAR`/`VAR_FIXED_CHAR` payload.
+    ///
+    /// Latin-1 decoding is infallible and returns a borrowed view for pure
+    /// ASCII, so the common case stays allocation-free.
+    pub(crate) fn decode<'a>(self, bytes: &'a [u8]) -> Result<std::borrow::Cow<'a, str>, String> {
+        match self {
+            Self::Latin1 => {
+                if bytes.is_ascii() {
+                    // ASCII is always valid UTF-8.
+                    Ok(std::borrow::Cow::Borrowed(
+                        std::str::from_utf8(bytes).expect("ASCII is valid UTF-8"),
+                    ))
+                } else {
+                    Ok(std::borrow::Cow::Owned(
+                        bytes.iter().map(|&byte| byte as char).collect(),
+                    ))
+                }
+            }
+            Self::Utf8 => std::str::from_utf8(bytes)
+                .map(std::borrow::Cow::Borrowed)
+                .map_err(|error| error.to_string()),
+        }
+    }
+}
+
 impl SecurityLevel {
+    /// Numeric handshake value (`0..=3`).
     pub fn as_i32(self) -> i32 {
         match self {
             SecurityLevel::PreferredUnsecured => 0,
@@ -38,6 +117,7 @@ impl SecurityLevel {
             SecurityLevel::OnlySecuredSession => 3,
         }
     }
+    /// Parse the case-sensitive names used in connection strings.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "PreferredUnsecured" => Some(SecurityLevel::PreferredUnsecured),
@@ -49,14 +129,26 @@ impl SecurityLevel {
     }
 }
 
+/// Connection settings shared by the native and compatibility clients.
+///
+/// Construct with [`NzConnectionConfig::new`], the fluent [`ConfigBuilder`],
+/// or [`parse_connection_string`]. The [`Debug`] implementation redacts the
+/// password.
 #[derive(Clone)]
 pub struct NzConnectionConfig {
+    /// Local filesystem policy for external-table import/export.
     pub external_files: crate::ExternalFilePolicy,
+    /// Appliance host name or IP address.
     pub host: String,
+    /// Appliance SQL port (default 5480).
     pub port: u16,
+    /// Database name.
     pub database: String,
+    /// Login user name.
     pub user: String,
+    /// Login password. Never logged or included in errors.
     pub password: String,
+    /// Requested handshake security level.
     pub security_level: SecurityLevel,
     /// Optional path to a trusted CA certificate (PEM) for TLS sessions.
     pub ssl_cert_path: Option<String>,
@@ -74,6 +166,8 @@ pub struct NzConnectionConfig {
     pub client_host_name: String,
     /// Numeric Netezza client type (default: JDBC = 3).
     pub client_type: i16,
+    /// Encoding of `CHAR`/`VARCHAR`/`VAR_FIXED_CHAR` values on the binary path.
+    pub char_varchar_encoding: CharEncoding,
 }
 
 impl fmt::Debug for NzConnectionConfig {
@@ -94,6 +188,7 @@ impl fmt::Debug for NzConnectionConfig {
             .field("os_user", &self.os_user)
             .field("client_host_name", &self.client_host_name)
             .field("client_type", &self.client_type)
+            .field("char_varchar_encoding", &self.char_varchar_encoding)
             .finish()
     }
 }
@@ -113,22 +208,40 @@ impl Default for NzConnectionConfig {
             connection_timeout: 10,
             command_timeout: 0,
             app_name: String::from("netezza-rust"),
-            os_user: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+            os_user: os_user_or_unknown(),
             client_host_name: hostname_or_unknown(),
             client_type: crate::ClientTypeId::SQL_JDBC,
+            char_varchar_encoding: CharEncoding::default(),
         }
     }
 }
 
-fn hostname_or_unknown() -> String {
-    std::fs::read_to_string("/etc/hostname")
+fn os_user_or_unknown() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn hostname_or_unknown() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
 impl NzConnectionConfig {
+    /// Build a config from the four required connection values.
     pub fn new(host: &str, database: &str, user: &str, password: &str) -> Self {
         NzConnectionConfig {
             host: host.into(),
@@ -359,6 +472,14 @@ pub fn parse_connection_string(connection_string: &str) -> NzResult<NzConnection
                 "osuser" | "os_user" => config.os_user = value,
                 "clienthostname" | "client_hostname" => config.client_host_name = value,
                 "clienttype" | "client_type" => config.client_type = parse_client_type(&value)?,
+                "charvarchencoding" | "char_varchar_encoding" | "charvarencoding" => {
+                    config.char_varchar_encoding =
+                        CharEncoding::parse(&value).ok_or_else(|| {
+                            NzError::Config(
+                                "Invalid char_varchar_encoding (expected latin1 or utf8)".into(),
+                            )
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -373,56 +494,76 @@ pub struct ConfigBuilder {
     config: NzConnectionConfig,
 }
 impl ConfigBuilder {
+    /// Set the appliance host.
     pub fn host(mut self, value: impl Into<String>) -> Self {
         self.config.host = value.into();
         self
     }
+    /// Set the appliance port.
     pub fn port(mut self, value: u16) -> Self {
         self.config.port = value;
         self
     }
+    /// Set the database name.
     pub fn database(mut self, value: impl Into<String>) -> Self {
         self.config.database = value.into();
         self
     }
+    /// Set the login user.
     pub fn user(mut self, value: impl Into<String>) -> Self {
         self.config.user = value.into();
         self
     }
+    /// Set the login password.
     pub fn password(mut self, value: impl Into<String>) -> Self {
         self.config.password = value.into();
         self
     }
+    /// Set the requested security level.
     pub fn security_level(mut self, value: SecurityLevel) -> Self {
         self.config.security_level = value;
         self
     }
+    /// Set the external-table file policy.
     pub fn external_files(mut self, value: crate::ExternalFilePolicy) -> Self {
         self.config.external_files = value;
         self
     }
+    /// Set the connection timeout in seconds.
     pub fn connection_timeout(mut self, seconds: u64) -> Self {
         self.config.connection_timeout = seconds;
         self
     }
+    /// Set the default command timeout in seconds (`0` disables it).
     pub fn command_timeout(mut self, seconds: u64) -> Self {
         self.config.command_timeout = seconds;
         self
     }
+    /// Set the application name reported for audit.
     pub fn application_name(mut self, value: impl Into<String>) -> Self {
         self.config.app_name = value.into();
         self
     }
+    /// Set the numeric Netezza client type.
     pub fn client_type(mut self, value: i16) -> Self {
         self.config.client_type = value;
         self
     }
+    /// Set the `CHAR`/`VARCHAR` binary decoding encoding.
+    ///
+    /// See [`CharEncoding`]; `Latin1` is the default.
+    pub fn char_varchar_encoding(mut self, value: CharEncoding) -> Self {
+        self.config.char_varchar_encoding = value;
+        self
+    }
+    /// Validate the accumulated settings and return the config.
     pub fn build(self) -> NzResult<NzConnectionConfig> {
         self.config.validate()?;
         Ok(self.config)
     }
 }
 impl NzConnectionConfig {
+    /// Start a fluent [`ConfigBuilder`].
     pub fn builder() -> ConfigBuilder {
         ConfigBuilder::default()
     }
@@ -597,6 +738,50 @@ mod tests {
                 .client_type,
             crate::ClientTypeId::SQL_JDBC
         );
+    }
+
+    #[test]
+    fn char_varchar_encoding_defaults_to_latin1_and_is_configurable() {
+        assert_eq!(
+            NzConnectionConfig::default().char_varchar_encoding,
+            CharEncoding::Latin1
+        );
+        for (value, expected) in [
+            ("latin", CharEncoding::Latin1),
+            ("latin1", CharEncoding::Latin1),
+            ("iso-8859-1", CharEncoding::Latin1),
+            ("utf8", CharEncoding::Utf8),
+            ("UTF-8", CharEncoding::Utf8),
+        ] {
+            assert_eq!(CharEncoding::parse(value), Some(expected), "{value}");
+        }
+        assert_eq!(CharEncoding::parse("cp1252"), None);
+
+        let cfg = parse_connection_string("nz://u:p@h/db?char_varchar_encoding=utf8").unwrap();
+        assert_eq!(cfg.char_varchar_encoding, CharEncoding::Utf8);
+        assert!(parse_connection_string("nz://u:p@h/db?char_varchar_encoding=cp1252").is_err());
+
+        let cfg = NzConnectionConfig::builder()
+            .host("h")
+            .database("d")
+            .user("u")
+            .char_varchar_encoding(CharEncoding::Utf8)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.char_varchar_encoding, CharEncoding::Utf8);
+    }
+
+    #[test]
+    fn latin1_decoding_is_infallible_and_utf8_is_checked() {
+        assert_eq!(CharEncoding::Latin1.decode(b"abc").unwrap(), "abc");
+        assert_eq!(
+            CharEncoding::Latin1.decode(&[0xF3, 0xBF, 0xB3]).unwrap(),
+            "ó¿³"
+        );
+        assert_eq!(CharEncoding::Utf8.decode("ó".as_bytes()).unwrap(), "ó");
+        assert!(CharEncoding::Utf8.decode(&[0xF3]).is_err());
+        assert_eq!(CharEncoding::Latin1.as_str(), "latin1");
+        assert_eq!(CharEncoding::Utf8.as_str(), "utf8");
     }
 
     #[test]

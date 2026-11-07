@@ -27,152 +27,255 @@ use crate::error::{NzError, NzResult};
 use crate::params::escape_literal;
 use crate::types::value::NzValue;
 
+/// One table row from `_v_table`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzTableInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Table name.
     pub name: String,
+    /// Table owner.
     pub owner: Option<String>,
+    /// Catalog object type (`TABLE`, `TEMP TABLE`, …).
     pub object_type: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
+    /// Approximate row count from `reltuples`.
     pub row_count: Option<i64>,
 }
 
+/// One column row from `_v_relation_column`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzColumnInfo {
+    /// Column name.
     pub name: String,
+    /// One-based ordinal position.
     pub ordinal: i32,
+    /// Formatted SQL type (`VARCHAR(20)`, `NUMERIC(10,2)`, …).
     pub type_name: String,
+    /// Whether the column accepts NULL.
     pub nullable: bool,
+    /// Catalog object id of the owning relation.
     pub object_id: Option<i64>,
+    /// Column comment.
     pub description: Option<String>,
+    /// Default expression, when the catalog exposes it.
     pub default_value: Option<String>,
 }
 
+/// One database row from `_v_database`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzDatabaseInfo {
+    /// Database name.
     pub name: String,
+    /// Database owner.
     pub owner: Option<String>,
+    /// Default schema for new sessions.
     pub default_schema: Option<String>,
 }
 
+/// One view row from `_v_view`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzViewInfo {
+    /// Schema that owns the view.
     pub schema: String,
+    /// View name.
     pub name: String,
+    /// View owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
+    /// `CREATE VIEW` definition body.
     pub definition: Option<String>,
 }
 
+/// One procedure row from `_v_procedure`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzProcedureInfo {
+    /// Schema that owns the procedure.
     pub schema: String,
+    /// Procedure name.
     pub name: String,
+    /// Procedure owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
+    /// Typed signature, e.g. `P(INTEGER)`.
     pub signature: Option<String>,
+    /// Return type.
     pub returns: Option<String>,
+    /// Whether the procedure is built in.
     pub is_builtin: Option<bool>,
+    /// Procedure source body.
     pub source: Option<String>,
+    /// Whether the procedure executes with owner rights.
     pub executed_as_owner: Option<bool>,
+    /// Argument list.
     pub arguments: Option<String>,
+    /// Procedure comment.
     pub description: Option<String>,
 }
 
+/// One table storage row from `_v_table_storage_stat`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzTableSizeInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Table name.
     pub table: String,
+    /// Used bytes.
     pub used_bytes: Option<i64>,
+    /// Allocated bytes.
     pub allocated_bytes: Option<i64>,
+    /// Used size in mebibytes.
     pub size_mb: Option<i64>,
+    /// Storage skew factor.
     pub skew: Option<f64>,
 }
 
+/// One row from `_v_session`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzSessionInfo {
+    /// Backend session id.
     pub session_id: i64,
+    /// Login user name.
     pub username: Option<String>,
+    /// Connected database.
     pub database: Option<String>,
-    /// Kept as the driver's canonical server text because the crate does not
-    /// impose a chrono dependency on callers.
+    /// Connection timestamp in server text form.
     pub connect_time: Option<String>,
+    /// Session priority.
     pub priority: Option<String>,
+    /// Session status.
     pub status: Option<String>,
+    /// Client type description.
     pub client_type: Option<String>,
+    /// Client OS user reported during the handshake.
     pub client_os_user: Option<String>,
 }
 
+/// One function row from `_v_function`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzFunctionInfo {
+    /// Schema that owns the function.
     pub schema: String,
+    /// Function name.
     pub name: String,
+    /// Function owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
+    /// Typed signature.
     pub signature: Option<String>,
+    /// Return type.
     pub returns: Option<String>,
+    /// Language or environment descriptor.
     pub language: Option<String>,
+    /// Whether this is a fluid/read-launcher function.
     pub is_fluid: Option<bool>,
 }
 
+/// One synonym row from `_v_synonym`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzSynonymInfo {
+    /// Schema that owns the synonym.
     pub schema: String,
+    /// Synonym name.
     pub name: String,
+    /// Referenced object name.
     pub referenced_object: Option<String>,
+    /// Referenced database.
     pub referenced_database: Option<String>,
+    /// Referenced schema.
     pub referenced_schema: Option<String>,
+    /// Synonym comment.
     pub description: Option<String>,
 }
 
+/// One constraint row from `_v_relation_keydata`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzConstraintInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Constrained table.
     pub table: String,
+    /// Constraint name.
     pub name: String,
+    /// Raw constraint type (`p`, `f`, `u`, …).
     pub constraint_type: char,
+    /// Constrained column.
     pub column: String,
+    /// Referenced database for foreign keys.
     pub primary_key_database: Option<String>,
+    /// Referenced schema for foreign keys.
     pub primary_key_schema: Option<String>,
+    /// Referenced table for foreign keys.
     pub primary_key_table: Option<String>,
+    /// Referenced column for foreign keys.
     pub primary_key_column: Option<String>,
+    /// Referential UPDATE action.
     pub update_type: Option<String>,
+    /// Referential DELETE action.
     pub delete_type: Option<String>,
 }
 
+/// One distribution-key row from `_v_table_dist_map`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzDistributionKeyInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Table name.
     pub table: String,
+    /// Distribution column.
     pub column: String,
+    /// Distribution attribute number.
     pub distribution_attribute: i32,
 }
 
+/// One organize-key row from `_v_table_organize_column`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzOrganizeKeyInfo {
+    /// Schema that owns the table.
     pub schema: String,
+    /// Table name.
     pub table: String,
+    /// Organize column.
     pub column: String,
+    /// Column attribute number.
     pub attribute: i32,
 }
 
+/// One row from `_v_object_data`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzObjectDetailInfo {
+    /// Object schema.
     pub schema: String,
+    /// Object name.
     pub name: String,
+    /// Catalog object type.
     pub object_type: String,
+    /// Object owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
+    /// Object comment.
     pub description: Option<String>,
+    /// Creation timestamp in server text form.
     pub created_date: Option<String>,
 }
 
+/// A table, view or procedure returned by [`NzMetadata::objects`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzObjectInfo {
+    /// Object schema.
     pub schema: String,
+    /// Object name.
     pub name: String,
+    /// `TABLE`, `VIEW` or `PROCEDURE`.
     pub object_type: String,
+    /// Object owner.
     pub owner: Option<String>,
+    /// Catalog object id.
     pub object_id: Option<i64>,
 }
 
@@ -186,6 +289,7 @@ impl<'a> NzMetadata<'a> {
         Self { connection }
     }
 
+    /// List visible schemas.
     pub fn schemas(&mut self) -> NzResult<Vec<String>> {
         let result = self
             .connection
@@ -193,6 +297,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(|r| r.try_get(0)).collect()
     }
 
+    /// List databases.
     pub fn databases(&mut self) -> NzResult<Vec<NzDatabaseInfo>> {
         let result = self.connection.query(
             "SELECT database, owner, defschema FROM _v_database ORDER BY database",
@@ -201,6 +306,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(database_from_row).collect()
     }
 
+    /// List tables, optionally filtered by schema and a SQL `LIKE` pattern.
     pub fn tables(
         &mut self,
         schema: Option<&str>,
@@ -211,24 +317,28 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(table_from_row).collect()
     }
 
+    /// List columns of one table.
     pub fn columns(&mut self, table: &str, schema: Option<&str>) -> NzResult<Vec<NzColumnInfo>> {
         let sql = columns_sql(table, schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(column_from_row).collect()
     }
 
+    /// List views, optionally limited to a schema.
     pub fn views(&mut self, schema: Option<&str>) -> NzResult<Vec<NzViewInfo>> {
         let sql = views_sql(schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(view_from_row).collect()
     }
 
+    /// List stored procedures, optionally limited to a schema.
     pub fn procedures(&mut self, schema: Option<&str>) -> NzResult<Vec<NzProcedureInfo>> {
         let sql = procedures_sql(schema)?;
         let result = self.connection.query(&sql, &[])?;
         result.rows().iter().map(procedure_from_row).collect()
     }
 
+    /// Return the distribution-key columns of one table.
     pub fn distribution_key(&mut self, table: &str, schema: Option<&str>) -> NzResult<Vec<String>> {
         let mut sql = format!(
             "SELECT attname FROM _v_table_dist_map WHERE tablename = {}",
@@ -243,6 +353,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(|r| text(r, 0)).collect()
     }
 
+    /// Return storage statistics for user tables.
     pub fn table_sizes(&mut self, schema: Option<&str>) -> NzResult<Vec<NzTableSizeInfo>> {
         let mut sql = String::from(
             "SELECT schema, tablename, used_bytes, allocated_bytes, (used_bytes / 1048576)::BIGINT AS size_mb, skew FROM _v_table_storage_stat WHERE tablename IS NOT NULL",
@@ -256,6 +367,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(table_size_from_row).collect()
     }
 
+    /// List active sessions.
     pub fn sessions(&mut self) -> NzResult<Vec<NzSessionInfo>> {
         let result = self.connection.query(
             "SELECT id, username, dbname, conntime, priority, status, type, client_os_username FROM _v_session ORDER BY conntime DESC",
@@ -264,6 +376,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(session_from_row).collect()
     }
 
+    /// List user-defined functions.
     pub fn functions(&mut self, schema: Option<&str>) -> NzResult<Vec<NzFunctionInfo>> {
         let mut sql = String::from(
             "SELECT schema, function, owner, objid, functionsignature, returns, env FROM _v_function WHERE function IS NOT NULL",
@@ -277,6 +390,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(function_from_row).collect()
     }
 
+    /// List synonyms.
     pub fn synonyms(&mut self, schema: Option<&str>) -> NzResult<Vec<NzSynonymInfo>> {
         let mut sql = String::from(
             "SELECT schema, synonym_name, refobjname, refdatabase, refschema, description FROM _v_synonym WHERE synonym_name IS NOT NULL",
@@ -290,6 +404,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(synonym_from_row).collect()
     }
 
+    /// List primary, unique and foreign keys.
     pub fn constraints(&mut self, schema: Option<&str>) -> NzResult<Vec<NzConstraintInfo>> {
         let mut sql = String::from(
             "SELECT schema, relation, constraintname, contype, attname, pkdatabase, pkschema, pkrelation, pkattname, updt_type, del_type FROM _v_relation_keydata WHERE relation IS NOT NULL",
@@ -303,6 +418,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(constraint_from_row).collect()
     }
 
+    /// Distribution keys across every table in a schema.
     pub fn all_distribution_keys(
         &mut self,
         schema: Option<&str>,
@@ -319,6 +435,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(distribution_from_row).collect()
     }
 
+    /// Organize keys across every table in a schema.
     pub fn organize_keys(&mut self, schema: Option<&str>) -> NzResult<Vec<NzOrganizeKeyInfo>> {
         let mut sql = String::from(
             "SELECT schema, tablename, attname, attnum FROM _v_table_organize_column WHERE tablename IS NOT NULL",
@@ -332,6 +449,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(organize_from_row).collect()
     }
 
+    /// Object definitions and comments from `_v_object_data`.
     pub fn object_details(&mut self, schema: Option<&str>) -> NzResult<Vec<NzObjectDetailInfo>> {
         let mut sql = String::from(
             "SELECT schema, objname, objtype, owner, objid, description, createdate FROM _v_object_data WHERE objname IS NOT NULL",
@@ -345,6 +463,7 @@ impl<'a> NzMetadata<'a> {
         result.rows().iter().map(object_detail_from_row).collect()
     }
 
+    /// Search object details by a case-insensitive substring.
     pub fn search_objects_detailed(
         &mut self,
         pattern: &str,
@@ -374,6 +493,7 @@ impl<'a> NzMetadata<'a> {
             .collect()
     }
 
+    /// Search tables, views and procedures by a case-insensitive substring.
     pub fn objects(&mut self, pattern: &str, schema: Option<&str>) -> NzResult<Vec<NzObjectInfo>> {
         let like = format!("%{pattern}%");
         let folded_pattern = pattern.to_ascii_lowercase();

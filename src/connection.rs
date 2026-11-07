@@ -630,12 +630,16 @@ impl RawRowData {
 /// Column metadata with explicitly separate PostgreSQL OID and DBOS wire type.
 #[derive(Debug, Clone, Copy)]
 pub struct TypeInfo<'a> {
+    /// PostgreSQL-style column description.
     pub column: &'a ColumnDesc,
+    /// DBOS wire type when the row is binary.
     pub dbos_type: Option<i32>,
+    /// Wire format: `0` text, `1` binary/DBOS.
     pub wire_format: u8,
 }
 
 impl Row {
+    /// Return column metadata plus the DBOS wire type, when available.
     pub fn type_info<I: RowIndex>(&self, index: I) -> NzResult<TypeInfo<'_>> {
         let position = index
             .position(self)
@@ -659,6 +663,7 @@ impl Row {
         })
     }
 
+    /// Build a row from owned values and column descriptions.
     pub fn new(columns: Vec<ColumnDesc>, values: Vec<NzValue>) -> Self {
         Row {
             metadata: Arc::new(RowMetadata::new(Arc::from(columns))),
@@ -800,18 +805,23 @@ impl Row {
         }
     }
 
+    /// Column descriptions in result order.
     pub fn columns(&self) -> &[ColumnDesc] {
         &self.metadata.columns
     }
 
+    /// Number of columns.
     pub fn len(&self) -> usize {
         self.metadata.columns.len()
     }
 
+    /// Whether the row has no columns.
     pub fn is_empty(&self) -> bool {
         self.columns().is_empty()
     }
 
+    /// Materialized values; panics if a cell cannot be decoded. Use
+    /// [`Row::try_values`] for the checked variant.
     pub fn values(&self) -> &[NzValue] {
         self.try_values()
             .unwrap_or_else(|e| panic!("row.values failed: {e}"))
@@ -944,7 +954,9 @@ impl Row {
 
 /// Index into a [`Row`] by ordinal or (case-insensitive) column name.
 pub trait RowIndex {
+    /// Resolve this index against `row`.
     fn position(&self, row: &Row) -> Option<usize>;
+    /// Human-readable index description for error messages.
     fn describe(&self) -> String;
 }
 
@@ -986,7 +998,9 @@ impl RowIndex for String {
 /// One result set: the rows of a single statement plus its column metadata.
 #[derive(Debug, Clone)]
 pub struct ResultSet {
+    /// Column descriptions.
     pub columns: Vec<ColumnDesc>,
+    /// Decoded rows.
     pub rows: Vec<Row>,
     /// Per-column nullability from the binary tuple descriptor
     /// (`RowDescriptionStandard`). `None` on the text path, where the server
@@ -1004,9 +1018,11 @@ impl ResultSet {
         }
     }
 
+    /// Number of rows.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
+    /// Whether the result set has no rows.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -1017,8 +1033,11 @@ impl ResultSet {
 /// the server notices collected while draining the response.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
+    /// One entry per statement result set.
     pub result_sets: Vec<ResultSet>,
+    /// Accumulated affected-row count, or `-1` when no count was reported.
     pub rows_affected: i64,
+    /// Server notices collected while draining the response.
     pub notices: Vec<String>,
 }
 
@@ -1030,6 +1049,7 @@ pub struct QueryResult {
 /// before returning the sink error. The connection remains reusable when that
 /// drain succeeds.
 pub trait QueryStreamSink {
+    /// Called once per result set before its first row.
     fn on_columns(
         &mut self,
         result_set_index: usize,
@@ -1037,6 +1057,7 @@ pub trait QueryStreamSink {
         nullability: Option<&[bool]>,
     ) -> NzResult<()>;
 
+    /// Called once per decoded row.
     fn on_row(&mut self, result_set_index: usize, row: Row) -> NzResult<()>;
 
     /// Borrowed hot-path callback used by the compatibility
@@ -1057,6 +1078,7 @@ pub trait QueryStreamSink {
         )
     }
 
+    /// Called for each server notice.
     fn on_notice(&mut self, _message: &str) -> NzResult<()> {
         Ok(())
     }
@@ -1083,15 +1105,22 @@ impl QueryStreamSink for DiscardSink {
 /// Metadata and counters returned after a streaming execution.
 #[derive(Debug, Clone, Default)]
 pub struct StreamSummary {
+    /// One entry per streamed result set.
     pub result_sets: Vec<StreamResultSet>,
+    /// Accumulated affected-row count.
     pub rows_affected: i64,
+    /// Server notices observed during the stream.
     pub notices: Vec<String>,
 }
 
+/// Per-result-set metadata reported by [`StreamSummary`].
 #[derive(Debug, Clone)]
 pub struct StreamResultSet {
+    /// Column descriptions.
     pub columns: Vec<ColumnDesc>,
+    /// Per-column nullable flags for binary sets.
     pub nullability: Option<Vec<bool>>,
+    /// Number of rows streamed for this set.
     pub row_count: u64,
 }
 
@@ -1138,17 +1167,23 @@ impl QueryResult {
 /// and the server `notices`, like the C# and Node drivers.
 #[derive(Debug, Clone)]
 pub struct NzCommand {
+    /// SQL text, including client-side placeholders.
     pub command_text: String,
+    /// Positional values used by `$1`-style substitution.
     pub parameters: Vec<NzValue>,
     /// Optional C#/ADO.NET-style named or `?` positional parameters. When
     /// non-empty these take precedence over `parameters` during execution.
     pub bound_parameters: Vec<NzParameter>,
+    /// Affected-row count from the last execution.
     pub records_affected: i64,
+    /// Notices from the last execution.
     pub notices: Vec<String>,
+    /// Per-command timeout in seconds (`0` uses the connection default).
     pub command_timeout: u64,
 }
 
 impl NzCommand {
+    /// Create a command with no parameters.
     pub fn new(sql: &str) -> Self {
         NzCommand {
             command_text: sql.to_string(),
@@ -1160,26 +1195,31 @@ impl NzCommand {
         }
     }
 
+    /// Replace the positional parameter list.
     pub fn set_parameters(mut self, params: Vec<NzValue>) -> Self {
         self.parameters = params;
         self
     }
 
+    /// Append one positional parameter.
     pub fn add_parameter(mut self, value: NzValue) -> Self {
         self.parameters.push(value);
         self
     }
 
+    /// Replace the named/`?` parameter list.
     pub fn set_bound_parameters(mut self, params: Vec<NzParameter>) -> Self {
         self.bound_parameters = params;
         self
     }
 
+    /// Append one named parameter.
     pub fn add_named_parameter(mut self, name: &str, value: NzValue) -> Self {
         self.bound_parameters.push(NzParameter::named(name, value));
         self
     }
 
+    /// Append one `?` positional parameter.
     pub fn add_positional_parameter(mut self, value: NzValue) -> Self {
         self.bound_parameters.push(NzParameter::positional(value));
         self
@@ -1346,6 +1386,7 @@ impl NzConnection {
         self.buffer.clear();
     }
 
+    /// Whether the connection is closed.
     pub fn is_closed(&self) -> bool {
         !self.connected || self.stream.is_none()
     }
@@ -1400,14 +1441,17 @@ impl NzConnection {
         self.in_transaction
     }
 
+    /// Backend process id used for cancellation.
     pub fn backend_process_id(&self) -> i32 {
         self.backend_process_id
     }
 
+    /// Backend secret key used for cancellation.
     pub fn backend_secret_key(&self) -> i32 {
         self.backend_secret_key
     }
 
+    /// Connection settings in effect for this session.
     pub fn config(&self) -> &NzConnectionConfig {
         &self.config
     }
@@ -1541,6 +1585,7 @@ impl NzConnection {
         self.execute_values(sql, &values)
     }
 
+    /// Execute a non-query with pre-built values.
     pub fn execute_values(&mut self, sql: &str, params: &[NzValue]) -> NzResult<i64> {
         let final_sql = substitute_parameters(sql, params).map_err(NzError::Config)?;
         Ok(self
@@ -1641,6 +1686,7 @@ impl NzConnection {
 
     // -- ADO.NET / C# flavor -------------------------------------------------
 
+    /// Build an ADO.NET-style command bound to this connection's settings.
     pub fn create_command(&self, sql: &str, params: Vec<NzValue>) -> NzCommand {
         NzCommand {
             command_text: sql.to_string(),
@@ -1671,16 +1717,19 @@ impl NzConnection {
 
     // -- transactions --------------------------------------------------------
 
+    /// Open an explicit transaction.
     pub fn begin_transaction(&mut self) -> NzResult<()> {
         self.batch_execute("BEGIN")?;
         Ok(())
     }
 
+    /// Commit the open transaction.
     pub fn commit(&mut self) -> NzResult<()> {
         self.batch_execute("COMMIT")?;
         Ok(())
     }
 
+    /// Roll back the open transaction (a no-op notice when none is open).
     pub fn rollback(&mut self) -> NzResult<()> {
         // A rollback with no open transaction is only a notice on Netezza,
         // so this stays safe to call defensively (pool release path).
@@ -2357,8 +2406,11 @@ impl NzConnection {
                     code::ROW_DESCRIPTION_STANDARD => {
                         let len = self.read_len("rowDescriptionStandardPayload")?;
                         let data = self.read_payload(len, "rowDescriptionStandardPayload")?;
-                        let descriptor =
-                            Arc::new(DbosTupleDesc::parse(&data, cached_columns.as_deref())?);
+                        let descriptor = Arc::new(DbosTupleDesc::parse_with_encoding(
+                            &data,
+                            cached_columns.as_deref(),
+                            self.config.char_varchar_encoding,
+                        )?);
                         tupdesc = (*descriptor).clone();
                         shared_tupdesc = Some(descriptor);
                         has_tupdesc = true;
@@ -3913,6 +3965,7 @@ mod tests {
             field_fixed_size: vec![4, 2],
             field_null_byte_offset: vec![0, 0],
             field_null_bit_mask: vec![0, 0],
+            char_varchar_encoding: crate::CharEncoding::Utf8,
             ..Default::default()
         });
         let mut bytes = vec![0, 0];
@@ -3922,6 +3975,60 @@ mod tests {
         assert!(row.try_get::<_, Option<String>>(1).is_err());
         assert!(row.try_values().is_err());
         assert_eq!(row.try_get::<_, i32>(0).unwrap(), 123);
+    }
+
+    #[test]
+    fn lazy_dbos_latin1_varchar_uses_the_shared_decoder() {
+        let desc = Arc::new(DbosTupleDesc {
+            num_fields: 1,
+            num_varying_fields: 1,
+            fixed_fields_size: 2,
+            field_type: vec![crate::messages::nz_type::NZ_TYPE_VARCHAR],
+            field_size: vec![16],
+            field_true_size: vec![16],
+            field_offset: vec![0],
+            field_fixed_size: vec![0],
+            field_null_byte_offset: vec![0],
+            field_null_bit_mask: vec![0],
+            ..Default::default()
+        });
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.push(0xF3);
+        payload.push(0);
+        let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), payload, desc).unwrap();
+
+        assert_eq!(row.try_get::<_, String>(0).unwrap(), "ó");
+        assert_eq!(row.try_values().unwrap()[0], NzValue::Text("ó".into()));
+        // A borrowed &str cannot hold transcoded Latin-1 bytes; String and
+        // try_get go through the shared NzValue decoder.
+        let error = row.try_get_raw_typed::<_, &str>(0).unwrap_err();
+        assert!(error.to_string().contains("Latin-1"), "{error}");
+    }
+
+    #[test]
+    fn lazy_dbos_utf8_varchar_can_stay_borrowed() {
+        let desc = Arc::new(DbosTupleDesc {
+            num_fields: 1,
+            num_varying_fields: 1,
+            fixed_fields_size: 2,
+            field_type: vec![crate::messages::nz_type::NZ_TYPE_VARCHAR],
+            field_size: vec![16],
+            field_true_size: vec![16],
+            field_offset: vec![0],
+            field_fixed_size: vec![0],
+            field_null_byte_offset: vec![0],
+            field_null_bit_mask: vec![0],
+            char_varchar_encoding: crate::CharEncoding::Utf8,
+            ..Default::default()
+        });
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice("ó".as_bytes());
+        let row = Row::from_dbos_raw(Arc::from(desc.to_column_descs()), payload, desc).unwrap();
+
+        assert_eq!(row.try_get_raw_typed::<_, &str>(0).unwrap(), "ó");
+        assert_eq!(row.try_get::<_, String>(0).unwrap(), "ó");
     }
 
     #[test]

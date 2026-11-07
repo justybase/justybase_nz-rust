@@ -1,6 +1,87 @@
-# Driver quality and performance report
+# Driver quality report
 
-## Scope and implementation status
+## Current release: `1.0.0-rc.1`
+
+`1.0.0-rc.1` freezes the public API for the `1.0` series. It remains preview
+software until `1.0.0` has soaked in controlled use; the support policy and the
+appliance/type/encoding/feature matrix are in
+[COMPATIBILITY.md](COMPATIBILITY.md). The integration guide is
+[README.md](README.md), and the complete change list is
+[CHANGELOG.md](CHANGELOG.md).
+
+This release was validated against Netezza
+`Release 11.2.2.1 [Build 20]`. No credentials or connection strings are stored
+in this report or in the repository.
+
+### Correctness changes in this release
+
+| Finding reproduced before changes | Implemented correction |
+| --- | --- |
+| Binary `CHAR`/`VARCHAR` values containing Latin-1 bytes (for example `ó` = `0xF3`) decoded as invalid UTF-8 | Encoding-aware DBOS field decoding; Latin-1 is the default, configurable with `char_varchar_encoding` / `CharEncoding` |
+| Borrowed `&str` getters could silently mangle non-ASCII Latin-1 data | Borrowed getters return an error for transcoded values; `String` and `NzValue` materialize the decoded text |
+| Binary `INTERVAL` folded days into hours and used non-server unit spellings | Signed day/clock components are preserved, units match the server, and a zero clock is omitted when days or months are present |
+| Binary `TIMETZ` always rendered `±HH:MM` | Offsets now match the server text form: `+02`, `+02:30` or `+02:30:15` |
+| Native metadata stopped at the core catalog helpers | Completed `AsyncMetadata`: current schema, sequences, users, groups, query history, table sizes, sessions, functions, synonyms, constraints, distribution/organize keys, object details, owners, search and DDL reconstruction |
+| Netezza 11.2 errors could arrive without SQLSTATE/detail/hint | Structured errors preserve the original message in `NzDatabaseError.raw` and keep the session usable when the backend can resynchronize |
+| A poisoned pool lock could hide the original panic | Pool lock poisoning is recovered explicitly in the sync and async pools |
+| Windows session identity was incomplete | `os_user` / `client_host_name` fallbacks were added |
+
+### Validation for this release
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo test -p nz_rust --all-targets --all-features --locked` | pass |
+| `cargo test -p nz_rust --doc --all-features --locked` | 4/4 pass |
+| `cargo clippy -p nz_rust --all-targets --all-features --locked -- -D warnings` | pass |
+| `cargo doc --no-deps --all-features --locked` with `RUSTDOCFLAGS=-D warnings` | pass |
+| Feature matrix (`default`, `ssl`, `chrono`, `compat`, all) | pass |
+| `cargo deny check advisories licenses bans sources` | pass |
+| Line-coverage gate (70%) | 73.84% lines, 71.63% regions, 63.98% functions |
+| `cargo package` / `cargo publish --dry-run` | pass — 108 files, 1.8 MiB |
+| Library unit tests | 155/155 |
+| Encoding matrix | 6/6 |
+| Metadata mock (native + legacy) | 2/2 |
+| Golden wire replay | 17/17 across 15 fixtures |
+| Pool mock tests | 14/14 |
+| Live qualification | 13/13 |
+| Live driver | 14/14 |
+| Live integration | 45/45 |
+| Live two-appliance matrix | primary pass; secondary skipped because `NZ_DEV2_*` was not configured |
+
+Golden fixtures in `tests/fixtures/wire` are real appliance responses to
+synthetic statements. They are replayed offline by `tests/wire_replay.rs` and
+cover encoding, native and legacy metadata, DDL reconstruction, temporal and
+numeric edges, and structured errors. The capture tool scans statements and
+responses for the configured password and host before writing a fixture.
+
+### Known limitations
+
+- The release candidate has been exercised against one appliance build. The
+  secondary matrix is implemented and documented but requires `NZ_DEV2_*`; a
+  two-appliance run is required before tagging `1.0.0`.
+- Binary `CHAR`/`VARCHAR` text defaults to Latin-1. Store characters outside
+  Latin-1 in `NVARCHAR`, or set `char_varchar_encoding=utf8` when the database
+  truly stores UTF-8.
+- Some Netezza 11.2 errors arrive as legacy raw text without SQLSTATE, detail
+  or hint; use `NzDatabaseError.raw` for the original message.
+- No universal performance claim is made for the release candidate. The
+  benchmark numbers later in this document are historical `0.3.0` data.
+
+### Reproducing the validation
+
+The commands are listed in [README.md](README.md#testing-and-validation) and
+[CONTRIBUTING.md](CONTRIBUTING.md). Live suites require `NZ_DEV_*`; the matrix
+runner additionally supports `NZ_DEV2_*`. Reports are written below `target/`
+and must not be committed.
+
+## Historical report: 0.3.0
+
+> This appendix is retained for project history. It describes version `0.3.0`
+> only; its benchmark numbers, test counts and reference-driver results are not
+> claims about `1.0.0-rc.1`.
+
+### Scope and implementation status
 
 This report covers version 0.3.0. The existing `AGENTS.md` was preserved.
 
@@ -9,7 +90,7 @@ coverage. The Rust API migration, native async metadata helpers, producer-side
 batching, regression suites, repeat performance runs and instrumented fuzz
 campaign are complete.
 
-## Correctness findings and fixes
+### Correctness findings and fixes
 
 | Finding reproduced before changes | Implemented correction |
 | --- | --- |
@@ -28,7 +109,7 @@ precision/scale before arithmetic. Backslashes follow observed Netezza literal
 semantics: string parameters use `chr(92)` when necessary. Unsupported binary
 SQL parameters now return an error instead of generating invalid SQL.
 
-## API, lifecycle and security
+### API, lifecycle and security
 
 The primary APIs are `Client`, `blocking::Client`, `Pool` and `blocking::Pool`.
 The primary blocking implementation uses the native Tokio protocol engine.
@@ -49,7 +130,7 @@ atomic. Scoped import readers belong to one operation; the global registry
 requires `compat`. Configuration debug output redacts passwords. Query timeouts
 default to disabled; native connect and cleanup deadlines are 10 and 5 seconds.
 
-## Performance measurements
+### Performance measurements (0.3.0)
 
 Baseline: Git HEAD `eb9dd61e9e20b626450558042c3b9709b96cac3d` (0.2.3),
 extracted read-only into `/tmp`. The final modified release measurements used
@@ -108,7 +189,7 @@ ignored `target/netezza-cross-benchmark/`; the earlier snapshot is in
 Reproduce with `benchmarks/netezza_cross_driver/run.sh` and
 `numeric_replay.sh`; see the benchmark README for environment controls.
 
-## Validation
+### Validation (0.3.0)
 
 The all-feature all-target regression run passed 131 unit tests, 29
 compatibility tests, 24 mock protocol tests and all other enabled test targets.
@@ -123,7 +204,7 @@ formatting, Clippy with warnings denied, rustdoc with warnings denied and
 all-target/all-feature check using Rust 1.87.0. The TLS fixture key is
 disposable test data, not a credential.
 
-## Rust plan completion
+### Rust plan completion (0.3.0)
 
 The native async metadata API now reconstructs table, view, procedure,
 external-table and synonym DDL. Bulk table/view/procedure operations batch
@@ -143,7 +224,7 @@ regression above 5%, but do not support a general latency-improvement claim. A
 dedicated native batch benchmark and paired allocation baseline remain useful
 follow-up measurements.
 
-## Reference-driver implementation and validation
+### Reference-driver implementation and validation (0.3.0)
 
 The authorized follow-up work is implemented in all three reference drivers.
 The changes preserve their public APIs except for the additive C# pool

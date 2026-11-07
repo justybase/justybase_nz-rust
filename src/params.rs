@@ -30,12 +30,16 @@ use std::sync::Arc;
 /// collection with ADO.NET semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NzParameter {
+    /// Parameter name for named placeholders.
     pub name: Option<String>,
+    /// Bound value.
     pub value: NzValue,
+    /// Whether the parameter is positional (`$1`) or named (`:name`).
     pub positional: bool,
 }
 
 impl NzParameter {
+    /// Create a named parameter.
     pub fn named(name: &str, value: NzValue) -> Self {
         Self {
             name: Some(name.trim_start_matches([':', '@']).to_string()),
@@ -44,6 +48,7 @@ impl NzParameter {
         }
     }
 
+    /// Create a positional parameter.
     pub fn positional(value: NzValue) -> Self {
         Self {
             name: None,

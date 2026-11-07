@@ -11,6 +11,7 @@ pub struct NzNumeric {
     scale: u32,
 }
 impl NzNumeric {
+    /// Build an exact numeric from an unscaled coefficient and scale.
     pub fn new(coefficient: i128, scale: u32) -> NzResult<Self> {
         if coefficient.unsigned_abs() >= 10u128.pow(38) || scale > 38 {
             return Err(NzError::Config(
@@ -19,9 +20,11 @@ impl NzNumeric {
         }
         Ok(Self { coefficient, scale })
     }
+    /// Unscaled integer coefficient.
     pub fn coefficient(self) -> i128 {
         self.coefficient
     }
+    /// Number of decimal digits after the point.
     pub fn scale(self) -> u32 {
         self.scale
     }

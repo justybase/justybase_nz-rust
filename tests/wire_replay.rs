@@ -9,6 +9,7 @@
 mod support;
 
 use nz_rust::{NzError, NzValue, QueryResult};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use support::*;
@@ -63,6 +64,28 @@ fn server_for(records: Records, chunking: Chunking) -> MockServer {
             }
             // Keep the session open until the client hangs up.
             while session.read_query().is_some() {}
+        },
+    )
+}
+
+/// Serve fixture responses by exact SQL text instead of sequence. Used by
+/// catalog fixtures whose setup statements (CREATE/DROP) are not replayed.
+fn server_for_queries(records: Records, chunking: Chunking) -> MockServer {
+    let answers: HashMap<String, Vec<u8>> = records.into_iter().collect();
+    MockServer::start(
+        HandshakeScript {
+            chunking,
+            ..Default::default()
+        },
+        move |session| {
+            while let Some(sql) = session.read_query() {
+                let Some(response) = answers.get(&sql) else {
+                    panic!("no fixture response for SQL: {sql}");
+                };
+                if session.send(response).is_err() {
+                    return;
+                }
+            }
         },
     )
 }
@@ -327,6 +350,46 @@ async fn replay_varchar_32767_boundaries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_latin_varchar_encoding() {
+    replay_all("latin_varchar", |outcomes, label| {
+        for (index, outcome) in outcomes.iter().take(3).enumerate() {
+            assert!(outcome.is_ok(), "{label}: statement {index}: {outcome:?}");
+        }
+        let result = outcomes[3].as_ref().unwrap();
+        assert!(
+            result.result_sets[0].nullability.is_some(),
+            "{label}: expected DBOS rows"
+        );
+        assert_eq!(
+            rows(&outcomes[3], 0, label),
+            [
+                strs(&["1", "ó", "ó", "Zażółć gęślą jaźń"]),
+                strs(&["2", "café", "café", "¡Hola! ¿Qué tal?"]),
+            ],
+            "{label}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_text_encoding() {
+    replay_all("text_encoding", |outcomes, label| {
+        let result = outcomes[0].as_ref().unwrap();
+        assert!(
+            result.result_sets[0].nullability.is_none(),
+            "{label}: expected the text path"
+        );
+        assert_eq!(
+            rows(&outcomes[0], 0, label),
+            [strs(&["ó", "Zażółć gęślą jaźń", "ab   ", "ab   ",])],
+            "{label}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_multi_result() {
     replay_all("multi_result", |outcomes, label| {
         let result = outcomes[0].as_ref().unwrap();
@@ -376,6 +439,462 @@ async fn replay_errors_then_success_on_the_same_session() {
     .await;
 }
 
+/// Live catalog layouts replayed through the native metadata API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_metadata_core_native() {
+    let records = load("metadata_core");
+    for chunking in [Chunking::Whole, Chunking::Fixed(7)] {
+        let server = server_for_queries(records.clone(), chunking);
+        let client = nz_rust::Client::connect(&server.config()).await.unwrap();
+        let metadata = client.metadata();
+
+        assert_eq!(
+            metadata.current_database().await.unwrap().as_deref(),
+            Some("JUST_DATA"),
+            "{chunking:?}"
+        );
+        assert!(metadata.schemas().await.unwrap().contains(&"ADMIN".into()));
+        assert!(metadata
+            .databases()
+            .await
+            .unwrap()
+            .iter()
+            .any(|database| database.name == "JUST_DATA"));
+
+        let tables = metadata.tables(Some("RUST_WIRE_META"), None).await.unwrap();
+        assert_eq!(tables.len(), 1, "{chunking:?}");
+        assert_eq!(tables[0].name, "T");
+        assert_eq!(tables[0].object_type.as_deref(), Some("TABLE"));
+        assert_eq!(tables[0].row_count, Some(1));
+
+        let columns = metadata.columns("T", Some("RUST_WIRE_META")).await.unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ID", "NAME", "AMT"]
+        );
+        assert!(!columns[0].nullable);
+        assert_eq!(columns[1].description.as_deref(), Some("display name"));
+        assert_eq!(columns[2].type_name, "NUMERIC(10,2)");
+
+        let views = metadata.views(Some("RUST_WIRE_META")).await.unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "V");
+        assert!(views[0]
+            .definition
+            .as_deref()
+            .unwrap()
+            .contains("RUST_WIRE_META.T"));
+
+        assert!(metadata
+            .procedures(Some("RUST_WIRE_META"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            metadata
+                .distribution_key("T", Some("RUST_WIRE_META"))
+                .await
+                .unwrap(),
+            ["ID"]
+        );
+        assert_eq!(
+            metadata
+                .organize_columns("T", Some("RUST_WIRE_META"))
+                .await
+                .unwrap(),
+            ["ID", "NAME"]
+        );
+        let keys = metadata
+            .table_keys("T", Some("RUST_WIRE_META"))
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_type, "PRIMARY KEY");
+        assert_eq!(keys[0].columns, ["ID"]);
+        assert_eq!(
+            metadata
+                .table_comment("T", Some("RUST_WIRE_META"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("meta table comment")
+        );
+        let detailed = metadata
+            .detailed_columns("T", Some("RUST_WIRE_META"))
+            .await
+            .unwrap();
+        assert_eq!(detailed.len(), 3);
+        assert!(detailed[0].not_null);
+        assert_eq!(detailed[1].description.as_deref(), Some("display name"));
+
+        assert_eq!(
+            metadata.current_schema().await.unwrap().as_deref(),
+            Some("ADMIN")
+        );
+        assert_eq!(
+            metadata
+                .table_owner("T", Some("RUST_WIRE_META"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ADMIN")
+        );
+        let sizes = metadata.table_sizes(Some("RUST_WIRE_META")).await.unwrap();
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[0].table, "T");
+        assert!(sizes[0].used_bytes.unwrap() > 0);
+        let sessions = metadata.sessions().await.unwrap();
+        assert!(sessions
+            .iter()
+            .any(|session| session.username.as_deref() == Some("ADMIN")));
+        assert!(metadata
+            .functions(Some("RUST_WIRE_META"))
+            .await
+            .unwrap()
+            .is_empty());
+        let synonyms = metadata.synonyms(Some("RUST_WIRE_META")).await.unwrap();
+        assert_eq!(synonyms.len(), 1);
+        assert_eq!(synonyms[0].name, "S");
+        assert!(metadata
+            .constraints(Some("RUST_WIRE_META"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|constraint| constraint.constraint_type == 'p'));
+        assert_eq!(
+            metadata
+                .all_distribution_keys(Some("RUST_WIRE_META"))
+                .await
+                .unwrap()[0]
+                .column,
+            "ID"
+        );
+        assert_eq!(
+            metadata
+                .organize_keys(Some("RUST_WIRE_META"))
+                .await
+                .unwrap()[0]
+                .column,
+            "ID"
+        );
+        assert!(metadata
+            .object_details(Some("RUST_WIRE_META"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|detail| detail.name == "T"));
+        assert!(metadata
+            .sequences(Some("RUST_WIRE_META"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(metadata
+            .users()
+            .await
+            .unwrap()
+            .iter()
+            .any(|user| user.name == "ADMIN"));
+        assert!(!metadata.groups().await.unwrap().is_empty());
+        let _ = metadata.query_history(10, None).await.unwrap();
+
+        client.close().await.unwrap();
+        server.assert_no_handler_panics();
+    }
+}
+
+/// The same live catalog layouts through the legacy/compat metadata API.
+#[cfg(feature = "compat")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_metadata_core_legacy() {
+    let records = load("metadata_core");
+    let server = server_for_queries(records, Chunking::Fixed(3));
+    let config = server.config();
+    let outcome = std::thread::spawn(move || {
+        let mut connection = nz_rust::NzConnection::connect(&config).unwrap();
+        let mut metadata = connection.metadata();
+
+        assert_eq!(
+            metadata.current_database().unwrap().as_deref(),
+            Some("JUST_DATA")
+        );
+        assert_eq!(metadata.current_schema().unwrap().as_deref(), Some("ADMIN"));
+        assert!(metadata.schemas().unwrap().contains(&"ADMIN".to_string()));
+        assert_eq!(
+            metadata.databases().unwrap()[0].default_schema.as_deref(),
+            Some("ADMIN")
+        );
+        let tables = metadata.tables(Some("RUST_WIRE_META"), None).unwrap();
+        assert_eq!(tables[0].name, "T");
+        assert_eq!(tables[0].row_count, Some(1));
+        let columns = metadata.columns("T", Some("RUST_WIRE_META")).unwrap();
+        assert_eq!(columns[0].name, "ID");
+        assert!(!columns[0].nullable);
+        assert!(metadata
+            .views(Some("RUST_WIRE_META"))
+            .unwrap()
+            .iter()
+            .any(|view| view.name == "V"));
+        assert!(metadata
+            .procedures(Some("RUST_WIRE_META"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            metadata
+                .distribution_key("T", Some("RUST_WIRE_META"))
+                .unwrap(),
+            ["ID"]
+        );
+        assert_eq!(
+            metadata
+                .organize_columns("T", Some("RUST_WIRE_META"))
+                .unwrap(),
+            ["ID", "NAME"]
+        );
+        assert_eq!(
+            metadata
+                .table_owner("T", Some("RUST_WIRE_META"))
+                .unwrap()
+                .as_deref(),
+            Some("ADMIN")
+        );
+        assert_eq!(
+            metadata
+                .table_comment("T", Some("RUST_WIRE_META"))
+                .unwrap()
+                .as_deref(),
+            Some("meta table comment")
+        );
+        let keys = metadata.table_keys("T", Some("RUST_WIRE_META")).unwrap();
+        assert_eq!(keys[0].key_type, "PRIMARY KEY");
+        assert_eq!(keys[0].columns, ["ID"]);
+
+        let sizes = metadata.table_sizes(Some("RUST_WIRE_META")).unwrap();
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[0].table, "T");
+        assert!(sizes[0].used_bytes.unwrap() > 0);
+
+        let sessions = metadata.sessions().unwrap();
+        assert!(!sessions.is_empty());
+        assert!(sessions
+            .iter()
+            .any(|session| session.username.as_deref() == Some("ADMIN")));
+
+        assert!(metadata
+            .functions(Some("RUST_WIRE_META"))
+            .unwrap()
+            .is_empty());
+        let synonyms = metadata.synonyms(Some("RUST_WIRE_META")).unwrap();
+        assert_eq!(synonyms.len(), 1);
+        assert_eq!(synonyms[0].name, "S");
+        assert_eq!(synonyms[0].referenced_object.as_deref(), Some("T"));
+        assert!(metadata
+            .constraints(Some("RUST_WIRE_META"))
+            .unwrap()
+            .iter()
+            .any(|constraint| constraint.constraint_type == 'p'));
+        assert_eq!(
+            metadata
+                .all_distribution_keys(Some("RUST_WIRE_META"))
+                .unwrap()[0]
+                .column,
+            "ID"
+        );
+        assert_eq!(
+            metadata.organize_keys(Some("RUST_WIRE_META")).unwrap()[0].column,
+            "ID"
+        );
+        assert!(metadata
+            .object_details(Some("RUST_WIRE_META"))
+            .unwrap()
+            .iter()
+            .any(|detail| detail.name == "T"));
+        assert!(metadata
+            .sequences(Some("RUST_WIRE_META"))
+            .unwrap()
+            .is_empty());
+        assert!(metadata
+            .users()
+            .unwrap()
+            .iter()
+            .any(|user| user.name == "ADMIN"));
+        assert!(!metadata.groups().unwrap().is_empty());
+        // `_v_qryhist` is absent on some appliances; the API returns an empty
+        // list rather than an error in that case.
+        let _ = metadata.query_history(10, None).unwrap();
+
+        assert_eq!(
+            metadata
+                .detailed_columns("T", Some("RUST_WIRE_META"))
+                .unwrap()
+                .len(),
+            3
+        );
+        connection.close();
+    })
+    .join();
+    assert!(outcome.is_ok(), "legacy metadata thread panicked");
+    server.assert_no_handler_panics();
+}
+
+/// Live DDL reconstruction: table, view and synonym definitions built from
+/// catalog metadata captured on the appliance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_ddl_reconstruction_native() {
+    let records = load("ddl_reconstruction");
+    for chunking in [Chunking::Whole, Chunking::Fixed(5)] {
+        let server = server_for_queries(records.clone(), chunking);
+        let client = nz_rust::Client::connect(&server.config()).await.unwrap();
+        let metadata = client.metadata();
+
+        let table = metadata
+            .table_ddl("T", Some("RUST_WIRE_DDL"), Some("TESTDB"))
+            .await
+            .unwrap_or_else(|error| panic!("{chunking:?} table DDL: {error}"));
+        for expected in [
+            "CREATE TABLE TESTDB.RUST_WIRE_DDL.T",
+            "ID INTEGER NOT NULL",
+            "NAME CHARACTER VARYING(20)",
+            "AMT NUMERIC(10,2) DEFAULT 0",
+            "DISTRIBUTE ON (ID)",
+            "ORGANIZE ON (ID, NAME)",
+            "PRIMARY KEY (ID)",
+            "COMMENT ON TABLE TESTDB.RUST_WIRE_DDL.T IS 'table comment';",
+            "COMMENT ON COLUMN TESTDB.RUST_WIRE_DDL.T.NAME IS 'column comment';",
+        ] {
+            assert!(
+                table.contains(expected),
+                "{chunking:?} table DDL missing {expected:?}:\n{table}"
+            );
+        }
+
+        let view = metadata
+            .view_ddl("V", Some("RUST_WIRE_DDL"), Some("TESTDB"))
+            .await
+            .unwrap_or_else(|error| panic!("{chunking:?} view DDL: {error}"));
+        for expected in [
+            "CREATE OR REPLACE VIEW TESTDB.RUST_WIRE_DDL.V AS",
+            "COMMENT ON VIEW TESTDB.RUST_WIRE_DDL.V IS 'view comment';",
+            "COMMENT ON COLUMN TESTDB.RUST_WIRE_DDL.V.NAME IS 'view column comment';",
+        ] {
+            assert!(
+                view.contains(expected),
+                "{chunking:?} view DDL missing {expected:?}:\n{view}"
+            );
+        }
+
+        let synonym = metadata
+            .synonym_ddl("S", Some("RUST_WIRE_DDL"), Some("TESTDB"))
+            .await
+            .unwrap_or_else(|error| panic!("{chunking:?} synonym DDL: {error}"));
+        assert!(
+            synonym.contains("CREATE SYNONYM TESTDB.RUST_WIRE_DDL.S"),
+            "{chunking:?} synonym DDL:\n{synonym}"
+        );
+        assert!(
+            synonym.contains("RUST_WIRE_DDL.T"),
+            "{chunking:?} synonym target:\n{synonym}"
+        );
+
+        client.close().await.unwrap();
+        server.assert_no_handler_panics();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_temporal_boundaries() {
+    replay_all("temporal_boundaries", |outcomes, label| {
+        for (index, outcome) in outcomes.iter().take(4).enumerate() {
+            assert!(outcome.is_ok(), "{label}: statement {index}: {outcome:?}");
+        }
+        let expected = [
+            strs(&[
+                "1",
+                "0001-01-01",
+                "0001-01-01 00:00:00",
+                "00:00:00",
+                "12:34:56+05:30",
+                "-1 year -2 mons -3 days -04:05:06.789012",
+            ]),
+            strs(&[
+                "2",
+                "9999-12-31",
+                "9999-12-31 23:59:59.999999",
+                "23:59:59.999999",
+                "00:00:00-00",
+                "1 year 2 mons 3 days 04:05:06.789012",
+            ]),
+        ];
+        assert_eq!(rows(&outcomes[3], 0, label), expected, "{label} dbos");
+        assert_eq!(
+            rows(&outcomes[4], 0, label),
+            [strs(&[
+                "0001-01-01",
+                "9999-12-31 23:59:59.999999",
+                "23:59:59.999999",
+                "-1 year -2 mons -3 days -04:05:06.789012",
+            ])],
+            "{label} text"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_numeric_edges() {
+    replay_all("numeric_edges", |outcomes, label| {
+        let expected = [
+            strs(&["1", "0.0000000000000000000"]),
+            strs(&["2", "-0.0000000000000000001"]),
+            strs(&["3", "9999999999999999999.9999999999999999999"]),
+            strs(&["4", "-9999999999999999999.9999999999999999999"]),
+        ];
+        assert_eq!(rows(&outcomes[5], 0, label), expected, "{label} dbos");
+        assert_eq!(
+            rows(&outcomes[6], 0, label),
+            [strs(&[
+                "9999999999999999999.9999999999999999999",
+                "-0.0000000000000000001",
+            ])],
+            "{label} text"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_error_details_preserve_fields_and_session() {
+    replay_all("error_details", |outcomes, label| {
+        for (index, fragment) in [
+            (0, "RUST_WIRE_MISSING_TABLE"),
+            (1, "not-a-number"),
+            (2, "Divide by 0"),
+        ] {
+            match &outcomes[index] {
+                Err(NzError::Database(error)) => {
+                    assert!(
+                        error.message.contains(fragment)
+                            || error
+                                .detail
+                                .as_deref()
+                                .is_some_and(|detail| detail.contains(fragment)),
+                        "{label}: {error:?}"
+                    );
+                    // Netezza 11.2 sends some errors in the legacy text form
+                    // without SQLSTATE fields; the raw text must still be
+                    // available and the session must survive.
+                    assert!(!error.raw.is_empty(), "{label}: raw error missing");
+                }
+                other => panic!("{label}: expected database error, got {other:?}"),
+            }
+        }
+        assert_eq!(rows(&outcomes[3], 0, label), [strs(&["1"])]);
+    })
+    .await;
+}
+
 /// Every fixture response truncated at many cut points, followed by EOF, must
 /// yield a clean error — never a panic, hang or bogus success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -387,6 +906,11 @@ async fn truncated_fixture_responses_fail_cleanly() {
         "multi_result",
         "notice",
         "error",
+        "latin_varchar",
+        "text_encoding",
+        "temporal_boundaries",
+        "numeric_edges",
+        "error_details",
     ] {
         let records = load(name);
         for (index, (_, response)) in records.iter().enumerate() {

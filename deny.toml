@@ -1,0 +1,42 @@
+# cargo-deny policy for nz_rust.
+#
+# Run locally with:
+#   cargo deny check advisories licenses bans sources
+#
+# The allow-list intentionally names every license family used by the
+# dependency tree (see `cargo metadata`) so a new dependency cannot silently
+# introduce a different license.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
