@@ -12,6 +12,14 @@ description = "Pure Rust driver for IBM Netezza / PureData — port of JustyBase
 readme = "README.md"
 keywords = ["netezza", "database", "sql", "driver", "tokio"]
 categories = ["database", "asynchronous"]
+exclude = [
+    "benchmarks/**",
+    "examples/nz-editor/**",
+    "AGENTS.md",
+    ".github/**",
+    ".agents/**",
+    ".codex/**",
+]
 
 [package.metadata.docs.rs]
 all-features = true
