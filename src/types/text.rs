@@ -122,6 +122,7 @@ pub fn parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> NzValue {
         1266 => NzValue::Timetz(raw.trim().to_string()),
         1186 => NzValue::Interval(raw.trim().to_string()),
         17 => NzValue::Bytea(decode_bytea_text(raw)),
+        2568 | 2569 => NzValue::Bytea(decode_varbinary_text(raw)),
         _ => NzValue::Text(raw.to_string()),
     }
 }
@@ -144,7 +145,7 @@ pub fn decode_bytea_text(raw: &str) -> Vec<u8> {
     let t = raw.trim();
     let hex = t.strip_prefix("\\x").or_else(|| t.strip_prefix("\\X"));
     if let Some(h) = hex {
-        if h.len() % 2 == 0 && !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if h.len() % 2 == 0 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
             let mut out = Vec::with_capacity(h.len() / 2);
             let bytes = h.as_bytes();
             let mut i = 0;
@@ -158,6 +159,33 @@ pub fn decode_bytea_text(raw: &str) -> Vec<u8> {
         }
     }
     t.as_bytes().to_vec()
+}
+
+/// Decode a text-path VARBINARY cell.
+///
+/// Netezza renders VARBINARY as `X'<hex>'` in the text protocol. `\x<hex>`
+/// is accepted too; anything else is kept as raw bytes so no data is lost.
+pub fn decode_varbinary_text(raw: &str) -> Vec<u8> {
+    let t = raw.trim();
+    let quoted = t
+        .strip_prefix("X'")
+        .or_else(|| t.strip_prefix("x'"))
+        .and_then(|rest| rest.strip_suffix('\''));
+    if let Some(h) = quoted {
+        if h.len() % 2 == 0 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut out = Vec::with_capacity(h.len() / 2);
+            let bytes = h.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let hi = (bytes[i] as char).to_digit(16).unwrap_or(0);
+                let lo = (bytes[i + 1] as char).to_digit(16).unwrap_or(0);
+                out.push(((hi << 4) | lo) as u8);
+                i += 2;
+            }
+            return out;
+        }
+    }
+    decode_bytea_text(raw)
 }
 
 /// Parse one text-protocol DataRow payload (`D`) into row values.
@@ -361,6 +389,17 @@ mod tests {
             parse_text_value("\\xdead", 17, -1),
             NzValue::Bytea(vec![0xde, 0xad])
         );
+    }
+
+    #[test]
+    fn varbinary_hex_text_is_decoded() {
+        assert_eq!(
+            parse_text_value("X'0102FF'", 2569, -1),
+            NzValue::Bytea(vec![0x01, 0x02, 0xff])
+        );
+        assert_eq!(decode_varbinary_text("x'deAD'"), vec![0xde, 0xad]);
+        assert_eq!(decode_varbinary_text("X''"), Vec::<u8>::new());
+        assert_eq!(parse_text_value("X''", 2568, -1), NzValue::Bytea(vec![]));
     }
 
     #[test]

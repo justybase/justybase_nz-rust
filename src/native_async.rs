@@ -925,6 +925,20 @@ impl Client {
             .map(|parsed| parsed.result)
     }
 
+    /// Execute one or more statements with an explicit deadline and return
+    /// every result set.
+    pub async fn query_multi_with_options(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        options: QueryOptions,
+    ) -> NzResult<QueryResult> {
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        self.send_query(sql, RowPolicy::AllRowsEager, Some(options))
+            .await
+            .map(|parsed| parsed.result)
+    }
+
     /// Execute with an explicit deadline independent of the connection default.
     pub async fn query_with_options(
         &self,
@@ -1146,6 +1160,22 @@ impl Client {
         let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
         Ok(self
             .send_query(sql, RowPolicy::Discard, None)
+            .await?
+            .result
+            .rows_affected)
+    }
+
+    /// Execute a statement with an explicit deadline and return its
+    /// affected-row count.
+    pub async fn execute_with_options(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        options: QueryOptions,
+    ) -> NzResult<i64> {
+        let sql = self.render_sql(sql, params).map_err(NzError::Config)?;
+        Ok(self
+            .send_query(sql, RowPolicy::Discard, Some(options))
             .await?
             .result
             .rows_affected)

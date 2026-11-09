@@ -7,6 +7,8 @@
 //! in each test file.
 #![allow(dead_code)]
 
+pub mod nzreplay;
+
 use nz_rust::NzConnectionConfig;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -588,6 +588,26 @@ be safely synchronized.
 - Performance depends on the appliance, network, query shape and value types.
   No universal benchmark claim is made for this preview release.
 
+## Cross-driver conformance tests
+
+The shared corpus lives in `conformance/` at the workspace root and will move
+to `tests/conformance` as a submodule. It provisions its own `CONFORMANCE`
+schema and runs the same case corpus against all four drivers.
+
+```powershell
+..\conformance\run-all.ps1 -Profile smoke -Bootstrap
+```
+
+The Rust runner is `examples/conformance_runner.rs`:
+
+```powershell
+cargo build --example conformance_runner
+```
+
+It uses the native async client (`Client::connect`) and emits the canonical
+JSONL from `conformance/runner-contract.md`. Host and credentials come only
+from `NZ_DEV_HOST` and the other `NZ_DEV_*` variables.
+
 ## Testing and validation
 
 Offline/unit validation from the workspace root:
