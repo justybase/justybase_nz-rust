@@ -25,6 +25,8 @@ use crate::error::{NzError, NzResult};
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 
+use crate::types::temporal::NzTimestamp;
+
 /// A Netezza `TIMETZ` value without inventing a calendar date.
 #[cfg(feature = "chrono")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +68,9 @@ pub enum NzValue {
     Time(String),
     /// TIMETZ as `HH:MM:SS[.ffffff]±HH[:MM[:SS]]`.
     Timetz(String),
-    /// TIMESTAMP as `YYYY-MM-DD HH:MM:SS[.ffffff]`.
-    Timestamp(String),
+    /// TIMESTAMP as microseconds since 2000-01-01, without formatting or a
+    /// heap-allocated string.
+    Timestamp(NzTimestamp),
     /// INTERVAL in Netezza text form.
     Interval(String),
     /// BYTEA / binary payloads.
@@ -83,7 +86,6 @@ pub(crate) enum StringValueKind {
     Date,
     Time,
     Timetz,
-    Timestamp,
     Interval,
 }
 
@@ -94,7 +96,6 @@ impl StringValueKind {
             Self::Date => NzValue::Date(String::with_capacity(10)),
             Self::Time => NzValue::Time(String::with_capacity(15)),
             Self::Timetz => NzValue::Timetz(String::with_capacity(24)),
-            Self::Timestamp => NzValue::Timestamp(String::with_capacity(26)),
             Self::Interval => NzValue::Interval(String::new()),
         }
     }
@@ -109,7 +110,6 @@ pub(crate) fn string_value_slot(value: &mut NzValue, kind: StringValueKind) -> &
             | (StringValueKind::Date, NzValue::Date(_))
             | (StringValueKind::Time, NzValue::Time(_))
             | (StringValueKind::Timetz, NzValue::Timetz(_))
-            | (StringValueKind::Timestamp, NzValue::Timestamp(_))
             | (StringValueKind::Interval, NzValue::Interval(_))
     );
     if !matches_kind {
@@ -120,7 +120,6 @@ pub(crate) fn string_value_slot(value: &mut NzValue, kind: StringValueKind) -> &
         | NzValue::Date(text)
         | NzValue::Time(text)
         | NzValue::Timetz(text)
-        | NzValue::Timestamp(text)
         | NzValue::Interval(text) => text,
         _ => unreachable!("string_value_slot installed the requested variant"),
     }
@@ -142,8 +141,8 @@ impl NzValue {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Timestamp(s)
             | NzValue::Interval(s) => s.clone(),
+            NzValue::Timestamp(value) => value.to_string(),
             NzValue::Decimal(value) => value.to_string(),
             NzValue::Bytea(b) => {
                 let mut out = String::from("0x");
@@ -171,11 +170,12 @@ impl NzValue {
             NzValue::Decimal(value) => value.to_string(),
             NzValue::Date(s) => format!("{s}T00:00:00.000Z"),
             // Node Date has ms precision: drop sub-ms digits to match.
-            NzValue::Timestamp(s) => {
+            NzValue::Timestamp(value) => {
+                let text = value.to_string();
                 // "YYYY-MM-DD HH:MM:SS.ffffff" → "YYYY-MM-DDTHH:MM:SS.mmmZ"
-                let (date_part, time_part) = match s.split_once(' ') {
+                let (date_part, time_part) = match text.split_once(' ') {
                     Some((d, t)) => (d, t),
-                    None => (s.as_str(), ""),
+                    None => (text.as_str(), ""),
                 };
                 let (hms, frac) = match time_part.split_once('.') {
                     Some((h, f)) => (h, f),
@@ -639,9 +639,9 @@ impl FromSql for NaiveTime {
 impl FromSql for NaiveDateTime {
     fn from_sql(value: &NzValue) -> NzResult<Self> {
         match value {
-            NzValue::Timestamp(text) => NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unexpected(value, "TIMESTAMP")),
+            NzValue::Timestamp(timestamp) => timestamp
+                .to_naive_datetime()
+                .ok_or_else(|| unexpected(value, "TIMESTAMP")),
             other => Err(unexpected(other, "TIMESTAMP")),
         }
     }
@@ -739,8 +739,8 @@ impl FromSql for String {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Timestamp(s)
             | NzValue::Interval(s) => Ok(s.clone()),
+            NzValue::Timestamp(value) => Ok(value.to_string()),
             NzValue::Decimal(value) => Ok(value.to_string()),
             other => Err(unexpected(other, "text")),
         }
@@ -894,7 +894,6 @@ impl<'a> FromSqlRaw<'a> for &'a str {
             | Some(NzValue::Date(s))
             | Some(NzValue::Time(s))
             | Some(NzValue::Timetz(s))
-            | Some(NzValue::Timestamp(s))
             | Some(NzValue::Interval(s)) => Ok(s),
             Some(NzValue::Numeric(s)) => Ok(s),
             Some(other) => Err(unexpected(other, "text")),
@@ -1256,9 +1255,13 @@ mod tests {
 
     #[test]
     fn canonical_timestamp_drops_sub_ms() {
-        let v = NzValue::Timestamp("2024-12-12 10:30:00.123456".into());
+        let v = NzValue::Timestamp(
+            crate::types::temporal::NzTimestamp::from_text("2024-12-12 10:30:00.123456").unwrap(),
+        );
         assert_eq!(v.to_node_canonical(), "2024-12-12T10:30:00.123Z");
-        let v = NzValue::Timestamp("2024-12-12 10:30:00".into());
+        let v = NzValue::Timestamp(
+            crate::types::temporal::NzTimestamp::from_text("2024-12-12 10:30:00").unwrap(),
+        );
         assert_eq!(v.to_node_canonical(), "2024-12-12T10:30:00.000Z");
     }
 

@@ -7,7 +7,7 @@
 use nz_rust::params::substitute_parameters;
 use nz_rust::{
     parse_connection_string, substitute_bound_parameters, ColumnDataType, ColumnDesc, NzDataReader,
-    NzError, NzParameter, NzValue, QueryResult, ResultSet, Row, SecurityLevel,
+    NzError, NzParameter, NzTimestamp, NzValue, QueryResult, ResultSet, Row, SecurityLevel,
 };
 use std::str::FromStr;
 
@@ -115,7 +115,8 @@ fn value_canonicalization_uses_stable_temporal_forms() {
         "2024-01-02T00:00:00.000Z"
     );
     assert_eq!(
-        NzValue::Timestamp("2024-01-02 03:04:05.123456".into()).to_node_canonical(),
+        NzValue::Timestamp(NzTimestamp::from_text("2024-01-02 03:04:05.123456").unwrap(),)
+            .to_node_canonical(),
         "2024-01-02T03:04:05.123Z"
     );
     assert_eq!(

@@ -136,10 +136,40 @@ pub(crate) fn take_import_source(id: &str) -> Option<ImportSource> {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Row {
     metadata: Arc<RowMetadata>,
     storage: RowStorage,
+}
+
+impl Clone for Row {
+    fn clone(&self) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            storage: match &self.storage {
+                RowStorage::Values { values, dbos } => RowStorage::Values {
+                    values: values.clone(),
+                    dbos: dbos.clone(),
+                },
+                RowStorage::Raw(raw) => RowStorage::Raw(raw.clone()),
+                RowStorage::Pending(pending) => RowStorage::Pending(pending.clone()),
+                RowStorage::Arena(arena) => RowStorage::Arena(arena.clone()),
+            },
+        }
+    }
+}
+
+fn values_heap_bytes(value: &NzValue) -> usize {
+    match value {
+        NzValue::Text(s)
+        | NzValue::Numeric(s)
+        | NzValue::Date(s)
+        | NzValue::Time(s)
+        | NzValue::Timetz(s)
+        | NzValue::Interval(s) => s.len(),
+        NzValue::Bytea(bytes) => bytes.len(),
+        _ => 0,
+    }
 }
 
 #[derive(Debug)]
@@ -203,7 +233,7 @@ impl RowMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum RowStorage {
     Values {
         values: Vec<NzValue>,
@@ -212,7 +242,284 @@ enum RowStorage {
         /// `None` for text rows and `Row::new` compatibility rows.
         dbos: Option<Arc<DbosTupleDesc>>,
     },
-    Raw(Arc<RawRowData>),
+    Raw(RawRowData),
+    /// A fully decoded row whose payload and values live in a shared batch
+    /// arena. Rows only hold offsets until the batch is flushed.
+    Pending(PendingRow),
+    /// A pending row promoted to an immutable, shared batch arena.
+    Arena(ArenaRow),
+}
+
+/// Shared storage for every row in one batch.
+///
+/// Payload bytes and decoded values are appended sequentially while the batch
+/// is being read. A single `Arc` allocation per batch replaces the per-row
+/// `Arc<RawRowData>` and per-row payload allocation used by the stream path.
+#[derive(Debug, Default)]
+pub(crate) struct RowArena {
+    payload: Vec<u8>,
+    values: Vec<NzValue>,
+}
+
+impl RowArena {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mutable payload buffer used to read a row straight from the transport.
+    pub(crate) fn payload_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.payload
+    }
+
+    /// Borrow one row payload by its `(offset, length)`.
+    pub(crate) fn payload_slice(&self, start: usize, len: usize) -> Option<&[u8]> {
+        self.payload(start, len)
+    }
+
+    /// Current payload length (rollback point for a partially decoded row).
+    pub(crate) fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Current value count (rollback point for a partially decoded row).
+    pub(crate) fn values_len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Reserve value slots for one row and borrow its payload and destination
+    /// slots together, so DBOS decoding writes values in place.
+    pub(crate) fn row_buffers(
+        &mut self,
+        payload_start: usize,
+        payload_len: usize,
+        count: usize,
+    ) -> (usize, &[u8], &mut [NzValue]) {
+        let payload_end = payload_start.saturating_add(payload_len);
+        let payload = self
+            .payload
+            .get(payload_start..payload_end)
+            .unwrap_or_default();
+        let values_start = self.values.len();
+        self.values
+            .resize_with(values_start + count, || NzValue::Null);
+        (values_start, payload, &mut self.values[values_start..])
+    }
+
+    /// Move decoded values into the arena and return `(offset, count)`.
+    pub(crate) fn push_values(&mut self, values: &mut Vec<NzValue>) -> (usize, usize) {
+        let start = self.values.len();
+        let count = values.len();
+        self.values.append(values);
+        (start, count)
+    }
+
+    /// Roll back a partially decoded row after a field decode error.
+    pub(crate) fn truncate(&mut self, payload_len: usize, values_len: usize) {
+        self.payload.truncate(payload_len);
+        self.values.truncate(values_len);
+    }
+
+    fn payload(&self, start: usize, len: usize) -> Option<&[u8]> {
+        start
+            .checked_add(len)
+            .and_then(|end| self.payload.get(start..end))
+    }
+
+    fn values(&self, start: usize, len: usize) -> Option<&[NzValue]> {
+        start
+            .checked_add(len)
+            .and_then(|end| self.values.get(start..end))
+    }
+}
+
+/// Offsets collected while a batch is still being read.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRow {
+    payload_start: usize,
+    payload_len: usize,
+    values_start: usize,
+    values_len: usize,
+    dbos: Option<Arc<DbosTupleDesc>>,
+}
+
+/// Immutable view into a flushed batch arena.
+#[derive(Debug, Clone)]
+struct ArenaRow {
+    arena: Arc<RowArena>,
+    payload_start: usize,
+    payload_len: usize,
+    values_start: usize,
+    values_len: usize,
+    dbos: Option<Arc<DbosTupleDesc>>,
+}
+
+impl ArenaRow {
+    fn payload(&self) -> Option<&[u8]> {
+        self.arena.payload(self.payload_start, self.payload_len)
+    }
+
+    /// Locate one field inside the row payload without materializing layout
+    /// caches. This keeps `try_get_raw_value` correct for batch rows while the
+    /// common typed path reads the already-decoded value.
+    fn field_bytes(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<Option<&[u8]>> {
+        let payload = self
+            .payload()
+            .ok_or_else(|| NzError::Protocol("batch row payload is out of bounds".into()))?;
+        let Some(descriptor) = &self.dbos else {
+            return text_field_bytes(payload, columns.len(), index);
+        };
+        dbos_field_bytes(payload, descriptor, index)
+    }
+}
+
+fn text_field_bytes(payload: &[u8], column_count: usize, index: usize) -> NzResult<Option<&[u8]>> {
+    if index >= column_count {
+        return Err(NzError::Config("row index out of range".into()));
+    }
+    let bitmap_len = column_count.div_ceil(8);
+    if payload.len() < bitmap_len {
+        return Err(NzError::Protocol("DataRow null bitmap is truncated".into()));
+    }
+    let mut cursor = bitmap_len;
+    for field in 0..column_count {
+        let byte = payload[field / 8];
+        let bit = 7 - (field % 8);
+        let present = byte & (1 << bit) != 0;
+        if !present {
+            if field == index {
+                return Ok(None);
+            }
+            continue;
+        }
+        let prefix_end = cursor
+            .checked_add(4)
+            .ok_or_else(|| NzError::Protocol("DataRow field prefix overflow".into()))?;
+        let encoded = i32::from_be_bytes(
+            payload
+                .get(cursor..prefix_end)
+                .ok_or_else(|| NzError::Protocol("DataRow field length is truncated".into()))?
+                .try_into()
+                .unwrap(),
+        );
+        let value_len = usize::try_from(encoded - 4)
+            .map_err(|_| NzError::Protocol("DataRow field length is invalid".into()))?;
+        let end = prefix_end
+            .checked_add(value_len)
+            .ok_or_else(|| NzError::Protocol("DataRow field length overflow".into()))?;
+        if end > payload.len() {
+            return Err(NzError::Protocol("DataRow field is out of bounds".into()));
+        }
+        if field == index {
+            return Ok(Some(&payload[prefix_end..end]));
+        }
+        cursor = end;
+    }
+    Err(NzError::Config("row index out of range".into()))
+}
+
+fn dbos_field_start(
+    payload: &[u8],
+    descriptor: &DbosTupleDesc,
+    index: usize,
+) -> NzResult<Option<usize>> {
+    if index >= descriptor.num_fields {
+        return Err(NzError::Config(format!(
+            "row field index {index} is out of range"
+        )));
+    }
+    if descriptor.is_field_null(payload, index) {
+        return Ok(None);
+    }
+    if descriptor.field_fixed_size[index] != 0 {
+        let start = usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+            NzError::Protocol(format!("DBOS fixed field {index} has an invalid offset"))
+        })?;
+        return Ok(Some(start));
+    }
+    if descriptor.num_varying_fields <= 0 {
+        let start = usize::try_from(descriptor.fixed_fields_size)
+            .map_err(|_| NzError::Protocol("DBOS fixed-field area offset is invalid".into()))?;
+        return Ok(Some(start));
+    }
+    let target = usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+        NzError::Protocol(format!("DBOS varying field {index} has an invalid index"))
+    })?;
+    let mut cursor = usize::try_from(descriptor.fixed_fields_size)
+        .map_err(|_| NzError::Protocol("DBOS fixed-field area offset is invalid".into()))?;
+    for field in 0..descriptor.num_varying_fields.max(0) as usize {
+        let prefix_end = cursor
+            .checked_add(2)
+            .ok_or_else(|| NzError::Protocol("DBOS varying field prefix overflow".into()))?;
+        let encoded = usize::from(u16::from_le_bytes(
+            payload
+                .get(cursor..prefix_end)
+                .ok_or_else(|| NzError::Protocol("DBOS varying field prefix is truncated".into()))?
+                .try_into()
+                .unwrap(),
+        ));
+        let value_end = cursor
+            .checked_add(encoded)
+            .ok_or_else(|| NzError::Protocol("DBOS varying field length overflow".into()))?;
+        if encoded < 2 || value_end > payload.len() {
+            return Err(NzError::Protocol(
+                "DBOS varying field length is invalid".into(),
+            ));
+        }
+        if field == target {
+            return Ok(Some(cursor));
+        }
+        cursor = value_end + usize::from(!encoded.is_multiple_of(2));
+        if cursor > payload.len() {
+            return Err(NzError::Protocol(
+                "DBOS varying field padding is truncated".into(),
+            ));
+        }
+    }
+    Err(NzError::Protocol(
+        "DBOS row layout was not discovered".into(),
+    ))
+}
+
+fn dbos_field_bytes<'a>(
+    payload: &'a [u8],
+    descriptor: &DbosTupleDesc,
+    index: usize,
+) -> NzResult<Option<&'a [u8]>> {
+    let Some(start) = dbos_field_start(payload, descriptor, index)? else {
+        return Ok(None);
+    };
+    if descriptor.field_fixed_size[index] != 0 {
+        let end = start
+            .checked_add(descriptor.fixed_width(index)?)
+            .ok_or_else(|| NzError::Protocol("DBOS field offset overflow".into()))?;
+        return payload
+            .get(start..end)
+            .map(Some)
+            .ok_or_else(|| NzError::Protocol("DBOS fixed field is out of bounds".into()));
+    }
+    if descriptor.num_varying_fields <= 0 {
+        return payload
+            .get(start..)
+            .map(Some)
+            .ok_or_else(|| NzError::Protocol("DBOS field is out of bounds".into()));
+    }
+    let prefix_end = start
+        .checked_add(2)
+        .ok_or_else(|| NzError::Protocol("DBOS varying field prefix overflow".into()))?;
+    let encoded = usize::from(u16::from_le_bytes(
+        payload
+            .get(start..prefix_end)
+            .ok_or_else(|| NzError::Protocol("DBOS varying field prefix is truncated".into()))?
+            .try_into()
+            .unwrap(),
+    ));
+    let value_end = start
+        .checked_add(encoded)
+        .ok_or_else(|| NzError::Protocol("DBOS varying field length overflow".into()))?;
+    payload
+        .get(prefix_end..value_end)
+        .map(Some)
+        .ok_or_else(|| NzError::Protocol("DBOS varying field is out of bounds".into()))
 }
 
 #[derive(Debug)]
@@ -224,7 +531,24 @@ struct RawRowData {
     layout_progress: Mutex<RowLayoutProgress>,
 }
 
-#[derive(Debug)]
+impl Clone for RawRowData {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+            kind: self.kind.clone(),
+            decoded: OnceLock::new(),
+            cells: OnceLock::new(),
+            layout_progress: Mutex::new(
+                self.layout_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum RawRowKind {
     Text,
     Dbos { descriptor: Arc<DbosTupleDesc> },
@@ -256,7 +580,7 @@ fn unpack_row_span(packed: u64, is_null: bool) -> RowFieldSpan {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct RowLayoutProgress {
     cursor: usize,
     // Each checked start/end pair is packed into 64 bits. DBOS spans are
@@ -651,6 +975,10 @@ impl Row {
                 RawRowKind::Dbos { descriptor, .. } => Some(descriptor.field_type[position]),
                 _ => None,
             },
+            RowStorage::Pending(pending) => {
+                pending.dbos.as_ref().map(|desc| desc.field_type[position])
+            }
+            RowStorage::Arena(arena) => arena.dbos.as_ref().map(|desc| desc.field_type[position]),
         };
         Ok(TypeInfo {
             column,
@@ -735,7 +1063,7 @@ impl Row {
         let cursor = metadata.columns.len().div_ceil(8);
         Ok(Self {
             metadata,
-            storage: RowStorage::Raw(Arc::new(RawRowData {
+            storage: RowStorage::Raw(RawRowData {
                 payload,
                 kind: RawRowKind::Text,
                 decoded: OnceLock::new(),
@@ -744,7 +1072,7 @@ impl Row {
                     cursor,
                     spans: Vec::new(),
                 }),
-            })),
+            }),
         })
     }
 
@@ -766,7 +1094,7 @@ impl Row {
         let cursor = usize::try_from(descriptor.fixed_fields_size.max(0)).unwrap_or(0);
         Ok(Self {
             metadata,
-            storage: RowStorage::Raw(Arc::new(RawRowData {
+            storage: RowStorage::Raw(RawRowData {
                 payload,
                 kind: RawRowKind::Dbos {
                     descriptor: descriptor.clone(),
@@ -777,8 +1105,42 @@ impl Row {
                     cursor,
                     spans: varying_starts,
                 }),
-            })),
+            }),
         })
+    }
+
+    /// Build a fully decoded row that waits for its batch arena.
+    pub(crate) fn from_pending_values(
+        metadata: Arc<RowMetadata>,
+        payload: (usize, usize),
+        values: (usize, usize),
+        dbos: Option<Arc<DbosTupleDesc>>,
+    ) -> Self {
+        Self {
+            metadata,
+            storage: RowStorage::Pending(PendingRow {
+                payload_start: payload.0,
+                payload_len: payload.1,
+                values_start: values.0,
+                values_len: values.1,
+                dbos,
+            }),
+        }
+    }
+
+    /// Point a pending row at the immutable batch arena before it is delivered.
+    pub(crate) fn promote_to_arena(&mut self, arena: Arc<RowArena>) {
+        let RowStorage::Pending(pending) = &self.storage else {
+            return;
+        };
+        self.storage = RowStorage::Arena(ArenaRow {
+            arena,
+            payload_start: pending.payload_start,
+            payload_len: pending.payload_len,
+            values_start: pending.values_start,
+            values_len: pending.values_len,
+            dbos: pending.dbos.clone(),
+        });
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -788,20 +1150,38 @@ impl Row {
                 // text offsets and decoded cells remain progressive.
                 let layout_bytes = match &raw.kind {
                     RawRowKind::Text => 0,
-                    RawRowKind::Dbos { descriptor } => descriptor
-                        .num_varying_fields
-                        .max(0) as usize
-                        * std::mem::size_of::<u64>(),
+                    RawRowKind::Dbos { descriptor } => {
+                        descriptor.num_varying_fields.max(0) as usize * std::mem::size_of::<u64>()
+                    }
                 };
                 raw.payload
                     .len()
-                    .saturating_add(std::mem::size_of::<RawRowData>() + std::mem::size_of::<Row>())
+                    .saturating_add(std::mem::size_of::<Row>())
                     .saturating_add(layout_bytes)
             }
-            RowStorage::Values { values, .. } => values.iter().map(|value| match value {
-                NzValue::Text(s) | NzValue::Numeric(s) | NzValue::Date(s) | NzValue::Time(s) | NzValue::Timestamp(s) | NzValue::Timetz(s) | NzValue::Interval(s) => s.len(),
-                NzValue::Bytea(bytes) => bytes.len(), _ => 0,
-            } + std::mem::size_of::<NzValue>()).sum(),
+            RowStorage::Pending(pending) => pending.payload_len.saturating_add(
+                pending
+                    .values_len
+                    .saturating_mul(std::mem::size_of::<NzValue>()),
+            ),
+            RowStorage::Arena(arena) => arena
+                .payload_len
+                .saturating_add(
+                    arena
+                        .values_len
+                        .saturating_mul(std::mem::size_of::<NzValue>()),
+                )
+                .saturating_add(
+                    arena
+                        .arena
+                        .values(arena.values_start, arena.values_len)
+                        .map(|values| values.iter().map(values_heap_bytes).sum())
+                        .unwrap_or(0),
+                ),
+            RowStorage::Values { values, .. } => values
+                .iter()
+                .map(|value| values_heap_bytes(value) + std::mem::size_of::<NzValue>())
+                .sum(),
         }
     }
 
@@ -838,6 +1218,13 @@ impl Row {
                 }
                 Ok(raw.decoded.get().expect("row initialized above"))
             }
+            RowStorage::Arena(arena) => arena
+                .arena
+                .values(arena.values_start, arena.values_len)
+                .ok_or_else(|| NzError::Protocol("batch row values are out of bounds".into())),
+            RowStorage::Pending(_) => {
+                Err(NzError::Config("row belongs to an incomplete batch".into()))
+            }
         }
     }
 
@@ -860,6 +1247,14 @@ impl Row {
                     .get(p)
                     .ok_or_else(|| NzError::Config("row values do not match columns".into())),
                 RowStorage::Raw(raw) => raw.value(p, self.columns()),
+                RowStorage::Arena(arena) => arena
+                    .arena
+                    .values(arena.values_start, arena.values_len)
+                    .and_then(|values| values.get(p))
+                    .ok_or_else(|| NzError::Protocol("batch row values are out of bounds".into())),
+                RowStorage::Pending(_) => {
+                    Err(NzError::Config("row belongs to an incomplete batch".into()))
+                }
             },
             None => Err(NzError::Config(format!(
                 "row index out of range: {}",
@@ -915,6 +1310,38 @@ impl Row {
                     }
                     RawRowKind::Text => Ok(value),
                 }
+            }
+            RowStorage::Arena(arena) => {
+                let values = arena
+                    .arena
+                    .values(arena.values_start, arena.values_len)
+                    .ok_or_else(|| {
+                        NzError::Protocol("batch row values are out of bounds".into())
+                    })?;
+                let value = values.get(position).ok_or_else(|| {
+                    NzError::Protocol("batch row values do not match columns".into())
+                })?;
+                let bytes = arena.field_bytes(position, self.columns())?;
+                let raw = RawValue::from_parts(
+                    bytes,
+                    Some(value),
+                    column.type_oid,
+                    column.type_mod,
+                    column.format,
+                );
+                match &arena.dbos {
+                    Some(descriptor) => {
+                        let row = arena.payload().unwrap_or_default();
+                        match dbos_field_start(row, descriptor, position)? {
+                            Some(start) => Ok(raw.with_dbos(descriptor, row, start, position)),
+                            None => Ok(raw),
+                        }
+                    }
+                    None => Ok(raw),
+                }
+            }
+            RowStorage::Pending(_) => {
+                Err(NzError::Config("row belongs to an incomplete batch".into()))
             }
         }
     }

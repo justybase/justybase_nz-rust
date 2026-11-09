@@ -187,7 +187,7 @@ fn encode(value: &NzValue) -> Option<Cell> {
         NzValue::Date(value) => ("datetime", format!("{value} 00:00:00.000000")),
         NzValue::Time(value) => ("timespan", value.clone()),
         NzValue::Timetz(value) => ("datetimeoffset", value.clone()),
-        NzValue::Timestamp(value) => ("datetime", normalize_timestamp(value)),
+        NzValue::Timestamp(value) => ("datetime", normalize_timestamp(&value.to_string())),
         NzValue::Interval(value) => ("timespan", value.clone()),
         NzValue::Bytea(value) => ("bytes", hex_upper(value)),
     };

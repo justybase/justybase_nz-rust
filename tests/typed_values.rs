@@ -1,4 +1,4 @@
-use nz_rust::{Decimal, FromSql, NzValue};
+use nz_rust::{Decimal, FromSql, NzTimestamp, NzValue};
 
 #[test]
 fn decimal_extraction_preserves_scale_and_rejects_out_of_range_numeric() {
@@ -21,8 +21,10 @@ fn chrono_extraction_keeps_microseconds_and_timezone_offset() {
     assert_eq!(date.to_string(), "2024-02-29");
     let time = NaiveTime::from_sql(&NzValue::Time("23:59:58.123456".into())).unwrap();
     assert_eq!(time.format("%H:%M:%S%.6f").to_string(), "23:59:58.123456");
-    let timestamp =
-        NaiveDateTime::from_sql(&NzValue::Timestamp("2024-02-29 23:59:58.123456".into())).unwrap();
+    let timestamp = NaiveDateTime::from_sql(&NzValue::Timestamp(
+        NzTimestamp::from_text("2024-02-29 23:59:58.123456").unwrap(),
+    ))
+    .unwrap();
     assert_eq!(
         timestamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
         "2024-02-29 23:59:58.123456"

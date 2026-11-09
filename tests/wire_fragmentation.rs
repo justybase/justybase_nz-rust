@@ -217,9 +217,34 @@ async fn native_stream_and_batches_decode_identically_under_fragmentation() {
         while let Some(batch) =
             std::future::poll_fn(|cx| Pin::new(&mut batches).poll_next(cx)).await
         {
-            batched.extend(values(&batch.unwrap()));
+            for row in batch.unwrap() {
+                let values = row.try_values().unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    if let NzValue::Text(text) = value {
+                        assert_eq!(&row.try_get::<_, String>(index).unwrap(), text);
+                    }
+                }
+                batched.push(values.to_vec());
+            }
         }
         assert_eq!(batched, expected().text, "chunking {chunking:?}");
+
+        let mut batches = client.query_batches(SQL_DBOS, &[]).await.unwrap();
+        let mut batched = Vec::new();
+        while let Some(batch) =
+            std::future::poll_fn(|cx| Pin::new(&mut batches).poll_next(cx)).await
+        {
+            for row in batch.unwrap() {
+                let values = row.try_values().unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    if let NzValue::Text(text) = value {
+                        assert_eq!(&row.try_get::<_, String>(index).unwrap(), text);
+                    }
+                }
+                batched.push(values.to_vec());
+            }
+        }
+        assert_eq!(batched, expected().dbos, "chunking {chunking:?}");
         client.close().await.unwrap();
         server.assert_no_handler_panics();
     }

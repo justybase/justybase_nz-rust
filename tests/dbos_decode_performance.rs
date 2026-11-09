@@ -82,9 +82,8 @@ fn checksum(values: &[NzValue]) -> u64 {
         NzValue::Int2(value) => sum.wrapping_add(*value as u64),
         NzValue::Int4(value) => sum.wrapping_add(*value as u64),
         NzValue::Int8(value) => sum.wrapping_add(*value as u64),
-        NzValue::Date(value) | NzValue::Time(value) | NzValue::Timestamp(value) => {
-            sum.wrapping_add(value.len() as u64)
-        }
+        NzValue::Date(value) | NzValue::Time(value) => sum.wrapping_add(value.len() as u64),
+        NzValue::Timestamp(value) => sum.wrapping_add(value.to_string().len() as u64),
         _ => sum,
     })
 }

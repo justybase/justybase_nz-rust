@@ -4,6 +4,23 @@ All notable changes to `nz_rust` will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- `NzValue::Timestamp` now carries the typed `NzTimestamp` value
+  (microseconds since 2000-01-01) instead of a preformatted `String`. Binary
+  TIMESTAMP decoding no longer formats or allocates per row; use `Display` /
+  `to_string()` for text or `NzTimestamp::microseconds()` for the numeric
+  component. This is a breaking change for code that matched the old `String`
+  payload.
+- `Client::query_batches` now eagerly decodes every column into one shared
+  per-batch arena. Batch rows no longer allocate an `Arc<RawRowData>`, payload
+  `Bytes`, or per-cell `OnceLock`; memory is bounded by the existing 256-row /
+  1 MiB batch limits. `try_values()` and typed getters read the predecoded
+  values directly.
+- The binary NUMERIC fast path returns an exact `Decimal` instead of routing
+  small values through `f64`, matching the C# driver and avoiding a
+  decimal/float round-trip per cell.
+
 ## [1.0.0-rc.1] - 2026-11-07
 
 Release candidate. The public API is frozen for the `1.0` series; `1.0.0`

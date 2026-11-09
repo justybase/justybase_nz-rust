@@ -101,8 +101,8 @@ pub(crate) fn write_nz_value_sql(value: &NzValue, output: &mut String) -> Result
         | NzValue::Date(value)
         | NzValue::Time(value)
         | NzValue::Timetz(value)
-        | NzValue::Timestamp(value)
         | NzValue::Interval(value) => write_text_literal(value, output)?,
+        NzValue::Timestamp(value) => write_text_literal(&value.to_string(), output)?,
         NzValue::Bytea(_) => {
             return Err(
                 "Binary SQL parameters are unsupported; use an external-table reader".into(),
@@ -673,8 +673,11 @@ mod tests {
                 value
             );
         }
-        let sql = escape_literal(&NzValue::Timestamp("2026-01-01'; SELECT 42; --".into())).unwrap();
-        assert_eq!(sql, "'2026-01-01''; SELECT 42; --'");
+        let sql = escape_literal(&NzValue::Timestamp(
+            crate::types::temporal::NzTimestamp::new(0),
+        ))
+        .unwrap();
+        assert_eq!(sql, "'2000-01-01 00:00:00'");
         assert!(escape_literal(&NzValue::Text("x\0y".into())).is_err());
     }
 

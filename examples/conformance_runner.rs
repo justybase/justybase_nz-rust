@@ -186,10 +186,10 @@ fn canonical(value: &NzValue, _type_class: &str) -> Value {
         NzValue::Float8(value) => float_json(*value),
         NzValue::Numeric(text) => Value::String(text.clone()),
         NzValue::Decimal(value) => Value::String(value.to_string()),
-        NzValue::Text(text)
-        | NzValue::Date(text)
-        | NzValue::Time(text)
-        | NzValue::Timestamp(text) => Value::String(text.clone()),
+        NzValue::Text(text) | NzValue::Date(text) | NzValue::Time(text) => {
+            Value::String(text.clone())
+        }
+        NzValue::Timestamp(text) => Value::String(text.to_string()),
         NzValue::Timetz(text) => Value::String(normalize_timetz(text)),
         NzValue::Interval(text) => parse_interval(text),
         NzValue::Bytea(bytes) => Value::String(base64_encode(bytes)),

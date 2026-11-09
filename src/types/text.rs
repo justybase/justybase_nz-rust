@@ -36,6 +36,7 @@
 
 use crate::types::datetime::normalize_time_text;
 use crate::types::numeric::{parse_numeric_text, NumericDecoded};
+use crate::types::temporal::NzTimestamp;
 use crate::types::value::NzValue;
 
 /// Build a Netezza simple-query (`P`) packet: `'P' + cmdNum(BE) + sql + NUL`.
@@ -83,6 +84,11 @@ pub fn try_parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> crate::N
         }
         // Preserve the exact wire text; typed temporal getters validate it.
         1083 => NzValue::Time(raw.trim().to_owned()),
+        1114 | 1184 | 702 => {
+            return NzTimestamp::from_text(raw)
+                .map(NzValue::Timestamp)
+                .map_err(|_| invalid())
+        }
         _ => parse_text_value(raw, type_oid, type_mod),
     })
 }
@@ -118,7 +124,10 @@ pub fn parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> NzValue {
         },
         1082 => NzValue::Date(raw.trim().to_string()),
         1083 => NzValue::Time(normalize_time_text(raw)),
-        1114 | 1184 | 702 => NzValue::Timestamp(raw.trim().to_string()),
+        1114 | 1184 | 702 => match NzTimestamp::from_text(raw) {
+            Ok(value) => NzValue::Timestamp(value),
+            Err(_) => NzValue::Text(raw.to_string()),
+        },
         1266 => NzValue::Timetz(raw.trim().to_string()),
         1186 => NzValue::Interval(raw.trim().to_string()),
         17 => NzValue::Bytea(decode_bytea_text(raw)),

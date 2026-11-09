@@ -666,8 +666,6 @@ impl DbosTupleDesc {
         var_starts: &mut Vec<usize>,
         field_stage: &mut bool,
     ) -> NzResult<()> {
-        *field_stage = false;
-        self.validate_row_bitmap(row)?;
         let num_fields = self.num_fields;
         if out.capacity() < num_fields {
             out.reserve(num_fields - out.capacity());
@@ -676,6 +674,26 @@ impl DbosTupleDesc {
             out.resize_with(num_fields, || NzValue::Null);
         } else {
             out.truncate(num_fields);
+        }
+        self.parse_row_classified_slice(row, out, var_starts, field_stage)
+    }
+
+    /// Slice-based row decoder used by batch arenas, where each row owns its
+    /// destination slots and the values must not be moved afterwards.
+    pub(crate) fn parse_row_classified_slice(
+        &self,
+        row: &[u8],
+        out: &mut [NzValue],
+        var_starts: &mut Vec<usize>,
+        field_stage: &mut bool,
+    ) -> NzResult<()> {
+        *field_stage = false;
+        self.validate_row_bitmap(row)?;
+        let num_fields = self.num_fields;
+        if out.len() < num_fields {
+            return Err(NzError::Config(
+                "row destination has fewer slots than fields".into(),
+            ));
         }
 
         // Pre-compute varying field start offsets.
@@ -883,8 +901,7 @@ impl DbosTupleDesc {
                     return Err(protocol_trunc(i));
                 }
                 let micros = i64::from_le_bytes(row[off..off + 8].try_into().unwrap());
-                let target = string_value_slot(out, StringValueKind::Timestamp);
-                datetime::timestamp_from_8bytes_into(micros, target);
+                *out = NzValue::Timestamp(crate::types::temporal::NzTimestamp::new(micros));
             }
             nz_type::NZ_TYPE_BOOL => {
                 if off >= row.len() {

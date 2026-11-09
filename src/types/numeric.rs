@@ -24,7 +24,7 @@
 
 use std::fmt::Write as _;
 
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 
 /// Field precision from the tuple descriptor: `(fieldSize >> 8) & 0x7f`.
 pub fn field_precision(field_size: i32) -> i32 {
@@ -92,9 +92,9 @@ pub(crate) fn get_cs_numeric_into(
         ));
     }
 
-    // Fast path: ≤ 2 words and prec ≤ 15. Keep the historical f64 result for
-    // values whose shortest representation is unambiguous; use Decimal for
-    // values such as 3.1400 where f64 would lose scale/trailing zeroes.
+    // Fast path: ≤ 2 words and prec ≤ 15. The magnitude fits `Decimal`
+    // exactly, so return the fixed-point value directly instead of formatting
+    // it as a decimal string or bouncing through `f64`.
     if part_count <= 2 && prec <= 15 {
         let unscaled: i64 = if part_count == 1 {
             // Single 32-bit word, two's complement.
@@ -106,14 +106,6 @@ pub(crate) fn get_cs_numeric_into(
             (hi << 32) + lo
         };
         if let Some(value) = decimal_from_i128(unscaled as i128, scale) {
-            let number = unscaled as f64 / 10f64.powi(scale);
-            if let Some(round_tripped) = Decimal::from_f64(number) {
-                // Decimal equality ignores scale, so compare scale as well:
-                // 3.1400 must remain Decimal while 3.14 may stay a float.
-                if round_tripped == value && round_tripped.scale() == value.scale() {
-                    return Ok(NumericDecodedInto::Number(number));
-                }
-            }
             return Ok(NumericDecodedInto::Decimal(value));
         }
         let negative = unscaled < 0;
@@ -406,11 +398,11 @@ mod tests {
             NumericDecoded::Decimal("3.1400".parse().unwrap())
         );
 
-        // Negative: -123.45 scale 2 (round-trips → number)
+        // Negative: -123.45 scale 2.
         let data = encode_numeric("-123.45", 2, 2);
         assert_eq!(
             get_cs_numeric(&data, 10, 2, 2).unwrap(),
-            NumericDecoded::Number(-123.45)
+            NumericDecoded::Decimal("-123.45".parse().unwrap())
         );
 
         // Single 32-bit word (precision ≤ 9).
@@ -440,13 +432,13 @@ mod tests {
         let data = encode_numeric("12345.6789", 4, 2);
         assert_eq!(
             get_cs_numeric(&data, 10, 4, 2).unwrap(),
-            NumericDecoded::Number(12345.6789)
+            NumericDecoded::Decimal("12345.6789".parse().unwrap())
         );
 
         let data = encode_numeric("-543.21", 2, 2);
         assert_eq!(
             get_cs_numeric(&data, 10, 2, 2).unwrap(),
-            NumericDecoded::Number(-543.21)
+            NumericDecoded::Decimal("-543.21".parse().unwrap())
         );
     }
 
@@ -490,31 +482,55 @@ mod tests {
     fn scale_padding() {
         let data = words_ms_first(&[7]);
         let d = get_cs_numeric(&data, 6, 4, 0).unwrap();
-        assert_eq!(d, NumericDecoded::Number(0.0007));
+        assert_eq!(d, NumericDecoded::Decimal("0.0007".parse().unwrap()));
     }
 
     #[test]
     fn reference_parity_vectors() {
         // Mirrors the Node/C# `TypeConversions - numeric binary parity` table.
         let cases: &[(&str, i32, i32, usize, NumericDecoded)] = &[
-            ("0", 9, 0, 1, NumericDecoded::Number(0.0)),
-            ("999999999", 9, 0, 1, NumericDecoded::Number(999999999.0)),
-            ("-999999999", 9, 0, 1, NumericDecoded::Number(-999999999.0)),
-            ("12345.6789", 10, 4, 2, NumericDecoded::Number(12345.6789)),
-            ("-543.21", 10, 2, 2, NumericDecoded::Number(-543.21)),
+            ("0", 9, 0, 1, NumericDecoded::Decimal("0".parse().unwrap())),
+            (
+                "999999999",
+                9,
+                0,
+                1,
+                NumericDecoded::Decimal("999999999".parse().unwrap()),
+            ),
+            (
+                "-999999999",
+                9,
+                0,
+                1,
+                NumericDecoded::Decimal("-999999999".parse().unwrap()),
+            ),
+            (
+                "12345.6789",
+                10,
+                4,
+                2,
+                NumericDecoded::Decimal("12345.6789".parse().unwrap()),
+            ),
+            (
+                "-543.21",
+                10,
+                2,
+                2,
+                NumericDecoded::Decimal("-543.21".parse().unwrap()),
+            ),
             (
                 "99999.999999",
                 15,
                 6,
                 2,
-                NumericDecoded::Number(99999.999999),
+                NumericDecoded::Decimal("99999.999999".parse().unwrap()),
             ),
             (
                 "-99999.999999",
                 15,
                 6,
                 2,
-                NumericDecoded::Number(-99999.999999),
+                NumericDecoded::Decimal("-99999.999999".parse().unwrap()),
             ),
             (
                 "123456789012345678.87654321",

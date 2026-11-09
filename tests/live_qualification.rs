@@ -885,14 +885,16 @@ async fn live_null_matrix_for_every_type_and_alternating_wide_rows() {
                 );
                 if ty.starts_with("VARBINARY") {
                     // Known representation difference: the binary path yields
-                    // Bytea (`0x0102`), the host text path yields text (`X'0102'`).
-                    assert_eq!(
-                        binary.trim_start_matches("0x").to_uppercase(),
-                        host.trim_start_matches("X'")
+                    // Bytea (`0x0102`), while the host text path may render
+                    // `X'0102'` or `0X0102` depending on the server version.
+                    let hex = |text: &str| {
+                        text.trim_start_matches("0x")
+                            .trim_start_matches("0X")
+                            .trim_start_matches("X'")
                             .trim_end_matches('\'')
-                            .to_uppercase(),
-                        "VARBINARY bytes differ"
-                    );
+                            .to_uppercase()
+                    };
+                    assert_eq!(hex(&binary), hex(&host), "VARBINARY bytes differ");
                 } else if ty == "INTERVAL" {
                     assert_eq!(interval_parts(&binary), interval_parts(&host), "{ty}");
                 } else if ty.starts_with("CHAR") || ty.starts_with("NCHAR") {

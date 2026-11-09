@@ -716,8 +716,8 @@ impl NzDataReader {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Timestamp(s)
             | NzValue::Interval(s) => Ok(Some(s.clone())),
+            NzValue::Timestamp(value) => Ok(Some(value.to_string())),
             NzValue::Decimal(value) => Ok(Some(value.to_string())),
             NzValue::Bool(b) => Ok(Some(b.to_string())),
             NzValue::Int2(n) => Ok(Some(n.to_string())),
@@ -744,8 +744,8 @@ impl NzDataReader {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Timestamp(s)
             | NzValue::Interval(s) => Ok(Some(s.as_bytes().to_vec())),
+            NzValue::Timestamp(value) => Ok(Some(value.to_string().into_bytes())),
             NzValue::Decimal(value) => Ok(Some(value.to_string().into_bytes())),
             other => Err(NzError::Config(format!(
                 "cannot convert {other:?} to bytes"

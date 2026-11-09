@@ -39,9 +39,12 @@ pub fn nz_value_to_cell(value: &NzValue) -> CellValue {
         NzValue::Date(s) => parse_date(s)
             .map(CellValue::DateTime)
             .unwrap_or_else(|| CellValue::Text(s.clone())),
-        NzValue::Timestamp(s) => parse_timestamp(s)
-            .map(CellValue::DateTime)
-            .unwrap_or_else(|| CellValue::Text(s.clone())),
+        NzValue::Timestamp(value) => {
+            let text = value.to_string();
+            parse_timestamp(&text)
+                .map(CellValue::DateTime)
+                .unwrap_or_else(|| CellValue::Text(text))
+        }
         // Times, intervals and binary payloads have no cell-native form;
         // keep the driver's text rendering.
         NzValue::Time(s) | NzValue::Timetz(s) | NzValue::Interval(s) => CellValue::Text(s.clone()),
@@ -189,7 +192,9 @@ mod tests {
             columns.clone(),
             vec![
                 NzValue::Int4(7),
-                NzValue::Timestamp("2024-01-02 03:04:05".to_string()),
+                NzValue::Timestamp(
+                    nz_rust::NzTimestamp::from_text("2024-01-02 03:04:05").unwrap(),
+                ),
             ],
         )];
         QueryResult {

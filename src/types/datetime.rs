@@ -23,6 +23,8 @@ use std::fmt::Write as _;
 
 /// Days from 1970-01-01 to the Netezza epoch (2000-01-01).
 pub const POSTGRES_EPOCH_DAYS: i64 = 10_957;
+/// Microseconds from 1970-01-01 to the Netezza epoch (2000-01-01).
+pub const POSTGRES_EPOCH_MICROS: i64 = POSTGRES_EPOCH_DAYS * 86_400_000_000;
 const MS_PER_DAY: i64 = 86_400_000;
 const US_PER_DAY: i64 = 86_400_000_000;
 

@@ -21,13 +21,13 @@
 //! simple-query protocol.
 
 use crate::config::{NzConnectionConfig, SecurityLevel};
-use crate::connection::{QueryResult, Row, RowMetadata};
+use crate::connection::{QueryResult, Row, RowArena, RowMetadata};
 use crate::error::{parse_backend_error_fields, validate_protocol_length, NzError, NzResult};
 use crate::handshake_common;
 use crate::messages::{code, parse_command_complete_rows};
 use crate::params::SqlTemplate;
 use crate::tuple_desc::{parse_row_description, ColumnDesc, DbosTupleDesc};
-use crate::types::value::ToSql;
+use crate::types::value::{NzValue, ToSql};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
 use std::collections::{HashMap, VecDeque};
@@ -327,6 +327,27 @@ struct BatchSender {
     sender: mpsc::Sender<QueuedBatch>,
     budget: Arc<Semaphore>,
     control: Arc<Control>,
+}
+
+/// Per-batch decode scratch. Payloads and decoded values are appended to one
+/// arena so a 256-row batch needs a single structural allocation instead of
+/// one `Row`/payload allocation per row.
+struct BatchAccumulator {
+    rows: Vec<Row>,
+    bytes: usize,
+    arena: RowArena,
+    scratch: Vec<NzValue>,
+}
+
+impl BatchAccumulator {
+    fn new() -> Self {
+        Self {
+            rows: Vec::with_capacity(BATCH_ROWS),
+            bytes: 0,
+            arena: RowArena::new(),
+            scratch: Vec::new(),
+        }
+    }
 }
 impl BatchSender {
     async fn send(&self, rows: Vec<Row>) -> Result<(), ()> {
@@ -1848,8 +1869,7 @@ impl AsyncSession {
         // the stream stays aligned: finish the response and report it then.
         let mut decode_error: Option<NzError> = None;
         let mut batch_extra_result_set = false;
-        let mut batch_rows = Vec::with_capacity(BATCH_ROWS);
-        let mut batch_bytes = 0usize;
+        let mut batch_buffer = BatchAccumulator::new();
         let mut event_rows: Option<PooledRowBatch> = None;
         let mut dbos_varying_scratch = Vec::new();
 
@@ -1889,32 +1909,71 @@ impl AsyncSession {
                         self.discard_exact(row_len).await?;
                         continue;
                     }
-                    let payload = self.read_bytes(row_len).await?;
                     let row_metadata = current.as_ref().expect("result set initialized").1.clone();
-                    let row = if row_policy.eagerly_decodes() {
-                        let mut values = Vec::with_capacity(
-                            current.as_ref().expect("result set initialized").0.len(),
-                        );
+                    let row = if batch.is_some() && !batch_extra_result_set {
+                        // Bulk batches decode eagerly into one shared arena so
+                        // consumers never pay per-row `OnceLock`/`Mutex` costs.
+                        let payload_start = batch_buffer.arena.payload_len();
+                        self.read_bytes_into(row_len, batch_buffer.arena.payload_buffer())
+                            .await?;
+                        let payload_range = (payload_start, row_len);
                         let mut field_stage = false;
-                        match descriptor.parse_row_classified(
-                            &payload,
-                            &mut values,
+                        let (values_start, payload, slots) = batch_buffer.arena.row_buffers(
+                            payload_start,
+                            row_len,
+                            descriptor.num_fields,
+                        );
+                        let parse_result = descriptor.parse_row_classified_slice(
+                            payload,
+                            slots,
                             &mut dbos_varying_scratch,
                             &mut field_stage,
-                        ) {
-                            Ok(()) => Row::from_shared_dbos_metadata(
+                        );
+                        match parse_result {
+                            Ok(()) => Row::from_pending_values(
                                 row_metadata,
-                                values,
-                                descriptor.clone(),
+                                payload_range,
+                                (values_start, descriptor.num_fields),
+                                Some(descriptor.clone()),
                             ),
                             Err(error) if field_stage => {
+                                batch_buffer.arena.truncate(payload_start, values_start);
                                 decode_error.get_or_insert(error);
                                 continue;
                             }
                             Err(error) => return Err(error),
                         }
                     } else {
-                        Row::from_dbos_raw_with_metadata(row_metadata, payload, descriptor.clone())?
+                        let payload = self.read_bytes(row_len).await?;
+                        if row_policy.eagerly_decodes() {
+                            let mut values = Vec::with_capacity(
+                                current.as_ref().expect("result set initialized").0.len(),
+                            );
+                            let mut field_stage = false;
+                            match descriptor.parse_row_classified(
+                                &payload,
+                                &mut values,
+                                &mut dbos_varying_scratch,
+                                &mut field_stage,
+                            ) {
+                                Ok(()) => Row::from_shared_dbos_metadata(
+                                    row_metadata,
+                                    values,
+                                    descriptor.clone(),
+                                ),
+                                Err(error) if field_stage => {
+                                    decode_error.get_or_insert(error);
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            Row::from_dbos_raw_with_metadata(
+                                row_metadata,
+                                payload,
+                                descriptor.clone(),
+                            )?
+                        }
                     };
                     let set = current.as_mut().expect("result set initialized");
                     if let Some(events) = events {
@@ -1922,9 +1981,7 @@ impl AsyncSession {
                         let _ = events.push_row(&mut event_rows, row).await;
                     } else if let Some(batch) = batch {
                         if !batch_extra_result_set {
-                            let _ =
-                                push_stream_batch(batch, &mut batch_rows, &mut batch_bytes, row)
-                                    .await;
+                            let _ = push_stream_batch(batch, &mut batch_buffer, row).await;
                         }
                     } else {
                         set.2.push(row);
@@ -1969,8 +2026,7 @@ impl AsyncSession {
                         events,
                         batch,
                         &mut event_rows,
-                        &mut batch_rows,
-                        &mut batch_bytes,
+                        &mut batch_buffer,
                         &mut set_index,
                         &mut row_count,
                         &mut started,
@@ -2015,27 +2071,71 @@ impl AsyncSession {
                         self.discard_exact(len).await?;
                         continue;
                     }
-                    let data = self.read_bytes(len).await?;
                     let row_metadata = current.as_ref().expect("result set initialized").1.clone();
-                    let row = if row_policy.eagerly_decodes() {
-                        let columns = current.as_ref().expect("result set initialized").0.as_ref();
-                        let mut values = Vec::with_capacity(columns.len());
+                    let row = if batch.is_some() && !batch_extra_result_set {
+                        let columns = current.as_ref().expect("result set initialized").0.clone();
+                        let payload_start = batch_buffer.arena.payload_len();
+                        self.read_bytes_into(len, batch_buffer.arena.payload_buffer())
+                            .await?;
+                        let payload_range = (payload_start, len);
+                        let values_start = batch_buffer.arena.values_len();
                         let mut value_stage = false;
-                        match crate::types::text::parse_text_data_row_classified(
-                            &data,
-                            columns,
-                            &mut values,
-                            &mut value_stage,
-                        ) {
-                            Ok(()) => Row::from_shared_metadata(row_metadata, values),
+                        let parse_result = {
+                            let data = batch_buffer
+                                .arena
+                                .payload_slice(payload_start, len)
+                                .ok_or_else(|| {
+                                    NzError::Protocol("DataRow payload is truncated".into())
+                                })?;
+                            crate::types::text::parse_text_data_row_classified(
+                                data,
+                                &columns,
+                                &mut batch_buffer.scratch,
+                                &mut value_stage,
+                            )
+                        };
+                        match parse_result {
+                            Ok(()) => {
+                                let values_range =
+                                    batch_buffer.arena.push_values(&mut batch_buffer.scratch);
+                                Row::from_pending_values(
+                                    row_metadata,
+                                    payload_range,
+                                    values_range,
+                                    None,
+                                )
+                            }
                             Err(message) if value_stage => {
+                                batch_buffer.arena.truncate(payload_start, values_start);
+                                batch_buffer.scratch.clear();
                                 decode_error.get_or_insert(NzError::Protocol(message));
                                 continue;
                             }
                             Err(message) => return Err(NzError::Protocol(message)),
                         }
                     } else {
-                        Row::from_text_raw_with_metadata(row_metadata, data)?
+                        let data = self.read_bytes(len).await?;
+                        if row_policy.eagerly_decodes() {
+                            let columns =
+                                current.as_ref().expect("result set initialized").0.as_ref();
+                            let mut values = Vec::with_capacity(columns.len());
+                            let mut value_stage = false;
+                            match crate::types::text::parse_text_data_row_classified(
+                                &data,
+                                columns,
+                                &mut values,
+                                &mut value_stage,
+                            ) {
+                                Ok(()) => Row::from_shared_metadata(row_metadata, values),
+                                Err(message) if value_stage => {
+                                    decode_error.get_or_insert(NzError::Protocol(message));
+                                    continue;
+                                }
+                                Err(message) => return Err(NzError::Protocol(message)),
+                            }
+                        } else {
+                            Row::from_text_raw_with_metadata(row_metadata, data)?
+                        }
                     };
                     let set = current.as_mut().expect("result set initialized");
                     if let Some(events) = events {
@@ -2043,9 +2143,7 @@ impl AsyncSession {
                         let _ = events.push_row(&mut event_rows, row).await;
                     } else if let Some(batch) = batch {
                         if !batch_extra_result_set {
-                            let _ =
-                                push_stream_batch(batch, &mut batch_rows, &mut batch_bytes, row)
-                                    .await;
+                            let _ = push_stream_batch(batch, &mut batch_buffer, row).await;
                         }
                     } else {
                         set.2.push(row);
@@ -2120,8 +2218,7 @@ impl AsyncSession {
                         events,
                         batch,
                         &mut event_rows,
-                        &mut batch_rows,
-                        &mut batch_bytes,
+                        &mut batch_buffer,
                         &mut set_index,
                         &mut row_count,
                         &mut started,
@@ -2169,8 +2266,7 @@ impl AsyncSession {
                         events,
                         batch,
                         &mut event_rows,
-                        &mut batch_rows,
-                        &mut batch_bytes,
+                        &mut batch_buffer,
                         &mut set_index,
                         &mut row_count,
                         &mut started,
@@ -2653,6 +2749,16 @@ impl AsyncSession {
         self.fill(len).await?;
         Ok(self.buffer.split_to(len).freeze())
     }
+
+    /// Read a frame payload directly into a caller-owned buffer, avoiding the
+    /// per-row `Bytes` allocation used on the streaming path.
+    async fn read_bytes_into(&mut self, len: usize, destination: &mut Vec<u8>) -> NzResult<()> {
+        validate_protocol_length(len as i32, "asyncPayload", true)?;
+        self.fill(len).await?;
+        destination.extend_from_slice(&self.buffer[..len]);
+        self.buffer.advance(len);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "ssl")]
@@ -2730,32 +2836,28 @@ async fn emit_result_start(
 
 async fn push_stream_batch(
     sender: &BatchSender,
-    rows: &mut Vec<Row>,
-    bytes: &mut usize,
+    buffer: &mut BatchAccumulator,
     row: Row,
 ) -> Result<(), ()> {
     let row_bytes = row.retained_bytes();
-    if !rows.is_empty() && bytes.saturating_add(row_bytes) > BATCH_BYTES {
-        flush_stream_batch(sender, rows, bytes).await?;
-    }
-    *bytes = bytes.saturating_add(row_bytes);
-    rows.push(row);
-    if rows.len() >= BATCH_ROWS || *bytes >= BATCH_BYTES {
-        flush_stream_batch(sender, rows, bytes).await?;
+    buffer.bytes = buffer.bytes.saturating_add(row_bytes);
+    buffer.rows.push(row);
+    if buffer.rows.len() >= BATCH_ROWS || buffer.bytes >= BATCH_BYTES {
+        flush_stream_batch(sender, buffer).await?;
     }
     Ok(())
 }
 
-async fn flush_stream_batch(
-    sender: &BatchSender,
-    rows: &mut Vec<Row>,
-    bytes: &mut usize,
-) -> Result<(), ()> {
-    if rows.is_empty() {
+async fn flush_stream_batch(sender: &BatchSender, buffer: &mut BatchAccumulator) -> Result<(), ()> {
+    if buffer.rows.is_empty() {
         return Ok(());
     }
-    *bytes = 0;
-    sender.send(std::mem::take(rows)).await
+    let arena = Arc::new(std::mem::take(&mut buffer.arena));
+    for row in &mut buffer.rows {
+        row.promote_to_arena(arena.clone());
+    }
+    buffer.bytes = 0;
+    sender.send(std::mem::take(&mut buffer.rows)).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2765,8 +2867,7 @@ async fn finish_response_set(
     events: Option<&EventSender>,
     batch: Option<&BatchSender>,
     event_rows: &mut Option<PooledRowBatch>,
-    batch_rows: &mut Vec<Row>,
-    batch_bytes: &mut usize,
+    batch_buffer: &mut BatchAccumulator,
     index: &mut usize,
     rows: &mut u64,
     started: &mut bool,
@@ -2775,7 +2876,7 @@ async fn finish_response_set(
         let _ = events.flush_rows(event_rows).await;
     }
     if let Some(batch) = batch {
-        let _ = flush_stream_batch(batch, batch_rows, batch_bytes).await;
+        let _ = flush_stream_batch(batch, batch_buffer).await;
     }
     if let Some((columns, _metadata, values, nullability)) = current.take() {
         if let Some(events) = events {
@@ -3081,16 +3182,13 @@ mod tests {
             }],
             vec![NzValue::Int4(7)],
         );
-        let mut pending = Vec::with_capacity(BATCH_ROWS);
-        let mut bytes = 0;
+        let mut pending = BatchAccumulator::new();
         for _ in 0..300 {
-            push_stream_batch(&batches, &mut pending, &mut bytes, row.clone())
+            push_stream_batch(&batches, &mut pending, row.clone())
                 .await
                 .unwrap();
         }
-        flush_stream_batch(&batches, &mut pending, &mut bytes)
-            .await
-            .unwrap();
+        flush_stream_batch(&batches, &mut pending).await.unwrap();
         let first = receiver.recv().await.unwrap();
         let second = receiver.recv().await.unwrap();
         assert_eq!(first.rows.len(), 256);
@@ -3118,14 +3216,54 @@ mod tests {
             }],
             vec![NzValue::Text("x".repeat(BATCH_BYTES + 1))],
         );
-        let mut pending = Vec::with_capacity(BATCH_ROWS);
-        let mut bytes = 0;
-        push_stream_batch(&batches, &mut pending, &mut bytes, row)
+        let mut pending = BatchAccumulator::new();
+        push_stream_batch(&batches, &mut pending, row)
             .await
             .unwrap();
         let batch = receiver.recv().await.unwrap();
         assert_eq!(batch.rows.len(), 1);
         assert!(batch.rows[0].retained_bytes() > BATCH_BYTES);
-        assert!(pending.is_empty());
+        assert!(pending.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_rows_are_promoted_into_the_arena_that_decoded_them() {
+        let control = Arc::new(Control::default());
+        control.active.store(1, Ordering::Release);
+        let (sender, mut receiver) = mpsc::channel(4);
+        let batches = BatchSender {
+            sender,
+            control,
+            budget: Arc::new(Semaphore::new(STREAM_BYTES)),
+        };
+        let columns: Arc<[ColumnDesc]> = Arc::from(vec![ColumnDesc {
+            name: "V".into(),
+            type_oid: 23,
+            type_len: 4,
+            type_mod: -1,
+            format: 1,
+        }]);
+        let metadata = Arc::new(RowMetadata::new(columns));
+        let mut buffer = BatchAccumulator::new();
+        for round in 0..2i32 {
+            for value in 0..3i32 {
+                let payload_start = buffer.arena.payload_len();
+                buffer.arena.payload_buffer().push(0);
+                let payload = (payload_start, 1);
+                let (values_start, _, slots) = buffer.arena.row_buffers(payload_start, 1, 1);
+                slots[0] = NzValue::Int4(round * 10 + value);
+                let row =
+                    Row::from_pending_values(metadata.clone(), payload, (values_start, 1), None);
+                push_stream_batch(&batches, &mut buffer, row).await.unwrap();
+            }
+            flush_stream_batch(&batches, &mut buffer).await.unwrap();
+            let batch = receiver.recv().await.unwrap();
+            assert_eq!(batch.rows.len(), 3);
+            for (value, row) in batch.rows.iter().enumerate() {
+                assert_eq!(row.try_get::<_, i32>(0).unwrap(), round * 10 + value as i32);
+            }
+            assert_eq!(buffer.arena.payload_len(), 0);
+            assert_eq!(buffer.arena.values_len(), 0);
+        }
     }
 }

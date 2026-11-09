@@ -99,8 +99,8 @@ fn write_cell<W: Write>(writer: &mut W, value: &NzValue) -> io::Result<()> {
         | NzValue::Date(text)
         | NzValue::Time(text)
         | NzValue::Timetz(text)
-        | NzValue::Timestamp(text)
         | NzValue::Interval(text) => write_escaped(writer, text),
+        NzValue::Timestamp(value) => write_escaped(writer, &value.to_string()),
         NzValue::Bytea(bytes) => {
             writer.write_all(b"0x")?;
             for byte in bytes {

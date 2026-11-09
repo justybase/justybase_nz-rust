@@ -109,10 +109,57 @@ impl NzTime {
     }
 }
 /// Microseconds since 2000-01-01, without a time zone.
+///
+/// This is the exact DBOS wire representation, so binary TIMESTAMP values are
+/// copied into [`NzValue::Timestamp`] without formatting or a heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NzTimestamp {
     /// Microseconds since 2000-01-01.
     pub microseconds: i64,
+}
+impl NzTimestamp {
+    /// Build a value from its microsecond offset.
+    pub fn new(microseconds: i64) -> Self {
+        Self { microseconds }
+    }
+    /// Microseconds since 2000-01-01.
+    pub fn microseconds(self) -> i64 {
+        self.microseconds
+    }
+    /// Parse `YYYY-MM-DD HH:MM:SS[.ffffff]` (a trailing zone is ignored).
+    pub fn from_text(input: &str) -> NzResult<Self> {
+        let input = input.trim();
+        let (date, time) = input.split_once(' ').ok_or_else(invalid)?;
+        let time = time.split_whitespace().next().ok_or_else(invalid)?;
+        let time = time.find(['+', '-']).map_or(time, |index| &time[..index]);
+        let time = time.strip_suffix(['Z', 'z']).unwrap_or(time);
+        let time = NzTime::new(parse_clock(time)?)?;
+        let micros = i64::from(parse_date(date)?)
+            .checked_mul(DAY)
+            .and_then(|value| value.checked_add(time.microseconds))
+            .ok_or_else(invalid)?;
+        Ok(Self {
+            microseconds: micros,
+        })
+    }
+}
+#[cfg(feature = "chrono")]
+impl NzTimestamp {
+    /// Convert to a naive `chrono` timestamp, if it fits chrono's range.
+    pub fn to_naive_datetime(self) -> Option<chrono::NaiveDateTime> {
+        let unix_micros = self
+            .microseconds
+            .checked_add(datetime::POSTGRES_EPOCH_MICROS)?;
+        chrono::DateTime::from_timestamp_micros(unix_micros).map(|value| value.naive_utc())
+    }
+    /// Build a value from a naive `chrono` timestamp.
+    pub fn from_naive_datetime(value: chrono::NaiveDateTime) -> Option<Self> {
+        let microseconds = value
+            .and_utc()
+            .timestamp_micros()
+            .checked_sub(datetime::POSTGRES_EPOCH_MICROS)?;
+        Some(Self { microseconds })
+    }
 }
 /// Calendar months and signed microseconds, preserving mixed-sign intervals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -189,18 +236,10 @@ impl FromSql for NzTimestamp {
         Self::from_sql(&value.to_nz_value()?)
     }
     fn from_sql(value: &NzValue) -> NzResult<Self> {
-        let NzValue::Timestamp(text) = value else {
+        let NzValue::Timestamp(value) = value else {
             return Err(invalid());
         };
-        let (date, time) = text.split_once(' ').ok_or_else(invalid)?;
-        let time = NzTime::new(parse_clock(time)?)?;
-        let micros = i64::from(parse_date(date)?)
-            .checked_mul(DAY)
-            .and_then(|v| v.checked_add(time.microseconds))
-            .ok_or_else(invalid)?;
-        Ok(Self {
-            microseconds: micros,
-        })
+        Ok(*value)
     }
 }
 impl FromSql for NzInterval {
@@ -350,9 +389,19 @@ macro_rules! temporal_traits {
 }
 temporal_traits!(NzDate, Date);
 temporal_traits!(NzTime, Time);
-temporal_traits!(NzTimestamp, Timestamp);
 temporal_traits!(NzInterval, Interval);
 temporal_traits!(NzTimetz, Timetz);
+
+impl<'a> FromSqlRaw<'a> for NzTimestamp {
+    fn from_sql_raw(value: RawValue<'a>) -> NzResult<Self> {
+        Self::from_raw(value)
+    }
+}
+impl ToSql for NzTimestamp {
+    fn to_nz_value(&self) -> NzValue {
+        NzValue::Timestamp(*self)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
