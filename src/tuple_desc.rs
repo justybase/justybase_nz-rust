@@ -25,7 +25,7 @@ use crate::types::datetime;
 use crate::types::numeric::{
     field_precision, field_scale, get_cs_numeric_into, numeric_digit_count, NumericDecodedInto,
 };
-use crate::types::value::{string_value_slot, NzValue, StringValueKind};
+use crate::types::value::{NzValue, StringValueKind};
 
 /// Column metadata from a text (`T`) or binary (`X`) row description.
 #[derive(Debug, Clone, PartialEq)]
@@ -651,7 +651,7 @@ impl DbosTupleDesc {
         var_starts: &mut Vec<usize>,
     ) -> NzResult<()> {
         let mut field_stage = false;
-        self.parse_row_classified(row, out, var_starts, &mut field_stage)
+        self.parse_row_classified(row, out, var_starts, &mut field_stage, None)
     }
 
     /// [`Self::parse_row_into_with_scratch`] that also reports *where* it
@@ -665,6 +665,7 @@ impl DbosTupleDesc {
         out: &mut Vec<NzValue>,
         var_starts: &mut Vec<usize>,
         field_stage: &mut bool,
+        cache: Option<&crate::value_cache::ValueCaches>,
     ) -> NzResult<()> {
         let num_fields = self.num_fields;
         if out.capacity() < num_fields {
@@ -675,7 +676,7 @@ impl DbosTupleDesc {
         } else {
             out.truncate(num_fields);
         }
-        self.parse_row_classified_slice(row, out, var_starts, field_stage)
+        self.parse_row_classified_slice(row, out, var_starts, field_stage, cache)
     }
 
     /// Slice-based row decoder used by batch arenas, where each row owns its
@@ -686,6 +687,7 @@ impl DbosTupleDesc {
         out: &mut [NzValue],
         var_starts: &mut Vec<usize>,
         field_stage: &mut bool,
+        cache: Option<&crate::value_cache::ValueCaches>,
     ) -> NzResult<()> {
         *field_stage = false;
         self.validate_row_bitmap(row)?;
@@ -755,10 +757,45 @@ impl DbosTupleDesc {
 
             let field_start = self.row_field_start(row, i, var_starts)?;
             *field_stage = true;
-            self.parse_field_into(row, field_start, i, out_value)?;
+            match cache {
+                Some(cache) => {
+                    let field_end = self.field_end(row, i, field_start)?;
+                    let key = row
+                        .get(field_start..field_end)
+                        .ok_or_else(|| protocol_trunc(i))?;
+                    *out_value = cache.get_or_decode(i, key, || {
+                        let mut value = NzValue::Null;
+                        self.parse_field_into(row, field_start, i, &mut value)?;
+                        Ok(value)
+                    })?;
+                }
+                None => self.parse_field_into(row, field_start, i, out_value)?,
+            }
         }
 
         Ok(())
+    }
+
+    /// End of the encoded value (excluding DBOS alignment padding).
+    fn field_end(&self, row: &[u8], index: usize, start: usize) -> NzResult<usize> {
+        if self.field_fixed_size[index] != 0 {
+            return start
+                .checked_add(self.fixed_width(index)?)
+                .filter(|&end| end <= row.len())
+                .ok_or_else(|| protocol_trunc(index));
+        }
+        let prefix = start
+            .checked_add(2)
+            .and_then(|end| row.get(start..end))
+            .ok_or_else(|| protocol_trunc(index))?;
+        let length = u16::from_le_bytes(prefix.try_into().unwrap()) as usize;
+        if length < 2 {
+            return Err(protocol_trunc(index));
+        }
+        start
+            .checked_add(length)
+            .filter(|&end| end <= row.len())
+            .ok_or_else(|| protocol_trunc(index))
     }
 
     pub(crate) fn parse_field_into(
@@ -780,9 +817,7 @@ impl DbosTupleDesc {
                 let text = self.char_varchar_encoding.decode(s).map_err(|error| {
                     NzError::Protocol(format!("invalid UTF-8 field {i}: {error}"))
                 })?;
-                let target = string_value_slot(out, StringValueKind::Text);
-                target.clear();
-                target.push_str(text.trim_end_matches(' '));
+                *out = StringValueKind::Text.value(text.trim_end_matches(' '));
             }
             nz_type::NZ_TYPE_NCHAR | nz_type::NZ_TYPE_NVARCHAR => {
                 if off + 2 > row.len() {
@@ -794,9 +829,7 @@ impl DbosTupleDesc {
                 }
                 let text = std::str::from_utf8(slice_of(row, off + 2, cursize as usize))
                     .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
-                let target = string_value_slot(out, StringValueKind::Text);
-                target.clear();
-                target.push_str(text.trim_end_matches('\0'));
+                *out = StringValueKind::Text.value(text.trim_end_matches('\0'));
             }
             nz_type::NZ_TYPE_VARCHAR | nz_type::NZ_TYPE_VAR_FIXED_CHAR => {
                 if off + 2 > row.len() {
@@ -812,9 +845,7 @@ impl DbosTupleDesc {
                     .map_err(|error| {
                         NzError::Protocol(format!("invalid UTF-8 field {i}: {error}"))
                     })?;
-                let target = string_value_slot(out, StringValueKind::Text);
-                target.clear();
-                target.push_str(&text);
+                *out = StringValueKind::Text.value(text);
             }
             nz_type::NZ_TYPE_JSON | nz_type::NZ_TYPE_JSONPATH => {
                 if off + 2 > row.len() {
@@ -826,9 +857,7 @@ impl DbosTupleDesc {
                 }
                 let text = std::str::from_utf8(slice_of(row, off + 2, cursize as usize))
                     .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field {i}: {e}")))?;
-                let target = string_value_slot(out, StringValueKind::Text);
-                target.clear();
-                target.push_str(text);
+                *out = StringValueKind::Text.value(text);
             }
             nz_type::NZ_TYPE_INT8 => {
                 if off + 8 > row.len() {
@@ -871,30 +900,34 @@ impl DbosTupleDesc {
                     return Err(protocol_trunc(i));
                 }
                 let days = i32::from_le_bytes(row[off..off + 4].try_into().unwrap());
-                let target = string_value_slot(out, StringValueKind::Date);
-                datetime::date_from_4bytes_into(days, target);
+                let mut target = String::new();
+                datetime::date_from_4bytes_into(days, &mut target);
+                *out = StringValueKind::Date.value(target);
             }
             nz_type::NZ_TYPE_TIME => {
                 if off + 8 > row.len() {
                     return Err(protocol_trunc(i));
                 }
                 let micros = i64::from_le_bytes(row[off..off + 8].try_into().unwrap());
-                let target = string_value_slot(out, StringValueKind::Time);
-                datetime::time_from_8bytes_into(micros, target);
+                let mut target = String::new();
+                datetime::time_from_8bytes_into(micros, &mut target);
+                *out = StringValueKind::Time.value(target);
             }
             nz_type::NZ_TYPE_INTERVAL => {
                 if off + 12 > row.len() {
                     return Err(protocol_trunc(i));
                 }
-                let target = string_value_slot(out, StringValueKind::Interval);
-                datetime::interval_from_12bytes_into(&row[off..off + 12], target);
+                let mut target = String::new();
+                datetime::interval_from_12bytes_into(&row[off..off + 12], &mut target);
+                *out = StringValueKind::Interval.value(target);
             }
             nz_type::NZ_TYPE_TIME_TZ => {
                 if off.checked_add(fld_len).is_none_or(|end| end > row.len()) || fld_len < 12 {
                     return Err(protocol_trunc(i));
                 }
-                let target = string_value_slot(out, StringValueKind::Timetz);
-                datetime::timetz_from_bytes_into(&row[off..off + fld_len], fld_len, target);
+                let mut target = String::new();
+                datetime::timetz_from_bytes_into(&row[off..off + fld_len], fld_len, &mut target);
+                *out = StringValueKind::Timetz.value(target);
             }
             nz_type::NZ_TYPE_TIMESTAMP => {
                 if off + 8 > row.len() {
@@ -917,20 +950,13 @@ impl DbosTupleDesc {
                 let p = field_precision(self.field_size[i]);
                 let s = field_scale(self.field_size[i]);
                 let c = numeric_digit_count(self.field_true_size[i]);
-                // Move an existing exact-string buffer out of the row value so
-                // the decoder can reuse its capacity only on the fallback
-                // path. Decimal/float values never become `NzValue::Numeric`.
-                let previous = std::mem::replace(out, NzValue::Null);
-                let mut exact = match previous {
-                    NzValue::Numeric(value) => value,
-                    _ => String::new(),
-                };
+                let mut exact = String::new();
                 match get_cs_numeric_into(&row[off.min(row.len())..], p, s, c, &mut exact)
                     .map_err(NzError::Protocol)?
                 {
                     NumericDecodedInto::Number(n) => *out = NzValue::Float8(n),
                     NumericDecodedInto::Decimal(value) => *out = NzValue::Decimal(value),
-                    NumericDecodedInto::Exact => *out = NzValue::Numeric(exact),
+                    NumericDecodedInto::Exact => *out = NzValue::Numeric(exact.into()),
                 }
             }
             _ => {
@@ -1043,10 +1069,6 @@ mod tests {
         assert_eq!(vals[1], NzValue::Text("abcd".into()));
 
         let mut reused = vals;
-        let text_ptr = match &reused[1] {
-            NzValue::Text(text) => text.as_ptr(),
-            other => panic!("expected text value, got {other:?}"),
-        };
         let mut row2 = vec![0u8, 0, 0];
         row2.extend_from_slice(&43i32.to_le_bytes());
         row2.extend_from_slice(&6u16.to_le_bytes());
@@ -1054,10 +1076,6 @@ mod tests {
         desc.parse_row_into(&row2, &mut reused).unwrap();
         assert_eq!(reused[0], NzValue::Int4(43));
         assert_eq!(reused[1], NzValue::Text("efgh".into()));
-        match &reused[1] {
-            NzValue::Text(text) => assert_eq!(text.as_ptr(), text_ptr),
-            other => panic!("expected text value, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1237,12 +1255,18 @@ mod tests {
         let mut field_stage = false;
 
         assert!(descriptor
-            .parse_row_classified(&build(b"ok"), &mut out, &mut scratch, &mut field_stage)
+            .parse_row_classified(
+                &build(b"ok"),
+                &mut out,
+                &mut scratch,
+                &mut field_stage,
+                None
+            )
             .is_ok());
         // Invalid UTF-8 in a well-formed row: field-level.
         let bad = build(&[0xf3, 0xff]);
         assert!(descriptor
-            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage)
+            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage, None)
             .is_err());
         assert!(field_stage);
 
@@ -1257,7 +1281,7 @@ mod tests {
         descriptor_with_bad_later_field.field_fixed_size[0] = 0;
         descriptor_with_bad_later_field.field_offset[1] = 100;
         assert!(descriptor_with_bad_later_field
-            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage)
+            .parse_row_classified(&bad, &mut out, &mut scratch, &mut field_stage, None)
             .is_err());
         assert!(!field_stage);
 
@@ -1266,12 +1290,12 @@ mod tests {
         let at = 7;
         broken[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(descriptor
-            .parse_row_classified(&broken, &mut out, &mut scratch, &mut field_stage)
+            .parse_row_classified(&broken, &mut out, &mut scratch, &mut field_stage, None)
             .is_err());
         assert!(!field_stage);
         // Row too short for the null bitmap: layout-level.
         assert!(descriptor
-            .parse_row_classified(&[0], &mut out, &mut scratch, &mut field_stage)
+            .parse_row_classified(&[0], &mut out, &mut scratch, &mut field_stage, None)
             .is_err());
         assert!(!field_stage);
     }

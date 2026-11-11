@@ -307,8 +307,11 @@ The full encoding and type matrix is in [COMPATIBILITY.md](COMPATIBILITY.md).
 null, boolean, signed integer, floating-point, exact numeric, text, temporal
 and binary variants. NUMERIC values that fit the fixed-width
 `rust_decimal::Decimal` representation use `NzValue::Decimal`; wider Netezza
-values use the lossless `NzValue::Numeric(String)` fallback. Temporal values
-remain canonical owned strings.
+values use the lossless `NzValue::Numeric` fallback. Text, numeric-text and
+temporal variants hold `NzStr` (`Arc<str>`), so cloning a value or a row is an
+atomic increment rather than a copy. Within one result set, repeated cell
+values in the same column are decoded once and shared: `row.value_cache_stats()`
+reports hits, misses, insertions, rejected long keys and self-disabled columns.
 
 Rows can be read by ordinal or case-insensitive column name and extracted with
 the checked `FromSql` API:

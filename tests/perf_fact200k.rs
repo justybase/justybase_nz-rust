@@ -863,3 +863,142 @@ fn live_fact200k_time_and_allocations() {
         median(sbp)
     );
 }
+
+#[test]
+#[cfg(feature = "compat")]
+fn replay_fact200k_value_cache_dedupes_repeated_cells() {
+    if env::var("NZ_RUN_REPLAY_PERF").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set NZ_RUN_REPLAY_PERF=1 to run the replay value-cache check");
+        return;
+    }
+    let fixture = load_fixture(&default_fixture_path());
+    let port = start_replay_server(fixture.response.clone());
+    let config = NzConnectionConfig {
+        host: "127.0.0.1".into(),
+        port,
+        database: "JUST_DATA".into(),
+        user: "replay".into(),
+        password: "replay".into(),
+        ..Default::default()
+    };
+    let mut conn = NzConnection::connect(&config).expect("compat replay connect");
+    let result = conn.query(&fixture.query, &[]).expect("replay query");
+    let rows: usize = result.result_sets.iter().map(|set| set.rows.len()).sum();
+    assert_eq!(rows, fixture.expected_rows);
+    let stats = result
+        .result_sets
+        .iter()
+        .find_map(|set| set.rows.first())
+        .map(|row| row.value_cache_stats())
+        .expect("at least one row");
+    assert!(stats.hits > 0, "replay cache had no hits: {stats:?}");
+    assert!(
+        stats.insertions > 0,
+        "replay cache inserted nothing: {stats:?}"
+    );
+    assert!(
+        stats.entries > 0,
+        "replay cache retained no entries: {stats:?}"
+    );
+
+    let mut sink = SharingSink::default();
+    conn.execute_stream(&fixture.query, &[], &mut sink)
+        .expect("replay stream");
+    assert_eq!(sink.rows, fixture.expected_rows);
+    assert!(sink.shared > 0, "streamed text values were never shared");
+}
+
+#[cfg(feature = "compat")]
+#[derive(Default)]
+struct SharingSink {
+    seen: Vec<std::collections::HashMap<String, Arc<str>>>,
+    shared: usize,
+    rows: usize,
+}
+
+#[cfg(feature = "compat")]
+impl QueryStreamSink for SharingSink {
+    fn on_columns(
+        &mut self,
+        _: usize,
+        columns: &[nz_rust::ColumnDesc],
+        _: Option<&[bool]>,
+    ) -> nz_rust::NzResult<()> {
+        self.seen = (0..columns.len()).map(|_| Default::default()).collect();
+        Ok(())
+    }
+
+    fn on_row(&mut self, _: usize, _: nz_rust::Row) -> nz_rust::NzResult<()> {
+        Ok(())
+    }
+
+    fn on_values(
+        &mut self,
+        _: usize,
+        _: &[nz_rust::ColumnDesc],
+        values: &[NzValue],
+    ) -> nz_rust::NzResult<()> {
+        self.rows += 1;
+        for (index, value) in values.iter().enumerate() {
+            if let NzValue::Text(text) = value {
+                if let Some(previous) = self
+                    .seen
+                    .get(index)
+                    .and_then(|seen| seen.get(text.as_ref()))
+                {
+                    assert!(Arc::ptr_eq(previous, text), "streamed text was reallocated");
+                    self.shared += 1;
+                } else {
+                    self.seen[index].insert(text.to_string(), text.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+#[cfg(feature = "compat")]
+fn replay_events50k_value_cache_shares_status() {
+    if env::var("NZ_RUN_REPLAY_PERF").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set NZ_RUN_REPLAY_PERF=1 to run the events replay check");
+        return;
+    }
+    let fixture = load_fixture("tests/fixtures/replay/events50k.nzreplay.gz");
+    assert_eq!(fixture.expected_rows, 50_000);
+    assert_eq!(fixture.expected_columns, 9);
+
+    let port = start_replay_server(fixture.response.clone());
+    let config = NzConnectionConfig {
+        host: "127.0.0.1".into(),
+        port,
+        database: "JUST_DATA".into(),
+        user: "replay".into(),
+        password: "replay".into(),
+        ..Default::default()
+    };
+    let mut conn = NzConnection::connect(&config).expect("compat replay connect");
+    let result = conn.query(&fixture.query, &[]).expect("replay query");
+    let set = result.result_sets.first().expect("result set");
+    assert_eq!(set.rows.len(), fixture.expected_rows);
+
+    let mut status: std::collections::HashMap<String, Arc<str>> = Default::default();
+    let mut shared = 0usize;
+    for row in &set.rows {
+        let values = row.try_values().expect("row values");
+        if let NzValue::Text(text) = &values[6] {
+            if let Some(previous) = status.get(text.as_ref()) {
+                assert!(Arc::ptr_eq(previous, text), "STATUS text was reallocated");
+                shared += 1;
+            } else {
+                status.insert(text.to_string(), text.clone());
+            }
+        }
+    }
+    assert!(status.len() > 1, "STATUS should have multiple values");
+    assert!(shared > 40_000, "STATUS values were not shared: {shared}");
+
+    let stats = set.rows[0].value_cache_stats();
+    assert!(stats.hits > 40_000, "cache hits: {stats:?}");
+    assert!(stats.insertions > 0, "cache insertions: {stats:?}");
+}

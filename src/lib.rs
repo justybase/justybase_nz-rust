@@ -113,6 +113,7 @@ mod reader;
 pub mod tuple_desc;
 /// Value, temporal and numeric types returned by the driver.
 pub mod types;
+mod value_cache;
 
 #[cfg(feature = "compat")]
 pub use async_pool::{AsyncNzPool, AsyncNzPoolConfig, AsyncPooledConnection};
@@ -154,6 +155,7 @@ pub use tuple_desc::{ColumnDesc, DbosTupleDesc};
 #[cfg(feature = "chrono")]
 pub use types::value::NzTimeTz;
 pub use types::value::{FromSql, FromSqlRaw, NzValue, RawValue, ToSql};
+pub use value_cache::ValueCacheStats;
 
 /// Netezza client type identifiers sent during the handshake.
 ///

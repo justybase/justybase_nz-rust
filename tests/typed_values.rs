@@ -1,4 +1,6 @@
-use nz_rust::{Decimal, FromSql, NzTimestamp, NzValue};
+#[cfg(feature = "chrono")]
+use nz_rust::NzTimestamp;
+use nz_rust::{Decimal, FromSql, NzValue};
 
 #[test]
 fn decimal_extraction_preserves_scale_and_rejects_out_of_range_numeric() {

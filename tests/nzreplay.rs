@@ -30,6 +30,16 @@ fn fact200k_fixture_matches_manifest() {
 }
 
 #[test]
+fn events50k_fixture_matches_manifest() {
+    let fixture = load_shipped("events50k");
+    assert_eq!(fixture.expected_rows, 50_000);
+    assert_eq!(fixture.expected_columns, 9);
+    assert!(fixture.query.contains("PERF.EVENTS_400K"));
+    assert!(fixture.segments.len() >= 2);
+    assert!(fixture.last_response().len() > 1_000_000);
+}
+
+#[test]
 fn rejects_bad_magic_and_trailing_bytes() {
     let bad_magic = [0u8; 4];
     let error = NzReplayFixture::parse(&bad_magic).unwrap_err();

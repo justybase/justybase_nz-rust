@@ -55,6 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 
+use crate::value_cache::{ValueCacheStats, ValueCaches};
+
 // ---------------------------------------------------------------------------
 // Virtual import sources (external-table `l` import)
 // ---------------------------------------------------------------------------
@@ -176,6 +178,7 @@ fn values_heap_bytes(value: &NzValue) -> usize {
 pub(crate) struct RowMetadata {
     columns: Arc<[ColumnDesc]>,
     name_index: OnceLock<hashbrown::HashMap<AsciiColumnName, usize>>,
+    value_caches: ValueCaches,
 }
 
 #[derive(Debug)]
@@ -211,10 +214,16 @@ impl hashbrown::Equivalent<AsciiColumnName> for ColumnNameLookup<'_> {
 
 impl RowMetadata {
     pub(crate) fn new(columns: Arc<[ColumnDesc]>) -> Self {
+        let value_caches = ValueCaches::new(&columns);
         Self {
             columns,
             name_index: OnceLock::new(),
+            value_caches,
         }
+    }
+
+    pub(crate) fn value_caches(&self) -> &ValueCaches {
+        &self.value_caches
     }
 
     fn position(&self, name: &str) -> Option<usize> {
@@ -589,7 +598,8 @@ struct RowLayoutProgress {
 }
 
 impl RawRowData {
-    fn value(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<&NzValue> {
+    fn value(&self, index: usize, metadata: &RowMetadata) -> NzResult<&NzValue> {
+        let columns = &metadata.columns;
         if let Some(values) = self.decoded.get() {
             return values
                 .get(index)
@@ -602,7 +612,7 @@ impl RawRowData {
             .get(index)
             .ok_or_else(|| NzError::Config("row index out of range".into()))?;
         if cell.get().is_none() {
-            let value = self.decode_value(index, columns).map_err(|error| {
+            let value = self.decode_value(index, metadata).map_err(|error| {
                 NzError::Protocol(format!(
                     "cannot decode column {index} (type {}): {error}",
                     columns[index].type_oid
@@ -785,7 +795,8 @@ impl RawRowData {
         Ok(())
     }
 
-    fn decode_value(&self, index: usize, columns: &[ColumnDesc]) -> NzResult<NzValue> {
+    fn decode_value(&self, index: usize, metadata: &RowMetadata) -> NzResult<NzValue> {
+        let columns = &metadata.columns;
         match &self.kind {
             RawRowKind::Text => {
                 let span = self.text_span(index, columns)?;
@@ -793,26 +804,35 @@ impl RawRowData {
                     return Ok(NzValue::Null);
                 }
                 let bytes = &self.payload[span.start..span.end];
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
                 let column = columns.get(index).ok_or_else(|| {
                     NzError::Protocol("text row has more fields than its description".into())
                 })?;
-                crate::types::text::try_parse_text_value(text, column.type_oid, column.type_mod)
+                metadata.value_caches.get_or_decode(index, bytes, || {
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
+                    crate::types::text::try_parse_text_value(text, column.type_oid, column.type_mod)
+                })
             }
             RawRowKind::Dbos { descriptor } => {
                 let field = self.dbos_span(index, descriptor)?;
                 if field.is_null {
                     return Ok(NzValue::Null);
                 }
-                let mut value = NzValue::Null;
-                descriptor.parse_field_into(&self.payload, field.start, index, &mut value)?;
-                Ok(value)
+                let key = self
+                    .payload
+                    .get(field.start..field.end)
+                    .ok_or_else(|| NzError::Protocol("DBOS field span is out of bounds".into()))?;
+                metadata.value_caches.get_or_decode(index, key, || {
+                    let mut value = NzValue::Null;
+                    descriptor.parse_field_into(&self.payload, field.start, index, &mut value)?;
+                    Ok(value)
+                })
             }
         }
     }
 
-    fn decode_all(&self, columns: &[ColumnDesc]) -> NzResult<Vec<NzValue>> {
+    fn decode_all(&self, metadata: &RowMetadata) -> NzResult<Vec<NzValue>> {
+        let columns = &metadata.columns;
         match &self.kind {
             RawRowKind::Text => {
                 let mut progress = self
@@ -831,13 +851,16 @@ impl RawRowData {
                             return Ok(NzValue::Null);
                         }
                         let bytes = &self.payload[span.start..span.end];
-                        let text = std::str::from_utf8(bytes)
-                            .map_err(|e| NzError::Protocol(format!("invalid UTF-8 field: {e}")))?;
-                        crate::types::text::try_parse_text_value(
-                            text,
-                            column.type_oid,
-                            column.type_mod,
-                        )
+                        metadata.value_caches.get_or_decode(index, bytes, || {
+                            let text = std::str::from_utf8(bytes).map_err(|e| {
+                                NzError::Protocol(format!("invalid UTF-8 field: {e}"))
+                            })?;
+                            crate::types::text::try_parse_text_value(
+                                text,
+                                column.type_oid,
+                                column.type_mod,
+                            )
+                        })
                     })
                     .collect()
             }
@@ -860,16 +883,24 @@ impl RawRowData {
                         if descriptor.is_field_null(&self.payload, index) {
                             return Ok(NzValue::Null);
                         }
-                        let start = if descriptor.field_fixed_size[index] != 0 {
-                            usize::try_from(descriptor.field_offset[index]).map_err(|_| {
-                                NzError::Protocol(format!(
-                                    "DBOS fixed field {index} has an invalid offset"
-                                ))
-                            })?
+                        let (start, end) = if descriptor.field_fixed_size[index] != 0 {
+                            let start =
+                                usize::try_from(descriptor.field_offset[index]).map_err(|_| {
+                                    NzError::Protocol(format!(
+                                        "DBOS fixed field {index} has an invalid offset"
+                                    ))
+                                })?;
+                            let width = descriptor.fixed_width(index)?;
+                            (start, start + width)
                         } else if varying_count == 0 {
-                            usize::try_from(descriptor.fixed_fields_size).map_err(|_| {
-                                NzError::Protocol("DBOS fixed-field area offset is invalid".into())
-                            })?
+                            let start =
+                                usize::try_from(descriptor.fixed_fields_size).map_err(|_| {
+                                    NzError::Protocol(
+                                        "DBOS fixed-field area offset is invalid".into(),
+                                    )
+                                })?;
+                            let width = descriptor.fixed_width(index)?;
+                            (start, start + width)
                         } else {
                             let varying_index = usize::try_from(descriptor.field_offset[index])
                                 .map_err(|_| {
@@ -877,17 +908,20 @@ impl RawRowData {
                                         "DBOS varying field {index} has an invalid index"
                                     ))
                                 })?;
-                            progress
-                                .spans
-                                .get(varying_index)
-                                .map(|span| (span >> 32) as u32 as usize)
-                                .ok_or_else(|| {
+                            let span =
+                                progress.spans.get(varying_index).copied().ok_or_else(|| {
                                     NzError::Protocol("DBOS row layout was not discovered".into())
-                                })?
+                                })?;
+                            ((span >> 32) as u32 as usize, span as u32 as usize)
                         };
-                        let mut value = NzValue::Null;
-                        descriptor.parse_field_into(&self.payload, start, index, &mut value)?;
-                        Ok(value)
+                        let key = self.payload.get(start..end).ok_or_else(|| {
+                            NzError::Protocol("DBOS field span is out of bounds".into())
+                        })?;
+                        metadata.value_caches.get_or_decode(index, key, || {
+                            let mut value = NzValue::Null;
+                            descriptor.parse_field_into(&self.payload, start, index, &mut value)?;
+                            Ok(value)
+                        })
                     })
                     .collect()
             }
@@ -1213,7 +1247,7 @@ impl Row {
             RowStorage::Values { values, .. } => Ok(values),
             RowStorage::Raw(raw) => {
                 if raw.decoded.get().is_none() {
-                    let values = raw.decode_all(self.columns())?;
+                    let values = raw.decode_all(&self.metadata)?;
                     let _ = raw.decoded.set(values);
                 }
                 Ok(raw.decoded.get().expect("row initialized above"))
@@ -1226,6 +1260,14 @@ impl Row {
                 Err(NzError::Config("row belongs to an incomplete batch".into()))
             }
         }
+    }
+
+    /// Per-result-set value-cache counters.
+    ///
+    /// All rows in one result set share the same cache, so the snapshot is
+    /// stable no matter which row is used to read it.
+    pub fn value_cache_stats(&self) -> ValueCacheStats {
+        self.metadata.value_caches.stats()
     }
 
     /// Raw value by ordinal or name. Panics when out of range / unknown —
@@ -1246,7 +1288,7 @@ impl Row {
                 RowStorage::Values { values, .. } => values
                     .get(p)
                     .ok_or_else(|| NzError::Config("row values do not match columns".into())),
-                RowStorage::Raw(raw) => raw.value(p, self.columns()),
+                RowStorage::Raw(raw) => raw.value(p, &self.metadata),
                 RowStorage::Arena(arena) => arena
                     .arena
                     .values(arena.values_start, arena.values_len)
@@ -2437,6 +2479,9 @@ impl NzConnection {
         let mut current_result_set_index = None;
         let mut stream_values: Vec<NzValue> = Vec::new();
         let mut stream_var_starts: Vec<usize> = Vec::new();
+        // Per-result-set value cache for the streaming sink path; reset with
+        // every new result set so keys never cross column layouts.
+        let mut stream_caches: Option<ValueCaches> = None;
         let mut row_columns: Option<Arc<[ColumnDesc]>> = None;
         let mut row_metadata: Option<Arc<RowMetadata>> = None;
         let mut error: Option<NzError> = None;
@@ -2487,12 +2532,19 @@ impl NzConnection {
                         // the DBOS row length governs the frame.
                         self.skip_frame_header()?;
                         if sink.is_some() {
+                            let caches = stream_caches.get_or_insert_with(|| {
+                                let columns = cached_columns
+                                    .clone()
+                                    .unwrap_or_else(|| tupdesc.to_column_descs());
+                                ValueCaches::new(&columns)
+                            });
                             if matches!(
                                 self.read_dbos_tuple_into(
                                     &tupdesc,
                                     has_tupdesc,
                                     &mut stream_values,
                                     &mut stream_var_starts,
+                                    Some(caches),
                                 )?,
                                 DbosRead::Skipped
                             ) {
@@ -2527,6 +2579,7 @@ impl NzConnection {
                                     &tupdesc,
                                     has_tupdesc,
                                     &mut stream_values,
+                                    stream_caches.as_ref(),
                                 )? {
                                     DbosRead::NotAvailable => break,
                                     DbosRead::Skipped => continue,
@@ -2559,6 +2612,9 @@ impl NzConnection {
                             let descriptor = shared_tupdesc.clone().ok_or_else(|| {
                                 NzError::Protocol("DBOS row descriptor is missing".into())
                             })?;
+                            let metadata = row_metadata
+                                .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
+                                .clone();
                             let mut values =
                                 Vec::with_capacity(columns.len().max(tupdesc.num_fields));
                             let mut var_starts = std::mem::take(&mut self.row_var_starts_scratch);
@@ -2567,16 +2623,14 @@ impl NzConnection {
                                 has_tupdesc,
                                 &mut values,
                                 &mut var_starts,
+                                Some(metadata.value_caches()),
                             );
                             self.row_var_starts_scratch = var_starts;
                             if matches!(first?, DbosRead::Skipped) {
                                 continue;
                             }
-                            let metadata = row_metadata
-                                .get_or_insert_with(|| Arc::new(RowMetadata::new(columns.clone())))
-                                .clone();
                             let row = Row::from_shared_dbos_metadata(
-                                metadata,
+                                metadata.clone(),
                                 values,
                                 descriptor.clone(),
                             );
@@ -2594,6 +2648,7 @@ impl NzConnection {
                                     descriptor.as_ref(),
                                     has_tupdesc,
                                     &mut values,
+                                    Some(metadata.value_caches()),
                                 )? {
                                     DbosRead::NotAvailable => break,
                                     DbosRead::Skipped => continue,
@@ -2647,6 +2702,7 @@ impl NzConnection {
                                 &mut sink_error,
                             );
                             cancel_if_sink_aborted!(new_sink_error);
+                            stream_caches = None;
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
                             row_metadata = None;
@@ -2670,6 +2726,7 @@ impl NzConnection {
                                 &mut current_result_set_index,
                                 &mut sink_error,
                             );
+                            stream_caches = None;
                         } else {
                             flush_current(&mut current, &mut sets, &mut row_columns);
                         }
@@ -2727,6 +2784,7 @@ impl NzConnection {
                                 &mut sink_error,
                             );
                             cancel_if_sink_aborted!(new_sink_error);
+                            stream_caches = None;
                             let _ = ensure_stream_result_set(
                                 &mut stream_result_sets,
                                 &mut stream_columns_sent,
@@ -3033,6 +3091,7 @@ impl NzConnection {
         has_tupdesc: bool,
         values: &mut Vec<NzValue>,
         var_starts: &mut Vec<usize>,
+        cache: Option<&ValueCaches>,
     ) -> NzResult<DbosRead> {
         if !has_tupdesc {
             return Err(NzError::Protocol(
@@ -3052,7 +3111,8 @@ impl NzConnection {
             let row_len = validate_protocol_length(row_len, "rowStandardPayload", false)?;
             let payload = buf.peek_bytes(&mut guard, row_len as usize)?;
             let mut field_stage = false;
-            match tupdesc.parse_row_classified(payload, values, var_starts, &mut field_stage) {
+            match tupdesc.parse_row_classified(payload, values, var_starts, &mut field_stage, cache)
+            {
                 Ok(()) => {
                     buf.advance(row_len as usize);
                     Ok(DbosRead::Row)
@@ -3082,6 +3142,7 @@ impl NzConnection {
         tupdesc: &DbosTupleDesc,
         has_tupdesc: bool,
         values: &mut Vec<NzValue>,
+        cache: Option<&ValueCaches>,
     ) -> NzResult<DbosRead> {
         if !has_tupdesc {
             return Err(NzError::Protocol(
@@ -3113,6 +3174,7 @@ impl NzConnection {
             values,
             &mut var_starts,
             &mut field_stage,
+            cache,
         );
         self.row_var_starts_scratch = var_starts;
         match result {
@@ -4187,18 +4249,18 @@ mod tests {
 
         let mut values = Vec::new();
         assert!(matches!(
-            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values, None),
             Ok(DbosRead::Row)
         ));
         assert_eq!(values, vec![NzValue::Int4(7)]);
         values.clear();
         assert!(matches!(
-            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values, None),
             Ok(DbosRead::Row)
         ));
         assert_eq!(values, vec![NzValue::Int4(8)]);
         assert!(matches!(
-            connection.try_read_available_dbos_row(&tupdesc, true, &mut values),
+            connection.try_read_available_dbos_row(&tupdesc, true, &mut values, None),
             Ok(DbosRead::NotAvailable)
         ));
         assert_eq!(connection.buffer.slice()[0], code::COMMAND_COMPLETE);
@@ -4352,6 +4414,46 @@ mod tests {
             Some(&42i32.to_le_bytes()[..])
         );
         assert_eq!(row.try_values().unwrap(), &[NzValue::Int4(42)]);
+    }
+
+    #[test]
+    fn repeated_dbos_text_values_share_the_same_arc() {
+        let descriptor = Arc::new(DbosTupleDesc {
+            num_fields: 1,
+            num_fixed_fields: 0,
+            num_varying_fields: 1,
+            fixed_fields_size: 2,
+            field_type: vec![crate::messages::nz_type::NZ_TYPE_VARCHAR],
+            field_size: vec![64],
+            field_true_size: vec![64],
+            field_offset: vec![0],
+            field_fixed_size: vec![0],
+            field_null_byte_offset: vec![0],
+            field_null_bit_mask: vec![0],
+            ..Default::default()
+        });
+        let text = b"repeat";
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&((text.len() + 2) as u16).to_le_bytes());
+        payload.extend_from_slice(text);
+        let metadata = Arc::new(RowMetadata::new(Arc::from(descriptor.to_column_descs())));
+        let first =
+            Row::from_dbos_raw_with_metadata(metadata.clone(), payload.clone(), descriptor.clone())
+                .unwrap();
+        let second =
+            Row::from_dbos_raw_with_metadata(metadata.clone(), payload, descriptor).unwrap();
+
+        let first_value = &first.try_values().unwrap()[0];
+        let second_value = &second.try_values().unwrap()[0];
+        match (first_value, second_value) {
+            (NzValue::Text(left), NzValue::Text(right)) => {
+                assert!(Arc::ptr_eq(left, right), "repeated text was reallocated");
+            }
+            other => panic!("expected text values, got {other:?}"),
+        }
+        let stats = first.value_cache_stats();
+        assert!(stats.hits > 0, "no cache hits: {stats:?}");
+        assert!(stats.insertions > 0, "no cache insertions: {stats:?}");
     }
 
     #[test]

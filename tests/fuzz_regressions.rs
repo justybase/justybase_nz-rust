@@ -79,7 +79,13 @@ fn sql_lexer(data: &[u8]) {
     let values = [
         NzValue::Null,
         NzValue::Int4(-7),
-        NzValue::Text(sql.chars().rev().take(MAX_TEXT_CHARS).collect()),
+        NzValue::Text(
+            sql.chars()
+                .rev()
+                .take(MAX_TEXT_CHARS)
+                .collect::<String>()
+                .into(),
+        ),
         NzValue::Text("it's \\ \"q\" ; -- /* $$".into()),
         NzValue::Bool(true),
     ];

@@ -1928,6 +1928,7 @@ impl AsyncSession {
                             slots,
                             &mut dbos_varying_scratch,
                             &mut field_stage,
+                            Some(row_metadata.value_caches()),
                         );
                         match parse_result {
                             Ok(()) => Row::from_pending_values(
@@ -1955,6 +1956,7 @@ impl AsyncSession {
                                 &mut values,
                                 &mut dbos_varying_scratch,
                                 &mut field_stage,
+                                Some(row_metadata.value_caches()),
                             ) {
                                 Ok(()) => Row::from_shared_dbos_metadata(
                                     row_metadata,
@@ -3147,7 +3149,7 @@ mod tests {
                 type_mod: -1,
                 format: 0,
             }],
-            vec![NzValue::Text("x".repeat(STREAM_BATCH_BYTES + 1))],
+            vec![NzValue::Text("x".repeat(STREAM_BATCH_BYTES + 1).into())],
         );
 
         events.push_row(&mut pending, row).await.unwrap();
@@ -3214,7 +3216,7 @@ mod tests {
                 type_mod: -1,
                 format: 0,
             }],
-            vec![NzValue::Text("x".repeat(BATCH_BYTES + 1))],
+            vec![NzValue::Text("x".repeat(BATCH_BYTES + 1).into())],
         );
         let mut pending = BatchAccumulator::new();
         push_stream_batch(&batches, &mut pending, row)

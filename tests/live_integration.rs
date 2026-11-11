@@ -52,6 +52,35 @@ fn unique(suffix: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires live Netezza appliance with JUST_DATA benchmark tables"]
+fn value_cache_dedupes_events_400k_and_fact_product_inventory() {
+    const QUERIES: [&str; 2] = [
+        "SELECT T1.EVENT_ID, T1.CUSTOMER_ID, T1.EVENT_TS, T1.AMOUNT, T1.TAX, \
+         T1.QUANTITY, T1.STATUS, T1.SKU, T1.NOTE \
+         FROM JUST_DATA.PERF.EVENTS_400K T1",
+        "SELECT T1.PRODUCTKEY, T1.DATEKEY, T1.MOVEMENTDATE, T1.UNITCOST, \
+         T1.UNITSIN, T1.UNITSOUT, T1.UNITSBALANCE \
+         FROM JUST_DATA.ADMIN.FACTPRODUCTINVENTORY T1",
+    ];
+    let mut conn = live_conn();
+    for sql in QUERIES {
+        let result = conn.query(sql, &[]).expect("query");
+        let rows: usize = result.result_sets.iter().map(|set| set.rows.len()).sum();
+        assert!(rows > 0, "query returned no rows: {sql}");
+        let stats = result
+            .result_sets
+            .iter()
+            .find_map(|set| set.rows.first())
+            .map(|row| row.value_cache_stats())
+            .expect("at least one row");
+        assert!(
+            stats.hits > 0,
+            "value cache had no hits for {sql}: {stats:?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires live Netezza appliance"]
 fn connection_open_and_close() {
     let mut conn = live_conn();

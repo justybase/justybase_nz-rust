@@ -83,7 +83,7 @@ pub fn try_parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> crate::N
             parse_text_value(raw, type_oid, type_mod)
         }
         // Preserve the exact wire text; typed temporal getters validate it.
-        1083 => NzValue::Time(raw.trim().to_owned()),
+        1083 => NzValue::Time(raw.trim().to_owned().into()),
         1114 | 1184 | 702 => {
             return NzTimestamp::from_text(raw)
                 .map(NzValue::Timestamp)
@@ -99,40 +99,40 @@ pub fn parse_text_value(raw: &str, type_oid: i32, type_mod: i32) -> NzValue {
         16 => NzValue::Bool(parse_bool_text(raw)),
         21 | 2500 => match raw.trim().parse::<i16>() {
             Ok(v) => NzValue::Int2(v),
-            Err(_) => NzValue::Text(raw.to_string()),
+            Err(_) => NzValue::Text(raw.to_string().into()),
         },
         23 | 26 | 28 => match raw.trim().parse::<i32>() {
             Ok(v) => NzValue::Int4(v),
-            Err(_) => NzValue::Text(raw.to_string()),
+            Err(_) => NzValue::Text(raw.to_string().into()),
         },
         20 => match raw.trim().parse::<i64>() {
             Ok(v) => NzValue::Int8(v),
-            Err(_) => NzValue::Numeric(raw.trim().to_string()),
+            Err(_) => NzValue::Numeric(raw.trim().to_string().into()),
         },
         700 => match raw.trim().parse::<f32>() {
             Ok(v) => NzValue::Float4(v),
-            Err(_) => NzValue::Text(raw.to_string()),
+            Err(_) => NzValue::Text(raw.to_string().into()),
         },
         701 => match raw.trim().parse::<f64>() {
             Ok(v) if v.is_finite() => NzValue::Float8(v),
-            _ => NzValue::Text(raw.to_string()),
+            _ => NzValue::Text(raw.to_string().into()),
         },
         1700 => match parse_numeric_text(raw, type_mod) {
             NumericDecoded::Number(n) => NzValue::Float8(n),
             NumericDecoded::Decimal(value) => NzValue::Decimal(value),
-            NumericDecoded::Exact(s) => NzValue::Numeric(s),
+            NumericDecoded::Exact(s) => NzValue::Numeric(s.into()),
         },
-        1082 => NzValue::Date(raw.trim().to_string()),
-        1083 => NzValue::Time(normalize_time_text(raw)),
+        1082 => NzValue::Date(raw.trim().to_string().into()),
+        1083 => NzValue::Time(normalize_time_text(raw).into()),
         1114 | 1184 | 702 => match NzTimestamp::from_text(raw) {
             Ok(value) => NzValue::Timestamp(value),
-            Err(_) => NzValue::Text(raw.to_string()),
+            Err(_) => NzValue::Text(raw.to_string().into()),
         },
-        1266 => NzValue::Timetz(raw.trim().to_string()),
-        1186 => NzValue::Interval(raw.trim().to_string()),
+        1266 => NzValue::Timetz(raw.trim().to_string().into()),
+        1186 => NzValue::Interval(raw.trim().to_string().into()),
         17 => NzValue::Bytea(decode_bytea_text(raw)),
         2568 | 2569 => NzValue::Bytea(decode_varbinary_text(raw)),
-        _ => NzValue::Text(raw.to_string()),
+        _ => NzValue::Text(raw.to_string().into()),
     }
 }
 
@@ -452,7 +452,7 @@ mod tests {
         payload.extend_from_slice(&4i32.to_be_bytes());
         assert_eq!(
             parse_text_data_row(&payload, &cols).unwrap(),
-            vec![NzValue::Text(String::new())]
+            vec![NzValue::Text(String::new().into())]
         );
     }
 

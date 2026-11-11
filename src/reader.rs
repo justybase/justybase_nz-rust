@@ -716,7 +716,7 @@ impl NzDataReader {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Interval(s) => Ok(Some(s.clone())),
+            | NzValue::Interval(s) => Ok(Some(s.to_string())),
             NzValue::Timestamp(value) => Ok(Some(value.to_string())),
             NzValue::Decimal(value) => Ok(Some(value.to_string())),
             NzValue::Bool(b) => Ok(Some(b.to_string())),

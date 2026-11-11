@@ -24,8 +24,14 @@ use crate::error::{NzError, NzResult};
 #[cfg(feature = "chrono")]
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
+use std::sync::Arc;
 
 use crate::types::temporal::NzTimestamp;
+
+/// Reference-counted, immutable text used by string-backed [`NzValue`]
+/// variants. Cloning an `NzStr` is a refcount bump, never a heap allocation,
+/// which lets the per-result value cache return repeated strings for free.
+pub type NzStr = Arc<str>;
 
 /// A Netezza `TIMETZ` value without inventing a calendar date.
 #[cfg(feature = "chrono")]
@@ -55,31 +61,29 @@ pub enum NzValue {
     /// IEEE 754 double precision (DOUBLE / FLOAT8).
     Float8(f64),
     /// NUMERIC — exact decimal text, precision-preserving (may exceed f64).
-    Numeric(String),
+    Numeric(NzStr),
     /// NUMERIC represented as an exact fixed-point decimal when its 96-bit
     /// coefficient and scale fit `rust_decimal`; scale/trailing zeroes are
     /// preserved without storing the value as a heap-allocated string.
     Decimal(Decimal),
     /// CHAR / VARCHAR / NCHAR / NVARCHAR and all other textual types.
-    Text(String),
+    Text(NzStr),
     /// DATE as `YYYY-MM-DD`.
-    Date(String),
+    Date(NzStr),
     /// TIME as `HH:MM:SS[.ffffff]`.
-    Time(String),
+    Time(NzStr),
     /// TIMETZ as `HH:MM:SS[.ffffff]±HH[:MM[:SS]]`.
-    Timetz(String),
+    Timetz(NzStr),
     /// TIMESTAMP as microseconds since 2000-01-01, without formatting or a
     /// heap-allocated string.
     Timestamp(NzTimestamp),
     /// INTERVAL in Netezza text form.
-    Interval(String),
+    Interval(NzStr),
     /// BYTEA / binary payloads.
     Bytea(Vec<u8>),
 }
 
-/// String-backed value variant used by the protocol decoders to retain the
-/// allocation for a column while rows are streamed. This is crate-private so
-/// the public value model stays a simple enum.
+/// String-backed value variant produced by the protocol decoders.
 #[derive(Clone, Copy)]
 pub(crate) enum StringValueKind {
     Text,
@@ -90,38 +94,16 @@ pub(crate) enum StringValueKind {
 }
 
 impl StringValueKind {
-    fn empty(self) -> NzValue {
+    /// Wrap `text` in the matching [`NzValue`] variant.
+    pub(crate) fn value(self, text: impl Into<NzStr>) -> NzValue {
+        let text = text.into();
         match self {
-            Self::Text => NzValue::Text(String::new()),
-            Self::Date => NzValue::Date(String::with_capacity(10)),
-            Self::Time => NzValue::Time(String::with_capacity(15)),
-            Self::Timetz => NzValue::Timetz(String::with_capacity(24)),
-            Self::Interval => NzValue::Interval(String::new()),
+            Self::Text => NzValue::Text(text),
+            Self::Date => NzValue::Date(text),
+            Self::Time => NzValue::Time(text),
+            Self::Timetz => NzValue::Timetz(text),
+            Self::Interval => NzValue::Interval(text),
         }
-    }
-}
-
-/// Return the reusable string buffer for `kind`, changing the enum variant
-/// only when the column's logical value kind changed.
-pub(crate) fn string_value_slot(value: &mut NzValue, kind: StringValueKind) -> &mut String {
-    let matches_kind = matches!(
-        (kind, &*value),
-        (StringValueKind::Text, NzValue::Text(_))
-            | (StringValueKind::Date, NzValue::Date(_))
-            | (StringValueKind::Time, NzValue::Time(_))
-            | (StringValueKind::Timetz, NzValue::Timetz(_))
-            | (StringValueKind::Interval, NzValue::Interval(_))
-    );
-    if !matches_kind {
-        *value = kind.empty();
-    }
-    match value {
-        NzValue::Text(text)
-        | NzValue::Date(text)
-        | NzValue::Time(text)
-        | NzValue::Timetz(text)
-        | NzValue::Interval(text) => text,
-        _ => unreachable!("string_value_slot installed the requested variant"),
     }
 }
 
@@ -141,7 +123,7 @@ impl NzValue {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Interval(s) => s.clone(),
+            | NzValue::Interval(s) => s.to_string(),
             NzValue::Timestamp(value) => value.to_string(),
             NzValue::Decimal(value) => value.to_string(),
             NzValue::Bytea(b) => {
@@ -166,7 +148,7 @@ impl NzValue {
             NzValue::Int8(v) => v.to_string(),
             NzValue::Float4(v) => fmt_f64(*v as f64),
             NzValue::Float8(v) => fmt_f64(*v),
-            NzValue::Numeric(s) | NzValue::Text(s) | NzValue::Interval(s) => s.clone(),
+            NzValue::Numeric(s) | NzValue::Text(s) | NzValue::Interval(s) => s.to_string(),
             NzValue::Decimal(value) => value.to_string(),
             NzValue::Date(s) => format!("{s}T00:00:00.000Z"),
             // Node Date has ms precision: drop sub-ms digits to match.
@@ -188,8 +170,8 @@ impl NzValue {
                 };
                 format!("{date_part}T{hms}.{ms}Z")
             }
-            NzValue::Time(s) => s.clone(),
-            NzValue::Timetz(s) => s.clone(),
+            NzValue::Time(s) => s.to_string(),
+            NzValue::Timetz(s) => s.to_string(),
             NzValue::Bytea(b) => {
                 let mut out = String::from("E'\\\\x");
                 push_hex(&mut out, b);
@@ -739,7 +721,7 @@ impl FromSql for String {
             | NzValue::Date(s)
             | NzValue::Time(s)
             | NzValue::Timetz(s)
-            | NzValue::Interval(s) => Ok(s.clone()),
+            | NzValue::Interval(s) => Ok(s.to_string()),
             NzValue::Timestamp(value) => Ok(value.to_string()),
             NzValue::Decimal(value) => Ok(value.to_string()),
             other => Err(unexpected(other, "text")),
@@ -1057,7 +1039,7 @@ impl ToSql for Vec<u8> {
 
 impl ToSql for String {
     fn to_nz_value(&self) -> NzValue {
-        NzValue::Text(self.clone())
+        NzValue::Text(self.as_str().into())
     }
 
     fn write_sql(&self, output: &mut String) -> Result<(), String> {
@@ -1227,7 +1209,7 @@ impl From<Decimal> for NzValue {
 }
 impl From<String> for NzValue {
     fn from(v: String) -> Self {
-        NzValue::Text(v)
+        NzValue::Text(v.into())
     }
 }
 impl From<&str> for NzValue {
@@ -1365,7 +1347,7 @@ mod tests {
 
         impl FromSql for LegacyMarker {
             fn from_sql(value: &NzValue) -> NzResult<Self> {
-                if matches!(value, NzValue::Text(text) if text == "legacy") {
+                if matches!(value, NzValue::Text(text) if text.as_ref() == "legacy") {
                     Ok(Self)
                 } else {
                     Err(NzError::Config("unexpected legacy test value".into()))

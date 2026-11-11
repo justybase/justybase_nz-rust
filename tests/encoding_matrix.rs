@@ -119,7 +119,7 @@ fn latin1_decoding_is_lossless_for_every_high_byte() {
     let bytes = row(&[0xF3, 0xE9, 0xBF, 0xB3], &bytes, "ó");
     let values = descriptor(CharEncoding::Latin1).parse_row(&bytes).unwrap();
     assert_eq!(values[1], NzValue::Text("óé¿³".into()));
-    assert_eq!(values[2], NzValue::Text(expected));
+    assert_eq!(values[2], NzValue::Text(expected.into()));
 }
 
 #[test]

@@ -170,7 +170,7 @@ impl<'a> FromSqlRaw<'a> for NzNumeric {
 }
 impl ToSql for NzNumeric {
     fn to_nz_value(&self) -> NzValue {
-        NzValue::Numeric(self.to_string())
+        NzValue::Numeric(self.to_string().into())
     }
 }
 #[cfg(test)]

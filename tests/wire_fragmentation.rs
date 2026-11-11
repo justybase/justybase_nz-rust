@@ -221,7 +221,7 @@ async fn native_stream_and_batches_decode_identically_under_fragmentation() {
                 let values = row.try_values().unwrap();
                 for (index, value) in values.iter().enumerate() {
                     if let NzValue::Text(text) = value {
-                        assert_eq!(&row.try_get::<_, String>(index).unwrap(), text);
+                        assert_eq!(row.try_get::<_, String>(index).unwrap(), text.to_string());
                     }
                 }
                 batched.push(values.to_vec());
@@ -238,7 +238,7 @@ async fn native_stream_and_batches_decode_identically_under_fragmentation() {
                 let values = row.try_values().unwrap();
                 for (index, value) in values.iter().enumerate() {
                     if let NzValue::Text(text) = value {
-                        assert_eq!(&row.try_get::<_, String>(index).unwrap(), text);
+                        assert_eq!(row.try_get::<_, String>(index).unwrap(), text.to_string());
                     }
                 }
                 batched.push(values.to_vec());

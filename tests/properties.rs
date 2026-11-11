@@ -81,7 +81,7 @@ fn text_literals_round_trip_and_never_escape_the_literal() {
     let mut seed = 0x5eed_1234_5678;
     for case in 0..4_000 {
         let value = random_text(&mut seed);
-        let rendered = escape_literal(&NzValue::Text(value.clone())).unwrap();
+        let rendered = escape_literal(&NzValue::Text(value.as_str().into())).unwrap();
         let (evaluated, used) = eval_literal(&rendered)
             .unwrap_or_else(|| panic!("case {case}: {value:?} -> {rendered}"));
         assert_eq!(evaluated, value, "case {case}: {rendered}");
@@ -104,7 +104,10 @@ fn parameter_values_are_never_rescanned_for_placeholders() {
         let (a, b) = (random_text(&mut seed), random_text(&mut seed));
         let sql = substitute_parameters(
             "SELECT $1, $2 /* $1 */ -- $2\n, '$1'",
-            &[NzValue::Text(a.clone()), NzValue::Text(b.clone())],
+            &[
+                NzValue::Text(a.as_str().into()),
+                NzValue::Text(b.as_str().into()),
+            ],
         )
         .unwrap();
         let rest = sql.strip_prefix("SELECT ").unwrap();

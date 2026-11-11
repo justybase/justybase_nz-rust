@@ -382,7 +382,7 @@ macro_rules! temporal_traits {
         }
         impl ToSql for $ty {
             fn to_nz_value(&self) -> NzValue {
-                NzValue::$variant(self.to_string())
+                NzValue::$variant(self.to_string().into())
             }
         }
     };
@@ -410,7 +410,7 @@ mod tests {
         for text in ["12:34:56.123456+05:30", "00:00:00.000001-03:30"] {
             let value = NzTimetz::from_sql(&NzValue::Timetz(text.into())).unwrap();
             assert_eq!(
-                NzTimetz::from_sql(&NzValue::Timetz(value.to_string())).unwrap(),
+                NzTimetz::from_sql(&NzValue::Timetz(value.to_string().into())).unwrap(),
                 value
             );
         }
@@ -453,7 +453,7 @@ mod tests {
             }
         );
         assert_eq!(
-            NzInterval::from_sql(&NzValue::Interval(interval.to_string())).unwrap(),
+            NzInterval::from_sql(&NzValue::Interval(interval.to_string().into())).unwrap(),
             interval
         );
         assert_eq!(

@@ -184,10 +184,10 @@ fn canonical(value: &NzValue, _type_class: &str) -> Value {
         NzValue::Int8(value) => Value::String(value.to_string()),
         NzValue::Float4(value) => float_json(*value as f64),
         NzValue::Float8(value) => float_json(*value),
-        NzValue::Numeric(text) => Value::String(text.clone()),
+        NzValue::Numeric(text) => Value::String(text.to_string()),
         NzValue::Decimal(value) => Value::String(value.to_string()),
         NzValue::Text(text) | NzValue::Date(text) | NzValue::Time(text) => {
-            Value::String(text.clone())
+            Value::String(text.to_string())
         }
         NzValue::Timestamp(text) => Value::String(text.to_string()),
         NzValue::Timetz(text) => Value::String(normalize_timetz(text)),
@@ -388,12 +388,12 @@ fn body_params(case: &Value) -> Vec<NzValue> {
                 .map(|item| match item.get("value").unwrap_or(&Value::Null) {
                     Value::Null => NzValue::Null,
                     Value::Bool(value) => NzValue::Bool(*value),
-                    Value::String(value) => NzValue::Text(value.clone()),
+                    Value::String(value) => NzValue::Text(value.as_str().into()),
                     Value::Number(value) => value
                         .as_i64()
                         .map(NzValue::Int8)
                         .unwrap_or_else(|| NzValue::Float8(value.as_f64().unwrap_or_default())),
-                    _ => NzValue::Text(item.to_string()),
+                    _ => NzValue::Text(item.to_string().into()),
                 })
                 .collect()
         })

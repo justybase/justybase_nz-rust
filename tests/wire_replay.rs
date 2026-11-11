@@ -222,7 +222,10 @@ async fn replay_dbos_types() {
         );
         // The empty VARCHAR is an empty string, not NULL.
         let row = &result.result_sets[0].rows[1];
-        assert_eq!(row.try_get_value(1).unwrap(), &NzValue::Text(String::new()));
+        assert_eq!(
+            row.try_get_value(1).unwrap(),
+            &NzValue::Text(String::new().into())
+        );
         let big: i64 = row.try_get(8).unwrap();
         assert_eq!(big, i64::MAX, "{label}");
     })

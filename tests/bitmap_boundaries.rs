@@ -73,7 +73,7 @@ fn text_cell(i: usize) -> String {
 fn expected_value(i: usize, present: bool) -> NzValue {
     match (present, i % 3 == 2) {
         (false, _) => NzValue::Null,
-        (true, true) => NzValue::Text(text_cell(i)),
+        (true, true) => NzValue::Text(text_cell(i).into()),
         (true, false) => NzValue::Int4(i as i32 * 1_000 - 7),
     }
 }

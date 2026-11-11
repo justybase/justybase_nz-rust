@@ -2,10 +2,27 @@
 
 All notable changes to `nz_rust` will be documented here.
 
-## [Unreleased]
+## [1.0.0-rc.2] - 2026-11-11
+
+### Added
+
+- Per-result-set, per-column value caching: repeated TEXT, NUMERIC, DATE,
+  TIME, TIMETZ and INTERVAL cells are decoded once and shared. The cache is
+  bounded per column, has a last-hit fast path, rejects long keys and disables
+  itself for high-cardinality columns after a probe. `Row::value_cache_stats()`
+  reports hits, misses, insertions, rejected keys and disabled columns;
+  `ValueCacheStats` is exported from the crate root.
 
 ### Changed
 
+- `NzValue` string-backed variants (`Text`, `Numeric`, `Date`, `Time`,
+  `Timetz`, `Interval`) now hold `NzStr` (`Arc<str>`) instead of `String`.
+  Cloning a value or a row is an atomic increment rather than a heap copy;
+  code that constructs these variants from a `String` needs `.into()` and code
+  that matches them must use the `Arc<str>` API. `TIMESTAMP` remains the typed
+  `NzTimestamp`.
+- The streaming sink path (`execute_stream`) uses the same per-column cache;
+  caches reset with every result set and never outlive it.
 - `NzValue::Timestamp` now carries the typed `NzTimestamp` value
   (microseconds since 2000-01-01) instead of a preformatted `String`. Binary
   TIMESTAMP decoding no longer formats or allocates per row; use `Display` /
