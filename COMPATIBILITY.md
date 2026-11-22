@@ -1,15 +1,18 @@
 # Compatibility and support matrix
 
 This document records the appliance, encoding, type and API surfaces that
-`nz_rust` 1.0.0-rc.1 claims to support, plus the rules that make the public API
+`nz_rust` 1.0.0-rc.3 claims to support, plus the rules that make the public API
 stable from this release onward.
 
 ## Validation baseline
 
 | Item | Value |
 | --- | --- |
-| Driver version | `1.0.0-rc.1` |
+| Driver version | `1.0.0-rc.3` |
 | Primary appliance | IBM Netezza `Release 11.2.2.1 [Build 20]` |
+| Secondary appliance | IBM Netezza `Release 11.2.2.1 [Build 20]` (independent instance) |
+| Two-appliance matrix | PASS on both instances (`scripts/test-live-matrix.ps1 -RequireTwo`) |
+| Live suites on each instance | `live_qualification` 13/13, `live_driver` 14/14, `live_integration` 47/47 |
 | Session encoding | `SHOW NZ_ENCODING` → `UTF8` |
 | Stored `CHAR`/`VARCHAR` bytes | database encoding, observed as Latin-1/CP1250-compatible single bytes |
 | `NCHAR`/`NVARCHAR` bytes | UTF-8 |
@@ -109,10 +112,16 @@ Known representation notes:
 | `ssl` | Rustls-based TLS transport |
 | `chrono` | optional `chrono` conversions for temporal values |
 
+The `chrono` feature is off by default. RUSTSEC-2026-0543 reports all `chrono`
+versions as unmaintained and has no safe upgrade; `deny.toml` carries an
+explicit, documented exception for this opt-in dependency. Applications that do
+not need the conversions can avoid it entirely.
+
 ## Public API stability and semver policy
 
-Starting with `1.0.0-rc.1`, the following surface is frozen for the `1.0`
-series; release candidates may still correct API mistakes before `1.0.0`.
+The following surface has been frozen since `1.0.0-rc.1` for the `1.0` series;
+the current candidate is `1.0.0-rc.3`, and release candidates may still correct
+API mistakes before `1.0.0`.
 After `1.0.0`, changes follow Cargo's interpretation of Semantic Versioning:
 
 - **Patch releases** (`1.0.x`) contain bug, security and documentation fixes
@@ -164,8 +173,15 @@ scripts/test-live-matrix.sh --require-two   # fail if NZ_DEV2_* is absent
 ```
 
 The report is written to `target/live-matrix/report.txt` and is excluded from
-the published crate. A matrix run is required before tagging `1.0.0` and is
-recommended for every appliance patch level.
+the published crate. For `1.0.0-rc.3` the matrix was run with `-RequireTwo` and
+passed on both instances; both run the same server build, so this confirms
+instance independence rather than coverage of every server release. The full
+live suites were also run on both instances. The cache benchmark test needs
+`JUST_DATA.PERF.EVENTS_400K` and `JUST_DATA.ADMIN.FACTPRODUCTINVENTORY`; the
+benchmark schema/table were provisioned on the secondary instance before the
+run, and the test remains `#[ignore]`d when that data is unavailable. A matrix
+run is required before tagging `1.0.0` and is recommended for every appliance
+patch level.
 
 ## Reporting a compatibility problem
 

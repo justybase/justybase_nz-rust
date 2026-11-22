@@ -30,7 +30,7 @@
 //! [COMPATIBILITY.md](https://github.com/justybase/justybase_nz-rust/blob/main/COMPATIBILITY.md)
 //! records the supported appliance, type, encoding and feature matrix.
 //!
-//! `1.0.0-rc.1` freezes the public API for the `1.0` series; `1.0.0` follows
+//! `1.0.0-rc.3` freezes the public API for the `1.0` series; `1.0.0` follows
 //! after the release-candidate soak. The crate forbids unsafe code and warns
 //! on undocumented public items.
 //!

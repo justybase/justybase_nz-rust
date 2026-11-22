@@ -142,7 +142,13 @@ fn run_batch(mut conn: NzConnection, args: &Args) -> ! {
     match conn.query(&args.sql, &[]) {
         Ok(result) => {
             match &args.out {
-                None => print!("{}", nz_rust::result_to_text(&result, true)),
+                None => match nz_rust::result_to_text(&result, true) {
+                    Ok(text) => print!("{text}"),
+                    Err(e) => {
+                        eprintln!("nz-editor: cannot render result: {e}");
+                        exit(1);
+                    }
+                },
                 Some(path) if export_excel::is_workbook_path(path) => {
                     if let Err(e) = export_excel::write_query_result_to_workbook(
                         &result,
@@ -153,7 +159,13 @@ fn run_batch(mut conn: NzConnection, args: &Args) -> ! {
                     }
                 }
                 Some(path) => {
-                    let text = nz_rust::result_to_text(&result, true);
+                    let text = match nz_rust::result_to_text(&result, true) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            eprintln!("nz-editor: cannot render result: {e}");
+                            exit(1);
+                        }
+                    };
                     if let Err(e) = std::fs::write(path, &text) {
                         eprintln!("nz-editor: cannot write {path}: {e}");
                         exit(1);

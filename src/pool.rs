@@ -225,7 +225,11 @@ impl NzPool {
                         "Timeout exceeded when trying to connect".into(),
                     ));
                 }
-                let (g, res) = self.state.1.wait_timeout(guard, dl - now).unwrap();
+                let (g, res) = self
+                    .state
+                    .1
+                    .wait_timeout(guard, dl - now)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard = g;
                 if res.timed_out() {
                     return Err(NzError::Timeout(
@@ -233,7 +237,11 @@ impl NzPool {
                     ));
                 }
             } else {
-                guard = self.state.1.wait(guard).unwrap();
+                guard = self
+                    .state
+                    .1
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
     }
@@ -508,6 +516,31 @@ mod tests {
         let pool = NzPool::new(c).unwrap();
         pool.close();
         assert!(pool.get().is_err());
+    }
+
+    #[test]
+    fn poisoned_state_does_not_panic_on_checkout_wait() {
+        let mut config = cfg();
+        config.max = 1;
+        config.wait_timeout = Some(Duration::from_millis(20));
+        let pool = NzPool::new(config).unwrap();
+        // Occupy the only slot so `get` takes the condvar wait path.
+        pool.state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total = 1;
+        let state = pool.state.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.0.lock().unwrap();
+            panic!("poison the pool state");
+        }));
+
+        let error = match pool.get() {
+            Ok(_) => panic!("checkout unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, NzError::Timeout(_)), "{error}");
     }
 
     #[test]

@@ -33,6 +33,7 @@
 //! as the literal `NULL` (the Node/C# grid convention).
 
 use crate::connection::QueryResult;
+use crate::error::{NzError, NzResult};
 use crate::types::value::NzValue;
 use std::io::{self, Write};
 
@@ -60,11 +61,14 @@ pub fn render_value(value: &NzValue) -> String {
 ///
 /// Every result set is emitted with a `# result set N (M rows)` banner; a
 /// header row is written when the set carries column metadata.
-pub fn result_to_text(result: &QueryResult, include_header: bool) -> String {
+///
+/// Returns a decoding error instead of panicking when a cell cannot be
+/// materialized. Use [`write_result_to_txt`] to stream directly to a writer.
+pub fn result_to_text(result: &QueryResult, include_header: bool) -> NzResult<String> {
     let mut out = Vec::new();
-    write_result_to_txt(&mut out, result, include_header)
-        .expect("result_to_text requires decodable rows");
-    String::from_utf8(out).expect("text export is UTF-8")
+    write_result_to_txt(&mut out, result, include_header)?;
+    String::from_utf8(out)
+        .map_err(|error| NzError::Protocol(format!("text export is not UTF-8: {error}")))
 }
 
 fn write_escaped<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
@@ -176,12 +180,14 @@ impl<W: Write> crate::QueryStreamSink for TextExportSink<W> {
 }
 
 /// Write each row directly, without allocating a complete result string.
-/// Decode errors are returned as `InvalidData`; writer errors are preserved.
+///
+/// Decode errors are preserved as [`NzError`]; writer errors are returned as
+/// [`NzError::Io`]. Nothing is buffered beyond one cell at a time.
 pub fn write_result_to_txt<W: Write>(
     writer: &mut W,
     result: &QueryResult,
     include_header: bool,
-) -> io::Result<()> {
+) -> NzResult<()> {
     for (index, set) in result.result_sets.iter().enumerate() {
         writeln!(
             writer,
@@ -203,9 +209,7 @@ pub fn write_result_to_txt<W: Write>(
                 if index != 0 {
                     writer.write_all(b"\t")?;
                 }
-                let value = row
-                    .try_get_value(index)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let value = row.try_get_value(index)?;
                 write_cell(writer, value)?;
             }
             writer.write_all(b"\n")?;
@@ -256,7 +260,7 @@ mod tests {
 
     #[test]
     fn renders_header_and_rows() {
-        let text = result_to_text(&sample(), true);
+        let text = result_to_text(&sample(), true).unwrap();
         assert!(text.contains("# result set 1 (2 rows)"));
         assert!(text.contains("ID\tNAME\n"));
         assert!(text.contains("1\talice\n"));
@@ -303,7 +307,7 @@ mod tests {
             rows_affected: 1,
             notices: vec![],
         };
-        let text = result_to_text(&result, false);
+        let text = result_to_text(&result, false).unwrap();
         assert!(text.contains("a\\tb\\nc\n"));
         // Exactly one data line — the embedded newline was escaped.
         assert_eq!(text.lines().count(), 2);
@@ -315,5 +319,26 @@ mod tests {
         write_result_to_txt(&mut buf, &sample(), true).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("alice"));
+    }
+
+    #[test]
+    fn decode_errors_are_returned_instead_of_panicking() {
+        let columns = vec![col("ID", 23), col("NAME", 1043)];
+        // Fewer values than columns: the second cell cannot be materialized.
+        let rows = vec![Row::new(columns.clone(), vec![NzValue::Int4(1)])];
+        let result = QueryResult {
+            result_sets: vec![ResultSet::new(columns, rows)],
+            rows_affected: 1,
+            notices: vec![],
+        };
+
+        let error = result_to_text(&result, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("row values do not match columns"));
+
+        let mut buf = Vec::new();
+        let error = write_result_to_txt(&mut buf, &result, false).unwrap_err();
+        assert!(matches!(error, NzError::Config(_)));
     }
 }

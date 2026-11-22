@@ -82,6 +82,45 @@ fn value_cache_dedupes_events_400k_and_fact_product_inventory() {
 
 #[test]
 #[ignore = "requires live Netezza appliance"]
+fn value_cache_shares_repeated_values_in_a_temp_table() {
+    let mut conn = live_conn();
+    let table = unique("CACHE_TMP");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE {table} AS \
+         SELECT CAST('PAID' AS VARCHAR(9)) AS STATUS, \
+                CAST(DATEKEY AS VARCHAR(20)) AS NOTE \
+         FROM JUST_DATA..DIMDATE LIMIT 1000"
+    ))
+    .expect("create temp table");
+
+    let result = conn
+        .query(&format!("SELECT STATUS, NOTE FROM {table}"), &[])
+        .expect("query");
+    let rows = result.rows();
+    assert!(rows.len() >= 2, "need repeated rows, got {}", rows.len());
+
+    let first = rows[0].try_values().expect("first row");
+    let second = rows[1].try_values().expect("second row");
+    match (&first[0], &second[0]) {
+        (NzValue::Text(a), NzValue::Text(b)) => {
+            assert!(
+                std::sync::Arc::ptr_eq(a, b),
+                "repeated STATUS value was not shared"
+            );
+        }
+        other => panic!("unexpected STATUS values: {other:?}"),
+    }
+
+    let stats = rows[0].value_cache_stats();
+    assert!(stats.hits > 0, "value cache had no hits: {stats:?}");
+    assert!(
+        stats.insertions > 0,
+        "value cache inserted nothing: {stats:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires live Netezza appliance"]
 fn connection_open_and_close() {
     let mut conn = live_conn();
     assert!(!conn.is_closed());

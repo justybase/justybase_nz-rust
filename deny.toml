@@ -13,7 +13,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0543 marks all chrono versions unmaintained and has no
+    # safe upgrade. The dependency is optional (`chrono` feature), is not
+    # enabled by default and carries no known exploitable defect. Replacing
+    # the conversion helpers is tracked separately; documenting the exception
+    # keeps the advisory visible rather than silently downgrading the gate.
+    { id = "RUSTSEC-2026-0543", reason = "optional opt-in chrono feature; no safe upgrade available; not enabled by default" },
+]
 
 [licenses]
 version = 2

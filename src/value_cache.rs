@@ -394,4 +394,80 @@ mod tests {
         cache.state.record(false);
         assert!(!cache.state.enabled());
     }
+
+    #[test]
+    fn decode_errors_are_not_cached() {
+        let caches = ValueCaches::new(&[desc(1043)]);
+        let error = caches
+            .get_or_decode(0, b"key", || {
+                Err(crate::error::NzError::Config("decode failed".into()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("decode failed"));
+
+        let value = caches
+            .get_or_decode(0, b"key", || Ok(NzValue::Text("recovered".into())))
+            .unwrap();
+        assert_eq!(value, NzValue::Text("recovered".into()));
+        let stats = caches.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.insertions, 1);
+    }
+
+    #[test]
+    fn columns_are_cached_independently() {
+        let caches = ValueCaches::new(&[desc(1043), desc(1043)]);
+        caches
+            .get_or_decode(0, b"left", || Ok(NzValue::Text("left".into())))
+            .unwrap();
+        caches
+            .get_or_decode(1, b"right", || Ok(NzValue::Text("right".into())))
+            .unwrap();
+
+        let left = caches
+            .get_or_decode(0, b"left", || panic!("column 0 should hit"))
+            .unwrap();
+        let right = caches
+            .get_or_decode(1, b"right", || panic!("column 1 should hit"))
+            .unwrap();
+        assert_eq!(left, NzValue::Text("left".into()));
+        assert_eq!(right, NzValue::Text("right".into()));
+
+        let stats = caches.stats();
+        assert_eq!(stats.columns, 2);
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.hits, 2);
+    }
+
+    #[test]
+    fn a_new_result_set_starts_with_empty_caches() {
+        let first = ValueCaches::new(&[desc(1043)]);
+        first
+            .get_or_decode(0, b"shared", || Ok(NzValue::Text("shared".into())))
+            .unwrap();
+        assert_eq!(first.stats().entries, 1);
+
+        let second = ValueCaches::new(&[desc(1043)]);
+        let decoded = second
+            .get_or_decode(0, b"shared", || Ok(NzValue::Text("decoded again".into())))
+            .unwrap();
+        assert_eq!(decoded, NzValue::Text("decoded again".into()));
+        let stats = second.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.entries, 1);
+    }
+
+    #[test]
+    fn out_of_range_column_falls_back_to_decoding() {
+        let caches = ValueCaches::new(&[desc(1043)]);
+        let value = caches
+            .get_or_decode(9, b"key", || Ok(NzValue::Text("value".into())))
+            .unwrap();
+        assert_eq!(value, NzValue::Text("value".into()));
+        let stats = caches.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+    }
 }

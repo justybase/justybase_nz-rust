@@ -2,6 +2,52 @@
 
 All notable changes to `nz_rust` will be documented here.
 
+## [1.0.0-rc.3] - 2026-11-22
+
+This release supersedes `1.0.0-rc.2`; rc.2 is not republished. It carries the
+P0 correctness fixes, completes the value-cache regression coverage and records
+the two-appliance live qualification required before `1.0.0`.
+
+### Added
+
+- Value-cache regression tests: decode failures are not cached, columns are
+  isolated, a new result set starts with empty caches, out-of-range columns fall
+  back to decoding, and long keys and high-cardinality columns are rejected or
+  disabled. A portable live test
+  verifies that repeated cells return the same `Arc<str>` allocation; the
+  existing 400k-row benchmark test now runs on both qualified appliances.
+- The publish workflow has a `verify` job that re-runs formatting, tests,
+  Clippy, rustdoc, the fuzz-target check and a publish dry run for the exact
+  tag before `cargo publish` is allowed to run.
+- `cargo deny` documents the RUSTSEC-2026-0543 (`chrono` unmaintained) advisory
+  as an explicit, justified exception for the opt-in `chrono` feature.
+
+### Changed
+
+- **API (RC correction):** `result_to_text` returns `NzResult<String>` and
+  `write_result_to_txt` returns `NzResult<()>` instead of panicking or erasing
+  decode errors into `io::Error`. Callers must handle the result; this is
+  documented because it changes a public signature during the RC cycle.
+- **API (RC correction):** `ReadBuffer::read_le_i64_at` returns `NzResult<i64>`
+  and validates offset overflow and buffer bounds.
+- Pool condition-variable waits recover from poisoning instead of unwinding.
+- Protocol-sync socket configuration failures are reported as `NzError::Protocol`
+  requiring reconnect instead of being silently ignored.
+
+### Fixed
+
+- Plain-text export no longer panics when a row cannot be materialized.
+- `fuzz/Cargo.lock` tracks the crate version again, so the release tag no longer
+  fails the `cargo check --manifest-path fuzz/Cargo.toml --locked` CI step.
+- `examples/nz-editor` compiles again with the `Arc<str>` value representation
+  and the new export API.
+
+### Validation
+
+Offline checks, the feature matrix, coverage, packaging and appliance-backed
+suites all pass; details and exact counts are in
+[QUALITY_REPORT.md](QUALITY_REPORT.md).
+
 ## [1.0.0-rc.2] - 2026-11-11
 
 ### Added

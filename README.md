@@ -8,7 +8,7 @@ Pure Rust client driver for IBM Netezza and PureData System for Analytics.
 [![docs.rs](https://docs.rs/nz_rust/badge.svg)](https://docs.rs/nz_rust)
 
 > [!WARNING]
-> **Preview software through `1.0.0-rc.1`.** The public API is frozen for the
+> **Preview software through `1.0.0-rc.3`.** The public API is frozen for the
 > `1.0` series and the driver is validated against a real appliance, but the
 > `1.0.0` release is intentionally held until the release candidate has soaked
 > in controlled use. Validate it against your Netezza environment before using
@@ -55,7 +55,7 @@ The compatibility APIs `query` and `execute_reader` buffer result sets. For
 large results, use `execute_stream` or the async streaming facade described
 below.
 
-The `1.0` public API is frozen from `1.0.0-rc.1` (see [API stability](#api-stability)),
+The `1.0` public API is frozen from `1.0.0-rc.3` (see [API stability](#api-stability)),
 but the driver does not claim complete coverage of every Netezza server feature.
 Missing or appliance-specific behavior should be reported as an issue with the
 server version, SQL example and a sanitized error or protocol trace.
@@ -83,7 +83,7 @@ server version, SQL example and a sanitized error or protocol trace.
 
 ## 1.0 API and migration
 
-Version `1.0.0-rc.1` freezes the public API for the `1.0` series; `1.0.0`
+Version `1.0.0-rc.3` freezes the public API for the `1.0` series; `1.0.0`
 follows after the release-candidate soak. Use `Client` for Tokio,
 `blocking::Client` for synchronous code, `Pool` for Tokio pooling and
 `blocking::Pool` for synchronous pooling. The primary blocking API runs the
@@ -107,7 +107,7 @@ The release candidate consolidates the hardening work since `0.3`:
 - CI runs Linux and cross-platform test jobs, `cargo-deny`, a 70% line-coverage
   gate and `cargo package` / `cargo publish --dry-run`.
 
-See [CHANGELOG.md](CHANGELOG.md) for the complete `1.0.0-rc.1` change list.
+See [CHANGELOG.md](CHANGELOG.md) for the complete `1.0.0-rc.3` change list.
 
 Public API notes for the `1.0` series:
 
@@ -135,6 +135,10 @@ Public API notes for the `1.0` series:
   keeps PostgreSQL OIDs separate from DBOS type codes.
 - Use `try_values()` when materializing compatibility values. `values()`
   explicitly panics on decoding failure; malformed data never becomes NULL.
+- `result_to_text` returns `NzResult<String>` and `write_result_to_txt` returns
+  `NzResult<()>`: undecodable cells are reported instead of panicking. Code
+  calling them must handle the result. `ReadBuffer::read_le_i64_at` likewise
+  returns `NzResult<i64>` with bounds/overflow validation.
 - `ToSql` implementations must implement `Debug + Sync`. Missing/unused
   bindings, NUL and malformed numeric literals are rejected. Binary SQL
   parameters are rejected; use external-table readers for binary transfers.
@@ -161,14 +165,14 @@ import legacy items from `nz_rust::compat`; the modern default API is
 `Client`, `blocking::Client`, `Pool` and `blocking::Pool`.
 
 ```toml
-nz_rust = { version = "1.0.0-rc.1", features = ["compat"] }
+nz_rust = { version = "1.0.0-rc.3", features = ["compat"] }
 ```
 
 For example, change `use nz_rust::NzConnection` to
 `use nz_rust::compat::NzConnection`. Remove the feature after migrating to
 the native client and pool APIs.
 
-See [QUALITY_REPORT.md](QUALITY_REPORT.md) for `1.0.0-rc.1` validation results
+See [QUALITY_REPORT.md](QUALITY_REPORT.md) for `1.0.0-rc.3` validation results
 and the clearly labelled historical `0.3.0` benchmarks.
 
 ## Installation
@@ -177,7 +181,7 @@ Add the crate from crates.io with:
 
 ```toml
 [dependencies]
-nz_rust = "1.0.0-rc.1"
+nz_rust = "1.0.0-rc.3"
 ```
 
 When using the workspace checkout:
@@ -191,7 +195,7 @@ TLS support is opt-in:
 
 ```toml
 [dependencies]
-nz_rust = { version = "1.0.0-rc.1", features = ["ssl"] }
+nz_rust = { version = "1.0.0-rc.3", features = ["ssl"] }
 ```
 
 The default build has no TLS dependency. The `ssl` feature enables Rustls and
@@ -627,8 +631,9 @@ cargo llvm-cov --all-features --locked --summary-only
 
 CI enforces formatting, Clippy and rustdoc with warnings denied, the
 appliance-independent suite, the `cargo-deny` advisories/licenses/bans/sources
-policy in `deny.toml`, and a 70% line-coverage floor. The `1.0.0-rc.1`
-validation run measured 73.84% line coverage.
+policy in `deny.toml`, and a 70% line-coverage floor. The `1.0.0-rc.3`
+validation run measured 72.18% line coverage (63.95% regions, 74.14%
+functions). The `chrono` advisory exception is documented in `deny.toml`.
 
 Live tests need a real appliance and are `#[ignore]`d, so `cargo test` never
 runs (or silently "passes") them. Configure `NZ_DEV_HOST`, `NZ_DEV_USER`,
@@ -655,10 +660,12 @@ scripts/test-live-matrix.sh --require-two
 ```
 
 The report is written to `target/live-matrix/report.txt`; credentials are read
-only from the environment and are never written there. A two-appliance matrix
-run is required before tagging `1.0.0` and recommended for every appliance
-patch level. The exact support matrix and semver policy are in
-[COMPATIBILITY.md](COMPATIBILITY.md).
+only from the environment and are never written there. For `1.0.0-rc.3` the
+matrix passed on both configured appliances, and the full live suites passed on
+each (13 `live_qualification` + 14 `live_driver` + 47 `live_integration` tests
+per appliance). A two-appliance matrix run is required before tagging `1.0.0`
+and recommended for every appliance patch level. The exact support matrix and
+semver policy are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 Run one suite directly with
 `cargo test --features compat --test live_qualification -- --ignored --nocapture --test-threads=1`.
@@ -754,7 +761,7 @@ private connection details.
 
 ## API stability
 
-The `1.0.0-rc.1` release freezes the public API for the `1.0` series:
+The `1.0.0-rc.3` release freezes the public API for the `1.0` series:
 
 - `1.0.x` releases contain bug, security and documentation fixes only.
 - `1.x.0` releases may add public items, trait implementations, feature flags

@@ -3207,15 +3207,38 @@ impl NzConnection {
         let ct = Duration::from_secs(self.config.connection_timeout.max(1));
         // Non-blocking probe for already-arrived bytes.
         {
-            let s = self.stream.as_mut().unwrap();
-            s.set_nonblocking(true).ok();
+            let s = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| NzError::Closed("connection stream is unavailable".into()))?;
+            s.set_nonblocking(true).map_err(|error| {
+                protocol_sync_error(
+                    context,
+                    &format!("cannot switch socket to nonblocking: {error}"),
+                )
+            })?;
             // `pull_available` loops until WouldBlock; on a blocking socket it
             // would hang, hence the temporary nonblocking mode.
-            let _ = self.buffer.pull_available(s);
-            s.set_nonblocking(false).ok();
+            let pulled = self.buffer.pull_available(s);
+            let restored_blocking = s.set_nonblocking(false);
             // Restore the configured read timeout (nonblocking mode clears it
             // on some platforms).
-            s.set_read_timeout(Some(ct)).ok();
+            let restored_timeout = s.set_read_timeout(Some(ct));
+            if let Err(error) = restored_blocking {
+                return Err(protocol_sync_error(
+                    context,
+                    &format!("cannot restore blocking socket: {error}"),
+                ));
+            }
+            if let Err(error) = restored_timeout {
+                return Err(protocol_sync_error(
+                    context,
+                    &format!("cannot restore read timeout: {error}"),
+                ));
+            }
+            pulled.map_err(|error| {
+                protocol_sync_error(context, &format!("protocol-sync probe failed: {error}"))
+            })?;
         }
 
         if self.buffer.available() == 0 && !must_wait_for_ready {
@@ -3229,11 +3252,19 @@ impl NzConnection {
         let deadline = Instant::now() + Duration::from_millis(2000);
         // Give the tail of an orphaned response a short window to arrive.
         if let Some(s) = self.stream.as_ref() {
-            s.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            s.set_read_timeout(Some(Duration::from_millis(250)))
+                .map_err(|error| {
+                    protocol_sync_error(
+                        context,
+                        &format!("cannot set orphan-drain timeout: {error}"),
+                    )
+                })?;
         }
         let r = self.drain_orphaned(context, deadline);
         if let Some(s) = self.stream.as_ref() {
-            s.set_read_timeout(Some(ct)).ok();
+            s.set_read_timeout(Some(ct)).map_err(|error| {
+                protocol_sync_error(context, &format!("cannot restore read timeout: {error}"))
+            })?;
         }
         if r.is_ok() {
             self.protocol_sync_required = false;
@@ -3352,9 +3383,23 @@ impl NzConnection {
             }
             // Try a non-blocking pull first.
             if let Some(s) = self.stream.as_mut() {
-                s.set_nonblocking(true).ok();
-                let _ = self.buffer.pull_available(s);
-                s.set_nonblocking(false).ok();
+                s.set_nonblocking(true).map_err(|error| {
+                    NzError::Protocol(format!(
+                        "cannot switch socket to nonblocking during protocol sync: {error}. Reconnect required."
+                    ))
+                })?;
+                let pulled = self.buffer.pull_available(s);
+                let restored = s.set_nonblocking(false);
+                if let Err(error) = restored {
+                    return Err(NzError::Protocol(format!(
+                        "cannot restore blocking socket during protocol sync: {error}. Reconnect required."
+                    )));
+                }
+                pulled.map_err(|error| {
+                    NzError::Protocol(format!(
+                        "protocol-sync probe failed: {error}. Reconnect required."
+                    ))
+                })?;
             }
             if self.buffer.available() >= n {
                 return Ok(true);
@@ -3367,7 +3412,11 @@ impl NzConnection {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if let Some(s) = self.stream.as_mut() {
                     s.set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
-                        .ok();
+                        .map_err(|error| {
+                            NzError::Protocol(format!(
+                                "cannot set protocol-sync read timeout: {error}. Reconnect required."
+                            ))
+                        })?;
                 }
                 // Peek via a blocking read into the buffer machinery: a
                 // timeout here just means "no more orphaned bytes yet".

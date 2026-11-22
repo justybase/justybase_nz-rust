@@ -1,85 +1,82 @@
 # Driver quality report
 
-## Current release: `1.0.0-rc.1`
+## Current release: `1.0.0-rc.3`
 
-`1.0.0-rc.1` freezes the public API for the `1.0` series. It remains preview
-software until `1.0.0` has soaked in controlled use; the support policy and the
-appliance/type/encoding/feature matrix are in
-[COMPATIBILITY.md](COMPATIBILITY.md). The integration guide is
-[README.md](README.md), and the complete change list is
-[CHANGELOG.md](CHANGELOG.md).
+`1.0.0-rc.3` is the current release candidate for the `1.0` series. It
+supersedes `1.0.0-rc.2`, which is not republished. The public API is frozen for
+`1.0`; the crate stays in preview until `1.0.0` has soaked in controlled use.
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the support matrix and
+[CHANGELOG.md](CHANGELOG.md) for the complete change list.
 
-This release was validated against Netezza
-`Release 11.2.2.1 [Build 20]`. No credentials or connection strings are stored
-in this report or in the repository.
+Validation was performed against two independent appliances, both running
+`Release 11.2.2.1 [Build 20]` with the `JUST_DATA` database. No credentials or
+connection strings are stored in this report or in the repository.
 
 ### Correctness changes in this release
 
-| Finding reproduced before changes | Implemented correction |
+| Finding | Implemented correction |
 | --- | --- |
-| Binary `CHAR`/`VARCHAR` values containing Latin-1 bytes (for example `ó` = `0xF3`) decoded as invalid UTF-8 | Encoding-aware DBOS field decoding; Latin-1 is the default, configurable with `char_varchar_encoding` / `CharEncoding` |
-| Borrowed `&str` getters could silently mangle non-ASCII Latin-1 data | Borrowed getters return an error for transcoded values; `String` and `NzValue` materialize the decoded text |
-| Binary `INTERVAL` folded days into hours and used non-server unit spellings | Signed day/clock components are preserved, units match the server, and a zero clock is omitted when days or months are present |
-| Binary `TIMETZ` always rendered `±HH:MM` | Offsets now match the server text form: `+02`, `+02:30` or `+02:30:15` |
-| Native metadata stopped at the core catalog helpers | Completed `AsyncMetadata`: current schema, sequences, users, groups, query history, table sizes, sessions, functions, synonyms, constraints, distribution/organize keys, object details, owners, search and DDL reconstruction |
-| Netezza 11.2 errors could arrive without SQLSTATE/detail/hint | Structured errors preserve the original message in `NzDatabaseError.raw` and keep the session usable when the backend can resynchronize |
-| A poisoned pool lock could hide the original panic | Pool lock poisoning is recovered explicitly in the sync and async pools |
-| Windows session identity was incomplete | `os_user` / `client_host_name` fallbacks were added |
+| `result_to_text` panicked on an undecodable cell; `write_result_to_txt` erased decode errors as `io::Error` | Both return `NzResult`; decoding errors propagate with their original detail |
+| `read_le_i64_at` sliced without checking bounds or overflow | Returns `NzResult<i64>` with explicit offset and buffer validation |
+| A poisoned pool condition-variable lock could unwind on checkout | Wait paths recover the inner guard, consistent with the rest of the pool |
+| Socket option failures during protocol sync were discarded | Reported as `NzError::Protocol` requiring reconnect instead of silently continuing |
+| The value cache had no regression coverage for failures, isolation or reset | Added unit and live tests for errors, per-column isolation, result-set reset, long keys, high-cardinality disabling and shared allocations |
+| `fuzz/Cargo.lock` kept version `1.0.0-rc.2` and broke the tagged CI build | Lockfile regenerated for the release version |
+| `examples/nz-editor` did not compile with `Arc<str>` values or the new export API | Value conversion and export call sites updated |
 
 ### Validation for this release
 
 | Check | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | pass |
-| `cargo test -p nz_rust --all-targets --all-features --locked` | pass |
-| `cargo test -p nz_rust --doc --all-features --locked` | 4/4 pass |
+| `cargo test -p nz_rust --all-targets --all-features --locked` | pass (170 library tests plus all offline suites) |
+| `cargo test -p nz_rust --doc --all-features --locked` | 5/5 pass |
 | `cargo clippy -p nz_rust --all-targets --all-features --locked -- -D warnings` | pass |
 | `cargo doc --no-deps --all-features --locked` with `RUSTDOCFLAGS=-D warnings` | pass |
-| Feature matrix (`default`, `ssl`, `chrono`, `compat`, all) | pass |
-| `cargo deny check advisories licenses bans sources` | pass |
-| Line-coverage gate (70%) | 73.84% lines, 71.63% regions, 63.98% functions |
-| `cargo package` / `cargo publish --dry-run` | pass — 108 files, 1.8 MiB |
-| Library unit tests | 155/155 |
-| Encoding matrix | 6/6 |
-| Metadata mock (native + legacy) | 2/2 |
+| Feature matrix (default, ssl, chrono, compat, all combinations) | pass |
+| `cargo check --manifest-path fuzz/Cargo.toml --locked` | pass |
+| `cargo deny check advisories licenses bans sources` | pass with the documented `chrono` exception |
+| Coverage gate (70% lines) | 72.18% lines, 63.95% regions, 74.14% functions |
+| `cargo package` / `cargo publish --dry-run` | pass - 116 files, 5.3 MiB |
 | Golden wire replay | 17/17 across 15 fixtures |
-| Pool mock tests | 14/14 |
-| Live qualification | 13/13 |
-| Live driver | 14/14 |
-| Live integration | 45/45 |
-| Live two-appliance matrix | primary pass; secondary skipped because `NZ_DEV2_*` was not configured |
+| Live two-appliance matrix (`--require-two`) | primary PASS, secondary PASS |
+| Live qualification | 13/13 on both appliances |
+| Live driver | 14/14 on both appliances |
+| Live integration | 47/47 on both appliances, including both cache tests |
 
-Golden fixtures in `tests/fixtures/wire` are real appliance responses to
-synthetic statements. They are replayed offline by `tests/wire_replay.rs` and
-cover encoding, native and legacy metadata, DDL reconstruction, temporal and
-numeric edges, and structured errors. The capture tool scans statements and
-responses for the configured password and host before writing a fixture.
+The two appliances use the same server build; the matrix proves the driver is
+not tied to one instance, not that every Netezza release is covered. The
+benchmark cache test uses `JUST_DATA.PERF.EVENTS_400K` and
+`JUST_DATA.ADMIN.FACTPRODUCTINVENTORY`; the equivalent table was provisioned on
+the secondary appliance before the run. The test is `#[ignore]`d and is not
+counted as passing when those tables are absent. A second, portable cache test
+uses only session TEMP tables and asserts shared `Arc<str>` allocations.
 
 ### Known limitations
 
-- The release candidate has been exercised against one appliance build. The
-  secondary matrix is implemented and documented but requires `NZ_DEV2_*`; a
-  two-appliance run is required before tagging `1.0.0`.
-- Binary `CHAR`/`VARCHAR` text defaults to Latin-1. Store characters outside
-  Latin-1 in `NVARCHAR`, or set `char_varchar_encoding=utf8` when the database
-  truly stores UTF-8.
+- Both qualified appliances run the same Netezza build; other server builds are
+  not claimed as tested.
+- RUSTSEC-2026-0543 marks all `chrono` versions unmaintained with no safe
+  upgrade. The dependency is opt-in (`chrono` feature), off by default and has
+  no known exploitable defect; the explicit `deny.toml` exception is documented
+  rather than hidden, and replacement of the conversion helpers is tracked.
 - Some Netezza 11.2 errors arrive as legacy raw text without SQLSTATE, detail
   or hint; use `NzDatabaseError.raw` for the original message.
-- No universal performance claim is made for the release candidate. The
-  benchmark numbers later in this document are historical `0.3.0` data.
+- No universal performance claim is made. Historical `0.3.0` numbers in the
+  appendix below are not claims about this release.
 
 ### Reproducing the validation
 
-The commands are listed in [README.md](README.md#testing-and-validation) and
-[CONTRIBUTING.md](CONTRIBUTING.md). Live suites require `NZ_DEV_*`; the matrix
-runner additionally supports `NZ_DEV2_*`. Reports are written below `target/`
-and must not be committed.
-
+Commands are listed in [README.md](README.md#testing-and-validation). Live
+suites require `NZ_DEV_*`; the matrix additionally uses `NZ_DEV2_*`. Reports are
+written below `target/` and must not be committed. Publication requires the
+`verify` job in `.github/workflows/publish.yml` to pass for the exact release
+tag before the crate is uploaded.
 ## Historical report: 0.3.0
 
 > This appendix is retained for project history. It describes version `0.3.0`
 > only; its benchmark numbers, test counts and reference-driver results are not
-> claims about `1.0.0-rc.1`.
+> claims about `1.0.0-rc.3`.
 
 ### Scope and implementation status
 
@@ -161,7 +158,7 @@ figures describe another API mode and are not compared directly to the
 materialized baseline. Reports are in ignored `target/quality-final-rust-7samples.json`
 and `target/quality-final-stream-7samples.json`.
 
-The first five-sample snapshot recorded 55–99.6% fewer allocated bytes in its
+The first five-sample snapshot recorded 55ÔÇô99.6% fewer allocated bytes in its
 paired comparison. The final run records allocation bytes for repeatability,
 but its allocation counter was noisy in some multi-row samples, so those
 earlier percentage reductions should not be treated as a refreshed paired
@@ -233,7 +230,7 @@ planned breaking change.
 
 | Driver | Implemented change | Evidence and limits |
 | --- | --- | --- |
-| C# | Variable-field offsets are precomputed in one bounded pass per row; wide fixed strings use cleared `ArrayPool<char>` scratch; reused row slots clear stale references; pool probes are async, with an optional idle validation interval (default `0` retains validation on every checkout). The interval never suppresses closed/expired checks. | Offset microbenchmark: at 64 fields 2.854 us → 154.86 ns (~18x), at 256 fields 58.36 us → 657.50 ns (~89x), zero managed allocations. Synthetic NativeAOT benchmark, not end-to-end throughput. Final unit suite: 80 passed. Integration suite with Python reference path: 137 passed, 1 skipped. |
+| C# | Variable-field offsets are precomputed in one bounded pass per row; wide fixed strings use cleared `ArrayPool<char>` scratch; reused row slots clear stale references; pool probes are async, with an optional idle validation interval (default `0` retains validation on every checkout). The interval never suppresses closed/expired checks. | Offset microbenchmark: at 64 fields 2.854 us Ôćĺ 154.86 ns (~18x), at 256 fields 58.36 us Ôćĺ 657.50 ns (~89x), zero managed allocations. Synthetic NativeAOT benchmark, not end-to-end throughput. Final unit suite: 80 passed. Integration suite with Python reference path: 137 passed, 1 skipped. |
 | Node | Batch cache drains by head index and is released when exhausted; contiguous text DataRow parsing uses a synchronous `Buffer` view with owned-copy fallback for fragmented frames; external export waits for `drain` and propagates stream errors. | Unit suite: 211 passed. Full suite: 477 passed, 1 skipped. The first run found one stale live assertion that omitted the database qualifier already emitted by DDL reconstruction; the assertion now checks the fully qualified output. |
 | Python | The global fixed-size pool is capped at 32 buffers (8 MiB at 256 KiB each) and reports retained bytes/count; DBOS parsing consumes short-lived memoryviews, including fragmented payloads backed by one owned buffer. | Unit suite: 206 passed, 1 skipped. C-extension and pure-Python parity: 110 passed; C extension is enabled. `mypy` succeeds; Pyright reports 0 errors and 232 pre-existing warnings. Live C/Python parity and contract integration: 116 passed. |
 

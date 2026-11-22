@@ -29,16 +29,16 @@ pub fn nz_value_to_cell(value: &NzValue) -> CellValue {
         NzValue::Float8(v) => CellValue::Number(*v),
         NzValue::Numeric(s) => match s.parse::<f64>() {
             Ok(n) if n.is_finite() => CellValue::Number(n),
-            _ => CellValue::Text(s.clone()),
+            _ => CellValue::Text(s.to_string()),
         },
         NzValue::Decimal(decimal) => match decimal.to_string().parse::<f64>() {
             Ok(number) if number.is_finite() => CellValue::Number(number),
             _ => CellValue::Text(decimal.to_string()),
         },
-        NzValue::Text(s) => CellValue::Text(s.clone()),
+        NzValue::Text(s) => CellValue::Text(s.to_string()),
         NzValue::Date(s) => parse_date(s)
             .map(CellValue::DateTime)
-            .unwrap_or_else(|| CellValue::Text(s.clone())),
+            .unwrap_or_else(|| CellValue::Text(s.to_string())),
         NzValue::Timestamp(value) => {
             let text = value.to_string();
             parse_timestamp(&text)
@@ -47,7 +47,7 @@ pub fn nz_value_to_cell(value: &NzValue) -> CellValue {
         }
         // Times, intervals and binary payloads have no cell-native form;
         // keep the driver's text rendering.
-        NzValue::Time(s) | NzValue::Timetz(s) | NzValue::Interval(s) => CellValue::Text(s.clone()),
+        NzValue::Time(s) | NzValue::Timetz(s) | NzValue::Interval(s) => CellValue::Text(s.to_string()),
         NzValue::Bytea(_) => CellValue::Text(value.to_display_string()),
     }
 }

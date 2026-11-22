@@ -200,8 +200,23 @@ impl ReadBuffer {
     }
 
     /// Parse a little-endian i64 at an absolute buffer offset (binary rows).
-    pub fn read_le_i64_at(&self, offset: usize) -> i64 {
-        i64::from_le_bytes(self.buf[offset..offset + 8].try_into().unwrap())
+    ///
+    /// Returns a protocol error when `offset + 8` overflows or falls outside
+    /// the buffered bytes instead of panicking.
+    pub fn read_le_i64_at(&self, offset: usize) -> NzResult<i64> {
+        let end = offset.checked_add(8).ok_or_else(|| {
+            NzError::Protocol(format!("read_le_i64_at offset overflow: {offset}"))
+        })?;
+        if offset < self.start || end > self.end {
+            return Err(NzError::Protocol(format!(
+                "read_le_i64_at out of bounds: offset={offset}, buffered={}..{}",
+                self.start, self.end
+            )));
+        }
+        let bytes = &self.buf[offset..end];
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        Ok(i64::from_le_bytes(raw))
     }
 
     pub fn slice(&self) -> &[u8] {
@@ -316,5 +331,20 @@ mod tests {
         assert_eq!(buffer.buf.capacity(), 0);
         buffer = moved;
         assert_eq!(buffer.read_byte(&mut Cursor::new([])).unwrap(), 1);
+    }
+
+    #[test]
+    fn read_le_i64_at_checks_bounds_and_overflow() {
+        let mut buffer = ReadBuffer::new();
+        let bytes = (-42_i64).to_le_bytes();
+        buffer.ensure_data(&mut Cursor::new(bytes), 8).unwrap();
+
+        assert_eq!(buffer.read_le_i64_at(0).unwrap(), -42);
+
+        let error = buffer.read_le_i64_at(1).unwrap_err();
+        assert!(error.to_string().contains("out of bounds"));
+
+        let error = buffer.read_le_i64_at(usize::MAX).unwrap_err();
+        assert!(error.to_string().contains("offset overflow"));
     }
 }

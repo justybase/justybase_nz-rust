@@ -649,7 +649,13 @@ impl App {
             }
             return;
         }
-        let rendered = nz_rust::result_to_text(result, true);
+        let rendered = match nz_rust::result_to_text(result, true) {
+            Ok(text) => text,
+            Err(e) => {
+                self.push_log(format!("Export failed: {path}: {e}"));
+                return;
+            }
+        };
         match std::fs::write(&path, rendered) {
             Ok(()) => {
                 let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
